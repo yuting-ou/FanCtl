@@ -1,8 +1,5 @@
 .build/
 dist/
-*.xcodeproj
-*.xcworkspace
-xcuserdata/
-DerivedData/
-*.dSYM
 .DS_Store
+.qoder/
+*.log
