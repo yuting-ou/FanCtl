@@ -10,7 +10,7 @@ jobs:
     name: 回归测试（2415 断言）+ Release 构建
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 显示工具链
         run: swift --version
