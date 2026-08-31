@@ -1,5 +1,12 @@
 # FanCtl(清风)— macOS 风扇智能管理
 
+![Release](https://img.shields.io/github/v/release/yuting-ou/FanCtl)
+![License](https://img.shields.io/github/license/yuting-ou/FanCtl)
+![CI](https://github.com/yuting-ou/FanCtl/actions/workflows/ci.yml/badge.svg)
+![Platform](https://img.shields.io/badge/macOS-26%2B-black)
+![Swift](https://img.shields.io/badge/Swift-5.9-orange)
+![Tests](https://img.shields.io/badge/tests-2415-brightgreen)
+
 > 本文档面向**AI 助手/开发者**编写:读完即可理解本项目架构、控制逻辑、安全机制与开发流程,无需再通读全部源码。修改代码前请先读「给 AI 助手的注意事项」。
 
 **版本**:3.1 (build 47) · **语言**:Swift 5.9 · **平台**:macOS 26+ (Apple Silicon / Intel) · **无第三方依赖**

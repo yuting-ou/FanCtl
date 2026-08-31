@@ -1,0 +1,54 @@
+name: Bug 报告
+description: 提交一个 Bug 以便我们修复
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你花时间提交这个 Bug！请尽量提供完整信息，这能极大帮助我们定位问题。
+  - type: dropdown
+    id: macos
+    attributes:
+      label: macOS 版本
+      options:
+        - macOS 26
+        - macOS 25
+        - 更早版本
+    validations:
+      required: true
+  - type: dropdown
+    id: chip
+    attributes:
+      label: 芯片
+      options:
+        - Apple Silicon (M 系列)
+        - Intel
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 问题出现的调速模式
+      options:
+        - auto（系统调度）
+        - curve（温度曲线）
+        - ai（AI 调速）
+        - manual（手动）
+        - 不确定
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么？
+      description: 描述你期望发生什么，以及实际发生了什么
+      placeholder: 告诉我发生了什么……
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: 请附上守护进程日志（/Library/Logs/FanCtl/）中相关片段
+      render: shell
