@@ -35,7 +35,8 @@ public struct StatsSampler {
                                 powerWatts: Double? = nil,
                                 reason: ControlReason? = nil,
                                 speedChange: Bool = false,
-                                cyclingGuard: Bool = false) -> DailyStats? {
+                                cyclingGuard: Bool = false,
+                                overshoot: Double? = nil) -> DailyStats? {
         let day = DailyStats.dayString(for: now)
         var archived: DailyStats? = nil
         if stats.date != day {
@@ -69,6 +70,8 @@ public struct StatsSampler {
         if speedChange { stats.speedChanges += 1 }
         // 启停循环抑制武装计数（v3.1：观察期核心指标，过高 → 需要预测式释放）
         if cyclingGuard { stats.aiCyclingGuards += 1 }
+        // 过冲峰值（v3.2：当日温度超出 AI 有效目标的最大值，τ 自适应的数据门槛）
+        if let o = overshoot, o.isFinite, o > stats.overshootPeak { stats.overshootPeak = o }
         return archived
     }
 }

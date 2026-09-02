@@ -216,6 +216,9 @@ struct ContentView: View {
             if s.aiCyclingGuards > 0 {
                 Text("启停抑制 \(Int(s.aiCyclingGuards)) 次（空闲停转试而不可得）")
             }
+            if s.overshootPeak >= 3 {
+                Text("过冲峰值 +\(Int(s.overshootPeak.rounded()))°（重载超出 AI 目标）")
+            }
             if s.quietSeconds > 60 {
                 Text("静音/安静时长 \(Self.duration(s.quietSeconds))")
             }

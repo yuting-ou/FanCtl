@@ -600,6 +600,10 @@ public struct DailyStats: Codable {
     // AI 启停循环抑制武装次数（v3.1）：每天"停转不可持续被实测"的次数——
     // 观察期核心指标，频率过高说明需要预测式释放（τ 自适应）而非记忆式抑制
     public var aiCyclingGuards: Double
+    // 当日温度超出 AI 有效目标的最大值（v3.2，°C）：滚动 30 天的过冲观察数据——
+    // 账本级 maxOvershoot 不滚动、无法区分"上周一次事件"与"持续过冲"；
+    // 连续多日 >8° 是启动 τ 自适应（动态学习）的数据门槛
+    public var overshootPeak: Double
 
     public var avgTemp: Double {
         tempSeconds > 0 ? tempSum / tempSeconds : (tempCount > 0 ? tempSum / tempCount : 0)
@@ -621,6 +625,7 @@ public struct DailyStats: Codable {
         self.quietSeconds = 0
         self.speedChanges = 0
         self.aiCyclingGuards = 0
+        self.overshootPeak = 0
     }
 
     // 温度分布采样：落入对应桶累计秒数（桶数变更的旧数据直接重建）
@@ -651,7 +656,7 @@ public struct DailyStats: Codable {
     private enum CodingKeys: String, CodingKey {
         case date, maxTemp, maxTempAt, highTempSeconds, tempSum, tempCount
         case revolutions, tempHistogram, powerSum, powerCount, tempSeconds, quietSeconds
-        case speedChanges, aiCyclingGuards
+        case speedChanges, aiCyclingGuards, overshootPeak
     }
 
     public init(from decoder: Decoder) throws {
@@ -670,6 +675,7 @@ public struct DailyStats: Codable {
         quietSeconds = try c.decodeIfPresent(Double.self, forKey: .quietSeconds) ?? 0
         speedChanges = try c.decodeIfPresent(Double.self, forKey: .speedChanges) ?? 0
         aiCyclingGuards = try c.decodeIfPresent(Double.self, forKey: .aiCyclingGuards) ?? 0
+        overshootPeak = try c.decodeIfPresent(Double.self, forKey: .overshootPeak) ?? 0
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -688,6 +694,7 @@ public struct DailyStats: Codable {
         try c.encode(quietSeconds, forKey: .quietSeconds)
         try c.encode(speedChanges, forKey: .speedChanges)
         try c.encode(aiCyclingGuards, forKey: .aiCyclingGuards)
+        try c.encode(overshootPeak, forKey: .overshootPeak)
     }
 }
 

@@ -102,15 +102,22 @@ public struct FanCurveController {
     // force=true（SSD/高温兜底）跳过限速，瞬时写满目标——安全优先级最高。
     // 注意：AI 空闲交还时 lastAppliedPercent 被 clearOutput 清空，重新接管（负载回来）时
     // last 为 nil 直接到位，不限制"夺回"路径，保证负载突增时响应不滞后。
-    public mutating func slew(target: Double, force: Bool = false) -> Double {
+    // v3.2 迟滞带（hysteresis > 0 时生效）：限速后的变化小于带宽时维持原写入。
+    // 物理依据：热系统 τ≈40s >> 3s 控制拍，AI 输出每拍 3-8% 的变化属于过度响应
+    //（实测 2000-3000 次/天 ≥3% 调速）。只延迟"写入"，AI 决策积分（output）独立
+    // 演化不受影响——温度误差持续存在时输出终将越过带缘，精度损失 ≤ 带宽×b。
+    // force（安全事件）跳过一切限速/迟滞，瞬时写满。
+    public mutating func slew(target: Double, force: Bool = false, hysteresis: Double = 0) -> Double {
+        var pct = max(0, min(100, target))   // 入口钳位（含 force 分支，与 shape 对齐）
         if force {
-            lastAppliedPercent = target
-            return target
+            lastAppliedPercent = pct
+            return pct
         }
-        var pct = max(0, min(100, target))
+
         if let last = lastAppliedPercent {
             if pct > last { pct = min(pct, last + tuning.maxStepUp) }
             if pct < last { pct = max(pct, last - tuning.maxStepDown) }
+            if hysteresis > 0, abs(pct - last) < hysteresis { pct = last }
         }
         lastAppliedPercent = pct
         return pct

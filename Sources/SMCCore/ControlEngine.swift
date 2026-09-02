@@ -476,6 +476,7 @@ public final class ControlEngine {
         var aiIntent: AIIntent? = nil
         var curveTargetPercent: Double? = nil  // 当前温度下用户曲线的期望值（AI 模式展示"曲线基准"）
         var guardArmedThisBeat = false         // v3.1 启停抑制本拍武装（战报计数用）
+        var overshootNow: Double? = nil        // v3.2 本拍温度超出 AI 有效目标的量（战报过冲峰值用）
         // AI 实际控制的"目标温度"（电池+省电时控制器会放宽 +4°）。学习窗口与"压不住"检测
         // 都必须以它为准，否则会与控制器真实目标错位（电池省电下误判"压不住"/误挡学习）。
         // v8：环境补偿（夏天放宽/冬天收紧）+ 夜间安静档（+4° 更安静）叠加在用户目标之上
@@ -631,7 +632,8 @@ public final class ControlEngine {
                 // shape() 的死区在 AI 下禁用（会与 PD 叠加振荡），故用纯限速的 slew()，与曲线共用同一套 maxStepUp/maxStepDown。
                 // 安全事件（SSD/电池/兜底）force 跳过限速；AI 空闲夺回时 last 已清、直接到位，负载突增响应不滞后。
                 shapedBase = controller.slew(target: baseTarget,
-                                             force: decision.ssdGuard || decision.batteryGuard || decision.failsafeActive)
+                                             force: decision.ssdGuard || decision.batteryGuard || decision.failsafeActive,
+                                             hysteresis: effectiveConfig.mode == .ai ? 4 : 0)
             } else {
                 shapedBase = controller.shape(target: baseTarget,
                                               force: decision.ssdGuard || decision.batteryGuard || decision.failsafeActive)
@@ -846,6 +848,12 @@ public final class ControlEngine {
                 aiMetrics.userTargetTemp = userTarget
                 aiMetrics.record(temp: temp, output: output, seconds: actualInterval)
             }
+            // v3.2 过冲观察：与 aiMetrics 同一排除集（静音封顶是用户意图而非控制失效，
+            // 安全覆盖/闭环故障期的温度不反映 AI 控制质量——混入会让 τ 自适应的
+            // 数据门槛被会议日/故障日误触发）；空闲交还拍 max(0, …) = 0 自然无贡献
+            if !quietActive, !writeHealth.faulted, !feedbackHealth.faulted, !fanStates.isEmpty {
+                overshootNow = max(0, temp - aiTargetEff)
+            }
         } else {
             // auto / AI 空闲交还：只在状态切换时恢复一次
             if forcedModeActive {
@@ -881,7 +889,8 @@ public final class ControlEngine {
                                                  powerWatts: powerWatts,
                                                  reason: reason,
                                                  speedChange: speedChanged,
-                                                 cyclingGuard: guardArmedThisBeat) {
+                                                 cyclingGuard: guardArmedThisBeat,
+                                                 overshoot: overshootNow) {
                 ConfigStore.archiveDay(archived)
             }
             prevStatsAppliedPercent = appliedPercent

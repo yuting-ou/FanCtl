@@ -45,7 +45,7 @@ do {
     }
     // 今日战报摘要（调速次数 = |输出Δ|≥3% 的拍数，风扇寿命代理指标）
     if let s = ConfigStore.loadStats(), s.date == DailyStats.today(), s.tempCount > 0 {
-        print("今日: 最高 \(String(format: "%.1f", s.maxTemp))°C · 调速 \(Int(s.speedChanges)) 次 · 启停抑制 \(Int(s.aiCyclingGuards)) 次 · 静音/安静 \(Int(s.quietSeconds / 60)) 分钟")
+        print("今日: 最高 \(String(format: "%.1f", s.maxTemp))°C · 调速 \(Int(s.speedChanges)) 次 · 启停抑制 \(Int(s.aiCyclingGuards)) 次\(s.overshootPeak >= 3 ? " · 过冲峰值 +\(Int(s.overshootPeak.rounded()))°" : "") · 静音/安静 \(Int(s.quietSeconds / 60)) 分钟")
     }
     if let m = ConfigStore.loadAIMetrics(), m.sampleCount > 0 {
         print(String(format: "AI 指标: %.1f 分钟 | 平均 %.1f°C | 波动 %.1f°C | 平均输出 %.1f%% | 超温 %.0f 秒",

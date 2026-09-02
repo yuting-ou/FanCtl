@@ -1853,6 +1853,17 @@ func testStatsSampler() {
     expectEqual(cgBack.aiCyclingGuards, 1, "aiCyclingGuards 往返")
     let cgLegacy = #"{"date":"2026-08-01","maxTemp":60,"maxTempAt":"2026-08-01T10:00:00Z","highTempSeconds":0,"tempSum":60,"tempCount":1,"revolutions":0}"#.data(using: .utf8)!
     expectEqual(try! cgDec.decode(DailyStats.self, from: cgLegacy).aiCyclingGuards, 0, "旧战报无 aiCyclingGuards 兼容")
+    // v3.2: 过冲峰值（max 语义）
+    var ov = StatsSampler(now: Date())
+    _ = ov.record(temp: 84, totalRPM: 0, seconds: 3, now: Date(), overshoot: 8.0)
+    _ = ov.record(temp: 86, totalRPM: 0, seconds: 3, now: Date(), overshoot: 10.5)
+    _ = ov.record(temp: 80, totalRPM: 0, seconds: 3, now: Date(), overshoot: 4.0)
+    expectEqual(ov.stats.overshootPeak, 10.5, "过冲峰值取最大（10.5，后续 4.0 不回退）")
+    _ = ov.record(temp: 60, totalRPM: 0, seconds: 3, now: Date())
+    expectEqual(ov.stats.overshootPeak, 10.5, "无过冲拍不回退峰值")
+    let ovBack = try! cgDec.decode(DailyStats.self, from: cgEnc.encode(ov.stats))
+    expectEqual(ovBack.overshootPeak, 10.5, "overshootPeak 往返")
+    expectEqual(try! cgDec.decode(DailyStats.self, from: cgLegacy).overshootPeak, 0, "旧战报无 overshootPeak 兼容")
 
     // 启动恢复 restore（停机跨天不丢战报）
     group("启动恢复")
@@ -2935,19 +2946,40 @@ func testControlEngine() {
         expect(st?.aiCyclingGuards ?? 0 >= 1, "战报 aiCyclingGuards 计数（得 \(st?.aiCyclingGuards ?? -1)）")
     }
 
+    // —— 场景 12：AI 迟滞带接线（v3.2 头号特性的引擎级回归——审查 P0 教训） ——
+    // temp 73.9 → error −2.1 → P 步长 3.15%/拍，全部落在 4% 迟滞带内 →
+    // 写入保持种子值 curve(73.9) ≈ 58%；未接线时决策一路降到底、Tg → 1200。
+    do {
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 73.9); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        for _ in 0..<15 { engine.beat()
+            if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+            clock.advance(3) }
+        // 迟滞把 3.15%/拍的决策微步量化为 ≥4% 台阶：总写入 ~9 次（含首拍种子）
+        // 而非逐拍 15 次。断言用总写入数（复核教训：逐拍 delta 计数曾因快照顺序空转）
+        let tgTotal = smc.writes.filter { $0.key == "F0Tg" }.count
+        expect(tgTotal <= 11, "迟滞量化写入（总 \(tgTotal) 次，未接线为 15）")
+    }
+
     // —— 场景 9：静音封顶期不污染 AI 评测（v2.9） ——
     do {
         envDirs.append(engineTestEnv())
-        let future = Date().addingTimeInterval(600)
+        let clock = FakeClock()
+        let future = clock.time().addingTimeInterval(600)   // 用 FakeClock 时间轴（真实时钟在凌晨运行时会相对假时钟过期）
         ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced,
                                          quietUntil: future, quietCapPercent: 30,
                                          envCompensation: false))
         let smc = makeFanSMC(); smc.set("Tp01", 82); smc.set("PSTR", 30)
-        let clock = FakeClock()
         let col = EngineCollector()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         for _ in 0..<4 { engine.beat(); clock.advance(3) }
         expectEqual(engine.aiMetrics.sampleCount, 0, "静音封顶期不记评测样本")
+        engine.shutdownSave()
+        expect(ConfigStore.loadStats()?.overshootPeak == 0, "静音封顶期过冲峰值不入账（temp 82 − 目标 76 = 6 被排除）")
         ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
         clock.advance(3)
         engine.beat()
@@ -3022,6 +3054,45 @@ func testAICyclingGuard() {
     let rc3 = b.step(temp: 77, powerWatts: 20, dt: 3)
     expect(rc3 != nil, "归位后夺回")
     expectEqual(b.currentGuardSeconds, 1800, "可持续释放后退避归位（得 \(b.currentGuardSeconds)）")
+}
+
+// MARK: - v3.2 AI 输出迟滞带 HIL 对比（调速频率 vs 温度精度，数据决定去留）
+
+func runHIL(hysteresis: Double) -> (changes: Int, rms: Double, maxO: Double, nan: Bool) {
+    var vm = VirtualMachine()
+    var ai = AIController()
+    ai.tuning.targetTemp = 76
+    var ctrl = FanCurveController()
+    var prevOut = 0.0, changes = 0
+    var sumSq = 0.0, n = 0.0, maxO = 0.0
+    var nan = false
+    // 负载轨迹：45W 基础 + 15W 正弦（周期 ~600s）+ 周期性 8W 阶跃（应用开合）
+    // 无风稳态 47~93°：AI 在 0~85% 区间真实工作，迟滞带有发挥空间
+    for i in 0..<1200 {   // 1 小时 @ 3s
+        let power = 45 + 15 * sin(Double(i) / 100.0) + ((i / 200) % 2 == 0 ? 8 : 0)
+        let o = ai.step(temp: vm.temp, powerWatts: power, dt: 3) ?? 0
+        let applied = ctrl.slew(target: o, force: false, hysteresis: hysteresis)
+        if abs(applied - prevOut) >= 3 { changes += 1 }
+        prevOut = applied
+        vm.step(power: power, percent: applied, dt: 3)
+        if vm.temp.isFinite {
+            sumSq += vm.temp * vm.temp; n += 1
+            maxO = max(maxO, vm.temp - 76)
+        } else { nan = true }
+    }
+    let rms = (sumSq / max(n, 1)).squareRoot()
+    return (changes, rms, maxO, nan)
+}
+
+func testHILHysteresis() {
+    group("HIL 迟滞带对比")
+    let base = runHIL(hysteresis: 0)
+    let hyst = runHIL(hysteresis: 4)
+    print("  [HIL 迟滞] 调速(≥3%): \(base.changes) → \(hyst.changes) | 温度RMS: \(String(format: "%.2f", base.rms)) → \(String(format: "%.2f", hyst.rms)) | 峰值: \(String(format: "%.1f", base.maxO)) → \(String(format: "%.1f", hyst.maxO))")
+    expect(!base.nan && !hyst.nan, "两版均无数值发散")
+    expect(hyst.changes < base.changes, "迟滞减少调速（\(base.changes) → \(hyst.changes)）")
+    expect(abs(hyst.rms - base.rms) <= 1.5, "温度精度损失 ≤1.5°（ΔRMS \(String(format: "%.2f", abs(hyst.rms - base.rms)))）")
+    expect(hyst.maxO <= base.maxO + 2, "过冲不恶化（\(String(format: "%.1f", hyst.maxO)) vs \(String(format: "%.1f", base.maxO))）")
 }
 
 // MARK: - v2.9 优化器反漂移（闭环自指的锚点限幅）
@@ -3134,6 +3205,7 @@ testControlEngine()
 testCurveAntiDrift()
 testLearningHygiene()
 testAICyclingGuard()
+testHILHysteresis()
 print("——")
 if failures == 0 {
     print("✅ 全部通过：\(checks) 项断言")
