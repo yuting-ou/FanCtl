@@ -9,6 +9,8 @@ jobs:
   test:
     name: 回归测试 + Release 构建
     runs-on: macos-26
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
