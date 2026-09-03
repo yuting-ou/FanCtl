@@ -22,6 +22,8 @@ public enum CurveOptimizer {
         public let presetCurves: [CurvePreset: [CurvePoint]] // 安静/均衡/强劲的个性化版本
         public let hotRatio: Double                          // 热压力（最近 7 天 ≥80°C 时间占比，
                                                              // 反漂移闸门与基线持久化的同一口径）
+        public let powerP50: Double?                         // 负载中位数（W，v3.3）：功耗分布与曲线无关，
+                                                             // 是打破“曲线→温度分布→曲线”自指的锚定量
         public let summary: String   // 一行结论（面板内展示）
         public let detail: String    // 完整依据（tooltip 展示）
     }
@@ -42,7 +44,8 @@ public enum CurveOptimizer {
 
     public static func optimize(days: [DailyStats],
                                 previous: [CurvePreset: [CurvePoint]]? = nil,
-                                previousHotRatio: Double? = nil) -> Result? {
+                                previousHotRatio: Double? = nil,
+                                previousPowerP50: Double? = nil) -> Result? {
         let valid = days.filter { $0.tempCount > 0 }
         guard !valid.isEmpty else { return nil }
 
@@ -119,8 +122,11 @@ public enum CurveOptimizer {
         // 上移不受限（机器变热自纠方向）。damp 后重新 shape 保证单调性不被破坏。
         // 热压力取最近 7 天窗口（v2.9）：与基线持久化同口径，且避免全历史累计
         // 稀释让"真变热"永远达不到 +1pp 门槛。
+        // v3.3 负载中位数（最近 7 天功耗直方图 P50）：与曲线无关的锚定量
+        let currentPowerP50 = Self.powerP50(recentDays)
         let damped = Self.damp(curves: curves, previous: previous,
-                               previousHotRatio: previousHotRatio, currentHotRatio: hotRatio)
+                               previousHotRatio: previousHotRatio, currentHotRatio: hotRatio,
+                               previousPowerP50: previousPowerP50, currentPowerP50: currentPowerP50)
         // 防御：基准曲线必须齐备 5 点，否则不返回（避免下游索引越界）
         guard let balanced = damped[.balanced], balanced.count == 5 else { return nil }
 
@@ -134,7 +140,29 @@ public enum CurveOptimizer {
         安静/均衡/强劲三个预设已全部按本机分布个性化：安静更晚介入保低噪，强劲提前压温，均衡两者兼顾（92° 硬兜底不变）。
         """
         return Result(points: balanced, presetCurves: damped, hotRatio: hotRatio,
-                      summary: summary, detail: detail)
+                      powerP50: currentPowerP50, summary: summary, detail: detail)
+    }
+
+    // 负载中位数：最近 7 天功耗直方图 P50（W）。数据不足（<30min）返回 nil。
+    // 功耗分布由用户行为决定、与风扇曲线无关——温度分位下移而它未变 = 自降温。
+    public static func powerP50(_ days: [DailyStats]) -> Double? {
+        var merged = [Double](repeating: 0, count: PowerHistogram.bucketCount)
+        for d in days {
+            guard let h = d.powerHistogram, h.count == PowerHistogram.bucketCount else { continue }
+            for i in 0..<merged.count { merged[i] += h[i] }
+        }
+        let total = merged.reduce(0, +)
+        guard total >= 30.0 * 60 else { return nil }
+        let target = total * 0.5
+        var cum = 0.0
+        for (i, sec) in merged.enumerated() where sec > 0 {
+            if cum + sec >= target {
+                let lo = Double(i) * PowerHistogram.bucketWidth
+                return lo + PowerHistogram.bucketWidth * (target - cum) / sec
+            }
+            cum += sec
+        }
+        return PowerHistogram.bucketMidPower(of: PowerHistogram.bucketCount - 1)
     }
 
     // 反漂移限幅决策（纯函数）：热压力较上次应用上升 ≥1pp → 1.5°/周期（真变热），
@@ -145,13 +173,25 @@ public enum CurveOptimizer {
         return currentHotRatio > prev + 0.01 ? 1.5 : 0.5
     }
 
-    // 反漂移限幅（previous 为上次应用的曲线；首次应用 previous nil → 不限幅）
+    // 反漂移限幅（previous 为上次应用的曲线；首次应用 previous nil → 不限幅）。
+    // v3.3 功耗锚定门控：负载中位数未变（±max(2W, 15%)）而温度分位下移 = 自降温
+    //（前一条曲线的冷却效应），锚点下移压到 0.25°/周期——打破闭环自指的根本手段；
+    // 功耗直方图未成熟（nil）时退回热压力门控。
     private static func damp(curves: [CurvePreset: [CurvePoint]],
                              previous: [CurvePreset: [CurvePoint]]?,
                              previousHotRatio: Double?,
-                             currentHotRatio: Double) -> [CurvePreset: [CurvePoint]] {
+                             currentHotRatio: Double,
+                             previousPowerP50: Double?,
+                             currentPowerP50: Double?) -> [CurvePreset: [CurvePoint]] {
         guard let previous, !previous.isEmpty else { return curves }
-        let maxDrop = anchorDropLimit(currentHotRatio: currentHotRatio, previousHotRatio: previousHotRatio)
+        // 功耗锚定门控（v3.3）：负载中位数未变而热压力未升 = 温度下移是自降温 →
+        // 下移压到 0.25°/周期；热压力上升的 1.5° 快速通道不被功耗门控覆盖（审查 M1）
+        let hotIncreased = previousHotRatio.map { currentHotRatio > $0 + 0.01 } ?? false
+        var maxDrop = anchorDropLimit(currentHotRatio: currentHotRatio, previousHotRatio: previousHotRatio)
+        if let prevP = previousPowerP50, let curP = currentPowerP50,
+           abs(curP - prevP) <= max(2.0, prevP * 0.15), !hotIncreased {
+            maxDrop = min(maxDrop, 0.25)
+        }
         var result: [CurvePreset: [CurvePoint]] = [:]
         for (preset, pts) in curves {
             guard let prev = previous[preset], prev.count == pts.count, pts.count == 5 else {

@@ -90,7 +90,9 @@ final class FanModel: ObservableObject {
     @Published var configWriteFailed = false   // config.json 写入失败（权限/目录缺失），面板警示
     // v8 环境温度补偿（默认开启）与夜间安静档（22:00–8:00 自动切安静）
     @Published var envCompensation = true
+    @Published var palmCompensation = false
     @Published var quietHours = false
+    @Published var palmComp: Double? = nil        // daemon 下发的体感补偿量（单一数据源）
     @Published var nightOverride = false       // 夜间安静档当前是否生效（daemon 判定）
     @Published var envTemp: Double? = nil      // 环境温度代理（status 下发，展示用）
     @Published var envTempOverride: Double? = nil  // 环境温度手动覆盖（nil=自动代理）
@@ -196,6 +198,7 @@ final class FanModel: ObservableObject {
     private static let fanOffsetsKey = "fanOffsets"
     private static let envCompensationKey = "envCompensation"
     private static let quietHoursKey = "quietHours"
+    private static let palmCompensationKey = "palmCompensation"
 
     var config: FanConfig {
         let offsets = fanOffsets.allSatisfy { $0 == 0 } ? nil : fanOffsets
@@ -212,7 +215,8 @@ final class FanModel: ObservableObject {
                   envCompensation: envCompensation,
                   quietHours: quietHours,
                   nightCurve: quietHours ? points(for: .quiet) : nil,
-                  envTempOverride: envTempOverride)
+                  envTempOverride: envTempOverride,
+                  palmCompensation: palmCompensation)
     }
 
     func points(for p: CurvePreset) -> [CurvePoint] {
@@ -263,6 +267,7 @@ final class FanModel: ObservableObject {
         preset = cfg.preset ?? .balanced
         batterySaver = cfg.batteryPreset != nil
         envCompensation = UserDefaults.standard.object(forKey: Self.envCompensationKey) as? Bool ?? cfg.envCompensation
+        palmCompensation = UserDefaults.standard.object(forKey: Self.palmCompensationKey) as? Bool ?? cfg.palmCompensation
         quietHours = UserDefaults.standard.object(forKey: Self.quietHoursKey) as? Bool ?? cfg.quietHours
         if let t = cfg.aiTargetTemp { aiTargetTemp = t }
         if let offsets = cfg.fanOffsets, offsets.count >= 2 {
@@ -446,6 +451,7 @@ final class FanModel: ObservableObject {
                 envTemp = nil
                 systemPower = nil
                 aiTargetEffective = nil
+                palmComp = nil
             }
         } else {
             // status.json 不存在或无法读取：daemon 下线（含刚下线需清除状态）
@@ -463,6 +469,7 @@ final class FanModel: ObservableObject {
                 envTemp = nil
                 systemPower = nil
                 aiTargetEffective = nil
+                palmComp = nil
             }
             daemonAlive = false
         }
@@ -486,6 +493,7 @@ final class FanModel: ObservableObject {
             daemonMode = nil
             configMismatch = false
             aiTargetEffective = nil
+            palmComp = nil
             return
         }
         lastStatusTimestamp = status.timestamp
@@ -500,6 +508,7 @@ final class FanModel: ObservableObject {
             daemonMode = nil
             configMismatch = false
             aiTargetEffective = nil
+            palmComp = nil
             return
         }
 
@@ -543,6 +552,7 @@ final class FanModel: ObservableObject {
             self.aiTargetEffective = status.aiTargetEffective.flatMap {
                 $0.isFinite && $0 > 20 && $0 < 100 ? $0 : nil
             }
+            self.palmComp = status.palmComp.flatMap { $0.isFinite && $0 > 0.5 && $0 <= 4 ? $0 : nil }
             self.systemPower = status.powerWatts.flatMap { $0.isFinite && $0 > 0.1 && $0 < 1000 ? $0 : nil }
         }
         if panelVisible && changed {
@@ -691,6 +701,10 @@ final class FanModel: ObservableObject {
             quietHours = cfg.quietHours
             UserDefaults.standard.set(cfg.quietHours, forKey: Self.quietHoursKey)
         }
+        if cfg.palmCompensation != palmCompensation {
+            palmCompensation = cfg.palmCompensation
+            UserDefaults.standard.set(cfg.palmCompensation, forKey: Self.palmCompensationKey)
+        }
         if let offsets = cfg.fanOffsets {
             let o0 = offsets.count > 0 ? max(-20, min(20, offsets[0])) : 0
             let o1 = offsets.count > 1 ? max(-20, min(20, offsets[1])) : 0
@@ -788,7 +802,7 @@ final class FanModel: ObservableObject {
     private struct AIBaseline: Codable { var date: String; var avgTemp: Double; var hotRatio: Double }
     // v2.9：优化器热压力基线（与 AIBaseline 解耦——反漂移闸门必须用优化器自己的
     // 直方图口径比对，AIBaseline.hotRatio 是全天聚合口径，混用会错判"变热/变凉"）
-    private struct AIOptimizeHot: Codable { var hotRatio: Double }
+    private struct AIOptimizeHot: Codable { var hotRatio: Double; var powerP50: Double? }
     private static let aiOptimizerHotKey = "aiOptimizerHotRatio"
     private struct AIEffect { let days: Int; let beforeAvg: Double; let afterAvg: Double; let beforeHot: Double; let afterHot: Double }
 
@@ -801,11 +815,12 @@ final class FanModel: ObservableObject {
         let days = loadDaysWithToday()
         // v2.9 反漂移：传入上次应用的曲线与优化器热压力基线，优化器据此限幅锚点下移
         let previousCurves = aiPresetCurves.isEmpty ? nil : aiPresetCurves
-        let previousHot = UserDefaults.standard.data(forKey: FanModel.aiOptimizerHotKey)
-            .flatMap { try? JSONDecoder().decode(AIOptimizeHot.self, from: $0) }?.hotRatio
+        let prevState = UserDefaults.standard.data(forKey: FanModel.aiOptimizerHotKey)
+            .flatMap { try? JSONDecoder().decode(AIOptimizeHot.self, from: $0) }
         guard let r = CurveOptimizer.optimize(days: days,
                                               previous: previousCurves,
-                                              previousHotRatio: previousHot) else {
+                                              previousHotRatio: prevState?.hotRatio,
+                                              previousPowerP50: prevState?.powerP50) else {
             if !auto { aiSummary = "数据积累中，正常使用约半小时后再试"; aiDetail = nil }
             return false
         }
@@ -831,8 +846,8 @@ final class FanModel: ObservableObject {
     }
 
     private func applyCurveResult(_ r: CurveOptimizer.Result, days: [DailyStats], notify: Bool) {
-        // 持久化优化器热压力（下次反漂移闸门的比对基线，同口径）
-        if let data = try? JSONEncoder().encode(AIOptimizeHot(hotRatio: r.hotRatio)) {
+        // 持久化优化器基线（热压力 + 负载中位数，下次反漂移闸门的比对口径）
+        if let data = try? JSONEncoder().encode(AIOptimizeHot(hotRatio: r.hotRatio, powerP50: r.powerP50)) {
             UserDefaults.standard.set(data, forKey: FanModel.aiOptimizerHotKey)
         }
         if let ag = Self.aggregate(days) {
@@ -993,6 +1008,13 @@ final class FanModel: ObservableObject {
     }
 
     // MARK: v8 环境补偿 / 夜间安静档
+
+    func setPalmCompensation(_ on: Bool) {
+        lastUserChange = Date()
+        palmCompensation = on
+        UserDefaults.standard.set(on, forKey: Self.palmCompensationKey)
+        saveConfig()
+    }
 
     func setEnvCompensation(_ on: Bool) {
         lastUserChange = Date()

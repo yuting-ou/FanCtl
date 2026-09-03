@@ -94,6 +94,10 @@ public struct FanConfig: Codable, Equatable {
     // 自动代理在热带环境/特殊散热结构下可能不准，允许用户手动指定。
     // nil = 使用自动代理（电池/掌托/散热片的有效低值）
     public var envTempOverride: Double?
+    // 体感补偿（v3.3，默认关）：掌托超过 40°C（体感阈值）时适度收紧目标——
+    // 芯片温度是代理指标，用户真正感知的是掌托温度。钳位 +4°C（风扇对底盘
+    // 温度的控制权限有限），电池/夜间安静档不参与（明确的安静意图不被覆盖）
+    public var palmCompensation: Bool
 
     public init(mode: FanMode = .curve,
                 manualPercent: Double = 50,
@@ -109,7 +113,8 @@ public struct FanConfig: Codable, Equatable {
                 envCompensation: Bool = true,
                 quietHours: Bool = false,
                 nightCurve: [CurvePoint]? = nil,
-                envTempOverride: Double? = nil) {
+                envTempOverride: Double? = nil,
+                palmCompensation: Bool = false) {
         self.mode = mode
         self.manualPercent = manualPercent
         self.curve = curve
@@ -125,6 +130,7 @@ public struct FanConfig: Codable, Equatable {
         self.quietHours = quietHours
         self.nightCurve = nightCurve
         self.envTempOverride = envTempOverride
+        self.palmCompensation = palmCompensation
     }
 
     // 获取指定风扇的偏移（0-based），自动处理越界
@@ -226,7 +232,7 @@ extension FanConfig {
     private enum CodingKeys: String, CodingKey {
         case mode, manualPercent, curve, preset, batteryPreset, batteryCurve
         case quietUntil, quietCapPercent, aiTargetTemp, fanOffsets, boostUntil
-        case envCompensation, quietHours, nightCurve, envTempOverride
+        case envCompensation, quietHours, nightCurve, envTempOverride, palmCompensation
     }
 
     public init(from decoder: Decoder) throws {
@@ -246,6 +252,7 @@ extension FanConfig {
         quietHours = try c.decodeIfPresent(Bool.self, forKey: .quietHours) ?? false
         nightCurve = try c.decodeIfPresent([CurvePoint].self, forKey: .nightCurve)
         envTempOverride = try c.decodeIfPresent(Double.self, forKey: .envTempOverride)
+        palmCompensation = try c.decodeIfPresent(Bool.self, forKey: .palmCompensation) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -265,6 +272,7 @@ extension FanConfig {
         try c.encode(quietHours, forKey: .quietHours)
         try c.encodeIfPresent(nightCurve, forKey: .nightCurve)
         try c.encodeIfPresent(envTempOverride, forKey: .envTempOverride)
+        try c.encode(palmCompensation, forKey: .palmCompensation)
     }
 }
 
@@ -340,8 +348,8 @@ public struct DaemonStatus: Codable {
     public var envTemp: Double?          // 环境温度代理（°C），环境补偿的输入与展示；无有效代理为 nil
     public var aiTargetEffective: Double? // AI 实际生效的目标温度（环境/夜间/电池叠加并钳位 ≤84° 后）；
                                           // App 的"全力散热"等判定须用它而非用户原始目标。旧版无此字段为 nil
-
-    // 兼容旧字段的计算属性
+    public var palmComp: Double?         // 体感补偿量（°C，v3.3）：掌托 >40° 时的目标收紧量，
+                                          // App 展示“体感补偿 −N°”胶囊；无/未启用为 nil
     public var cpuTemp: Double { sensors.cpuDie }
     public var gpuTemp: Double { sensors.gpuDie }
 
@@ -362,7 +370,8 @@ public struct DaemonStatus: Codable {
                 powerWatts: Double? = nil,
                 nightOverride: Bool? = nil,
                 envTemp: Double? = nil,
-                aiTargetEffective: Double? = nil) {
+                aiTargetEffective: Double? = nil,
+                palmComp: Double? = nil) {
         self.sensors = sensors
         self.mode = mode
         self.appliedPercent = appliedPercent
@@ -387,6 +396,7 @@ public struct DaemonStatus: Codable {
         self.nightOverride = nightOverride
         self.envTemp = envTemp
         self.aiTargetEffective = aiTargetEffective
+        self.palmComp = palmComp
     }
 
     // 旧版便利初始化（保持源码兼容）
@@ -420,6 +430,7 @@ public struct DaemonStatus: Codable {
         case learningRecently, learnedPoints, learnedSamples
         case targetUnreachable, powerWatts, nightOverride, envTemp
         case aiTargetEffective
+        case palmComp
         // 旧字段
         case cpuTemp, gpuTemp
     }
@@ -463,6 +474,7 @@ public struct DaemonStatus: Codable {
         self.nightOverride = try container.decodeIfPresent(Bool.self, forKey: .nightOverride)
         self.envTemp = try container.decodeIfPresent(Double.self, forKey: .envTemp)
         self.aiTargetEffective = try container.decodeIfPresent(Double.self, forKey: .aiTargetEffective)
+        self.palmComp = try container.decodeIfPresent(Double.self, forKey: .palmComp)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -491,6 +503,7 @@ public struct DaemonStatus: Codable {
         try container.encodeIfPresent(nightOverride, forKey: .nightOverride)
         try container.encodeIfPresent(envTemp, forKey: .envTemp)
         try container.encodeIfPresent(aiTargetEffective, forKey: .aiTargetEffective)
+        try container.encodeIfPresent(palmComp, forKey: .palmComp)
         // 同时写旧字段，保证回滚到旧版本 App/daemon 时也能读
         try container.encode(sensors.cpuDie, forKey: .cpuTemp)
         try container.encode(sensors.gpuDie, forKey: .gpuTemp)
@@ -545,6 +558,24 @@ public enum ControlReason: String, Codable {
         case .ssd: return "SSD 高温托底"
         case .failsafe: return "高温全速兜底"
         }
+    }
+}
+
+// 功耗分布直方图（v3.3）：与温度直方图同构，2W 桶 × 30（0~60W，越界并入尾桶）。
+// 负载分布由用户行为决定、与曲线无关——它是优化器打破“曲线→温度分布→曲线”
+// 闭环自指的锚定量：温度分位下移而功耗分位未变 = 自降温，禁止锚点跟进。
+public enum PowerHistogram {
+    public static let bucketWidth = 2.0
+    public static let bucketCount = 30   // 覆盖 0~60W
+
+    public static func bucketIndex(for power: Double) -> Int {
+        guard power.isFinite, power > 0 else { return 0 }
+        let raw = power / bucketWidth
+        return Int(min(max(raw, 0), Double(bucketCount - 1)))
+    }
+
+    public static func bucketMidPower(of index: Int) -> Double {
+        (Double(index) + 0.5) * bucketWidth
     }
 }
 
@@ -604,6 +635,9 @@ public struct DailyStats: Codable {
     // 账本级 maxOvershoot 不滚动、无法区分"上周一次事件"与"持续过冲"；
     // 连续多日 >8° 是启动 τ 自适应（动态学习）的数据门槛
     public var overshootPeak: Double
+    // 功耗分布直方图（v3.3，秒/桶）：负载分布与曲线无关，是优化器功耗锚定的
+    // 数据底座（打破闭环自指）与未来“按负载个性化”的基础
+    public var powerHistogram: [Double]?
 
     public var avgTemp: Double {
         tempSeconds > 0 ? tempSum / tempSeconds : (tempCount > 0 ? tempSum / tempCount : 0)
@@ -626,6 +660,18 @@ public struct DailyStats: Codable {
         self.speedChanges = 0
         self.aiCyclingGuards = 0
         self.overshootPeak = 0
+        self.powerHistogram = nil
+    }
+
+    // 功耗分布采样（v3.3）：落入对应桶累计秒数（桶数变更的旧数据直接重建）
+    public mutating func addPowerSample(_ power: Double, seconds: Double) {
+        guard power.isFinite, power > 0.1, power < 1000 else { return }
+        var h = powerHistogram ?? [Double](repeating: 0, count: PowerHistogram.bucketCount)
+        if h.count != PowerHistogram.bucketCount {
+            h = [Double](repeating: 0, count: PowerHistogram.bucketCount)
+        }
+        h[PowerHistogram.bucketIndex(for: power)] += seconds
+        powerHistogram = h
     }
 
     // 温度分布采样：落入对应桶累计秒数（桶数变更的旧数据直接重建）
@@ -656,7 +702,7 @@ public struct DailyStats: Codable {
     private enum CodingKeys: String, CodingKey {
         case date, maxTemp, maxTempAt, highTempSeconds, tempSum, tempCount
         case revolutions, tempHistogram, powerSum, powerCount, tempSeconds, quietSeconds
-        case speedChanges, aiCyclingGuards, overshootPeak
+        case speedChanges, aiCyclingGuards, overshootPeak, powerHistogram
     }
 
     public init(from decoder: Decoder) throws {
@@ -676,6 +722,7 @@ public struct DailyStats: Codable {
         speedChanges = try c.decodeIfPresent(Double.self, forKey: .speedChanges) ?? 0
         aiCyclingGuards = try c.decodeIfPresent(Double.self, forKey: .aiCyclingGuards) ?? 0
         overshootPeak = try c.decodeIfPresent(Double.self, forKey: .overshootPeak) ?? 0
+        powerHistogram = try c.decodeIfPresent([Double].self, forKey: .powerHistogram)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -695,6 +742,7 @@ public struct DailyStats: Codable {
         try c.encode(speedChanges, forKey: .speedChanges)
         try c.encode(aiCyclingGuards, forKey: .aiCyclingGuards)
         try c.encode(overshootPeak, forKey: .overshootPeak)
+        try c.encodeIfPresent(powerHistogram, forKey: .powerHistogram)
     }
 }
 

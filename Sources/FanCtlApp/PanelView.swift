@@ -156,6 +156,11 @@ struct ContentView: View {
                     set: { model.setEnvCompensation($0) }
                 ))
                 .help("夏天自动放宽/冬天收紧目标与曲线，让同一设置全年行为一致")
+                Toggle("体感补偿（掌托 >40° 加强散热）", isOn: Binding(
+                    get: { model.palmCompensation },
+                    set: { model.setPalmCompensation($0) }
+                ))
+                .help("掌托超过 40°C 时自动收紧目标最多 4°C——直接服务体感而非代理指标；安静优先的用户可关闭")
                 Toggle("夜间安静档（22:00–8:00）", isOn: Binding(
                     get: { model.quietHours },
                     set: { model.setQuietHours($0) }
@@ -790,6 +795,15 @@ struct ContentView: View {
                         .padding(.horizontal, 6).padding(.vertical, 3)
                         .background(Capsule().fill(.green.opacity(0.12)))
                         .help("电池供电 · 目标自动放宽 +4°（更安静省电），与曲线\"电池安静档\"同语义")
+                        .transition(.opacity)
+                        .lineLimit(1)
+                }
+                if let pc = model.palmComp, pc > 0.5 {
+                    Label("体感 -\(Int(pc.rounded()))°", systemImage: "hand.raised.fill")
+                        .font(.caption2.weight(.medium)).foregroundStyle(.cyan)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(Capsule().fill(.cyan.opacity(0.12)))
+                        .help("掌托 \(Int(model.palmRestTemp ?? 40))°C 超过舒适阈值：目标自动收紧（体感补偿）")
                         .transition(.opacity)
                         .lineLimit(1)
                 }

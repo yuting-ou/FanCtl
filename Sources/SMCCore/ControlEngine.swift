@@ -484,12 +484,17 @@ public final class ControlEngine {
         // 89°C 以上(高于兜底释放线 88°),AI 在 88–92° 区间保持低转速会触发
         // "低转↔92° 全速↔88° 释放↔低转"的周期性振荡,学习窗口与"压不住"检测也全部失真
         let envOff = FanPipeline.envOffset(envTemp: envTemp, enabled: config.envCompensation)
+        // v3.3 体感补偿：掌托超阈值（>40°）→ 适度收紧（AI 目标降低、曲线查表右移）。
+        // 掌托数据用本拍已读的传感器读数；无效/低于阈值 → 0（零噪声代价）
+        let palmComp = FanPipeline.palmComp(palmRest: sensorReadings.palmRest,
+                                            enabled: effectiveConfig.palmCompensation)
         let aiTargetEff = effectiveConfig.mode == .ai
-            ? min(FanPipeline.failsafeReleaseTemp - 4,
+            ? max(60, min(FanPipeline.failsafeReleaseTemp - 4,
                   AIController.effectiveTarget(config.aiTargetTemp ?? 76, onBattery: onBattery,
                                                batterySaver: config.batteryPreset != nil)
                     + envOff
-                    + (nightActive && config.quietHours ? 4 : 0))
+                    + (nightActive && config.quietHours ? 4 : 0)
+                    - palmComp))
             : (config.aiTargetTemp ?? 76)
         // 静音承诺生效判定（hoist：AI 空闲交还抑制与评测排除共用同一判定）
         let quietActive = config.quietUntil != nil && config.quietCapPercent != nil
@@ -558,6 +563,7 @@ public final class ControlEngine {
                                           aiPercent: aiPercent, now: hooks.now(),
                                           nightActive: nightActive,
                                           envTemp: envTemp,
+                                          palmComp: palmComp,
                                           wasSSDGuardActive: ssdGuardActive,
                                           wasSSDCriticalActive: ssdCriticalActive,
                                           wasFailsafeActive: failsafeActive,
@@ -952,7 +958,8 @@ public final class ControlEngine {
                             && !decision.ssdGuard && !decision.batteryGuard
                             && !decision.failsafeActive) ? true : nil,
             envTemp: envTemp,
-            aiTargetEffective: effectiveConfig.mode == .ai ? aiTargetEff : nil
+            aiTargetEffective: effectiveConfig.mode == .ai ? aiTargetEff : nil,
+            palmComp: palmComp > 0.5 ? palmComp : nil
         )
 
         let summary = statusChangeSummary(status)

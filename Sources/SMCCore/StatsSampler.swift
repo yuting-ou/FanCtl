@@ -56,6 +56,8 @@ public struct StatsSampler {
         stats.tempSeconds += seconds
         // 温度分布直方图：AI 曲线优化的数据底座（按 2°C 桶累计秒数）
         stats.addTempSample(temp, seconds: seconds)
+        // 功耗分布直方图（v3.3）：负载分布与曲线无关，优化器功耗锚定的数据底座
+        stats.addPowerSample(powerWatts ?? 0, seconds: seconds)
         stats.revolutions += totalRPM * seconds / 60
         // 功耗累计（散热退化趋势的数据底座；无功耗键的机型跳过）
         if let p = powerWatts, p.isFinite, p > 0.1, p < 1000 {

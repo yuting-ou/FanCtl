@@ -2965,6 +2965,26 @@ func testControlEngine() {
         expect(tgTotal <= 11, "迟滞量化写入（总 \(tgTotal) 次，未接线为 15）")
     }
 
+    // —— 场景 13：体感补偿 → AI 有效目标收紧（v3.3） ——
+    do {
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false,
+                                         palmCompensation: true))
+        let smc = makeFanSMC(); smc.set("Tp01", 70); smc.set("Ts0P", 44); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        engine.beat()
+        let st = ConfigStore.loadStatus()
+        expectClose(st?.aiTargetEffective ?? 0, 72, 0.01, "掌托 44° → 有效目标 76−4 = 72（得 \(st?.aiTargetEffective ?? -1)）")
+        expect(st?.palmComp == 4, "status 下发体感补偿量")
+        // 关闭后恢复
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+        clock.advance(3)
+        engine.beat()
+        expectClose(ConfigStore.loadStatus()?.aiTargetEffective ?? 0, 76, 0.01, "关闭体感补偿恢复 76")
+    }
+
     // —— 场景 9：静音封顶期不污染 AI 评测（v2.9） ——
     do {
         envDirs.append(engineTestEnv())
@@ -3095,6 +3115,61 @@ func testHILHysteresis() {
     expect(hyst.maxO <= base.maxO + 2, "过冲不恶化（\(String(format: "%.1f", hyst.maxO)) vs \(String(format: "%.1f", base.maxO))）")
 }
 
+// MARK: - v3.3 体感补偿 + 功耗直方图 + 优化器功耗门控
+
+func testPalmComp() {
+    group("体感补偿")
+    expectEqual(FanPipeline.palmComp(palmRest: 39, enabled: true), 0, "39° 舒适区内不收紧")
+    expectEqual(FanPipeline.palmComp(palmRest: 40, enabled: true), 0, "40° 阈值起点为 0")
+    expectEqual(FanPipeline.palmComp(palmRest: 42, enabled: true), 2, "42° 收紧 2°")
+    expectEqual(FanPipeline.palmComp(palmRest: 45, enabled: true), 4, "45° 封顶 +4")
+    expectEqual(FanPipeline.palmComp(palmRest: 50, enabled: true), 4, "50° 封顶 +4")
+    expectEqual(FanPipeline.palmComp(palmRest: nil, enabled: true), 0, "无传感器为 0")
+    expectEqual(FanPipeline.palmComp(palmRest: 44, enabled: false), 0, "未启用为 0")
+    expectEqual(FanPipeline.palmComp(palmRest: .nan, enabled: true), 0, "NaN 为 0")
+    expectEqual(FanPipeline.palmComp(palmRest: 60, enabled: true), 0, ">55° 读数异常为 0")
+
+    // decide 集成：仅基础曲线分支收紧，电池档不受影响
+    let bal = CurvePreset.balanced.points
+    let cfg = FanConfig(mode: .curve, curve: bal, preset: .balanced, envCompensation: false)
+    let with = FanPipeline.decide(config: cfg, smoothedTemp: 70, rawTemp: 70, nandTemp: 40,
+                                  onBattery: false, aiPercent: nil, now: Date(), palmComp: 4)
+    let without = FanPipeline.decide(config: cfg, smoothedTemp: 70, rawTemp: 70, nandTemp: 40,
+                                     onBattery: false, aiPercent: nil, now: Date())
+    expectClose(with.targetPercent!, FanConfig.percent(temp: 74, curve: bal), 1e-9, "体感补偿查表右移 4°（74° 查表）")
+    expect(with.targetPercent! > without.targetPercent!, "体感补偿加强散热")
+    let batt = FanConfig(mode: .curve, curve: bal, preset: .balanced,
+                         batteryPreset: .quiet, envCompensation: false)
+    let withB = FanPipeline.decide(config: batt, smoothedTemp: 70, rawTemp: 70, nandTemp: 40,
+                                   onBattery: true, aiPercent: nil, now: Date(), palmComp: 4)
+    expectClose(withB.targetPercent!, FanConfig.percent(temp: 70, curve: CurvePreset.quiet.points), 1e-9,
+                "电池安静档不被体感补偿覆盖")
+}
+
+func testPowerHistogram() {
+    group("功耗直方图")
+    expectEqual(PowerHistogram.bucketIndex(for: 0.5), 0, "0.5W → 桶 0")
+    expectEqual(PowerHistogram.bucketIndex(for: 3), 1, "3W → 桶 1")
+    expectEqual(PowerHistogram.bucketIndex(for: 61), 29, "61W 并入尾桶")
+    expectEqual(PowerHistogram.bucketIndex(for: .nan), 0, "NaN → 桶 0")
+    var d = DailyStats(date: "2026-09-01")
+    d.addPowerSample(25, seconds: 700); d.addPowerSample(26, seconds: 700); d.addPowerSample(45, seconds: 700)
+    let h = d.powerHistogram!
+    expectEqual(h.count, PowerHistogram.bucketCount, "桶数")
+    expectClose(h.reduce(0, +), 2100, 1e-9, "总秒数守恒")
+    d.addPowerSample(.nan, seconds: 700)
+    expectClose(d.powerHistogram!.reduce(0, +), 2100, 1e-9, "NaN 不入桶")
+    // P50 计算（2100s ≥ 30min 门槛；前两桶累计 1400s 过半 → 桶 13 内插值）
+    expectClose(CurveOptimizer.powerP50([d])!, 27.0, 0.01, "P50 = 27.0W")
+    // Codable 兼容（日期策略必须 iso8601，与 ConfigStore 一致）
+    let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+    let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+    let back = try! dec.decode(DailyStats.self, from: enc.encode(d))
+    expectEqual(back.powerHistogram!, h, "powerHistogram 往返")
+    let legacy = #"{"date":"2026-08-01","maxTemp":60,"maxTempAt":"2026-08-01T10:00:00Z","highTempSeconds":0,"tempSum":60,"tempCount":1,"revolutions":0}"#.data(using: .utf8)!
+    expectEqual(try! dec.decode(DailyStats.self, from: legacy).powerHistogram, nil, "旧战报兼容")
+}
+
 // MARK: - v2.9 优化器反漂移（闭环自指的锚点限幅）
 
 func testCurveAntiDrift() {
@@ -3139,6 +3214,50 @@ func testCurveAntiDrift() {
     // 无 previous（首次）→ 完全不限幅
     let bare = CurveOptimizer.optimize(days: days)!
     expectEqual(bare.points, first.points, "首次应用与旧行为一致")
+
+    // v3.3 功耗锚定门控：温度分位下移而负载未变 → 自降温，下移压到 0.25°/周期
+    func powerDays(_ center: Double, _ maxT: Double) -> [DailyStats] {
+        (1...7).map { i in
+            var d = makeDay("2026-08-2\(i)", center: center, spread: 7, hours: 6, maxT: maxT, hotRatio: 0.01)
+            var h = [Double](repeating: 0, count: PowerHistogram.bucketCount)
+            h[12] = 6 * 3600   // 负载集中在 ~25W
+            d.powerHistogram = h
+            return d
+        }
+    }
+    let coolBase = powerDays(60, 85)
+    let first2 = CurveOptimizer.optimize(days: coolBase)!
+    expectClose(first2.powerP50!, 25.0, 0.1, "powerP50 从直方图计算（得 \(first2.powerP50!)）")
+    let cooler2 = powerDays(57, 82)
+    let gated = CurveOptimizer.optimize(days: cooler2, previous: first2.presetCurves,
+                                        previousHotRatio: 0.03, previousPowerP50: 25.5)!
+    let g2 = gated.presetCurves[.balanced]!
+    for i in 0..<5 {
+        expect(g2[i].temp >= first2.presetCurves[.balanced]![i].temp - 0.26,
+               "负载未变 → 锚点\(i)下移压到 0.25°（\(first2.presetCurves[.balanced]![i].temp)→\(g2[i].temp)）")
+    }
+    // 负载变化（25.5→40W，超过 max(2, 15%) 门槛）→ 正常热压力门控（0.5°）
+    let loadShift = CurveOptimizer.optimize(days: cooler2, previous: first2.presetCurves,
+                                            previousHotRatio: 0.03, previousPowerP50: 40)!
+    let l2 = loadShift.presetCurves[.balanced]!
+    expect(l2[0].temp < first2.presetCurves[.balanced]![0].temp - 0.26,
+           "负载变化 → 放开 0.5° 下移（\(first2.presetCurves[.balanced]![0].temp)→\(l2[0].temp)）")
+    expectLegal(g2, "功耗门控路径合法")
+
+    // v3.3 功耗门控不覆盖热压力快速通道：功耗未变 + 热压力大幅上升 → 仍 1.5°/周期
+    let hotPow = (1...7).map { i -> DailyStats in
+        var d = makeDay("2026-08-2\(i)", center: 82, spread: 9, hours: 6, maxT: 96, hotRatio: 0.15)
+        var h = [Double](repeating: 0, count: PowerHistogram.bucketCount)
+        h[12] = 6 * 3600
+        d.powerHistogram = h
+        return d
+    }
+    let hp = CurveOptimizer.optimize(days: hotPow, previous: first.presetCurves,
+                                     previousHotRatio: 0.03, previousPowerP50: 25.5)!
+    expect(hp.powerP50! > 0.04, "功耗 P50 已计算（得 \(hp.powerP50!)）")
+    let hb1 = first.presetCurves[.balanced]!
+    expect(hp.presetCurves[.balanced]!.enumerated().contains { $0.element.temp <= hb1[$0.offset].temp - 0.51 },
+           "功耗未变 + 热压力上升 → 1.5° 快速通道仍生效（未被功耗门控覆盖）")
 }
 
 // MARK: - v2.9 学习卫生（环境修正清洗 + 功耗分档滞回）
@@ -3206,6 +3325,8 @@ testCurveAntiDrift()
 testLearningHygiene()
 testAICyclingGuard()
 testHILHysteresis()
+testPalmComp()
+testPowerHistogram()
 print("——")
 if failures == 0 {
     print("✅ 全部通过：\(checks) 项断言")

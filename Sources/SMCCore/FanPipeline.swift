@@ -61,6 +61,15 @@ public enum FanPipeline {
         }
     }
 
+    /// 体感补偿偏移（v3.3）：palmComp = clamp((掌托−40)×1, 0, +4)，正値 = 目标收紧。
+    /// 物理依据：芯片温度是代理指标，用户感知的是掌托；"掌托 − 40°C"是体感超阈值量
+    /// （不用掌托−环境，避免与环境补偿双重计账）。风扇对底盘温度控制权限有限，
+    /// 钳位 +4 保守。nil/无效/低于 40°（舒适区内）→ 0，零噪声代价。
+    public static func palmComp(palmRest: Double?, enabled: Bool) -> Double {
+        guard enabled, let palm = palmRest, palm.isFinite, palm > 5, palm < 55 else { return 0 }
+        return max(0, min(4, palm - 40))
+    }
+
     /// 环境温度补偿偏移：envOffset = clamp((env−25)×0.5, −5, +8)。
     /// 物理依据：绝对温度 = 环境 + 温升；夏天环境 35°C 时芯片 70°C 只相当于
     /// 冬天环境 15°C 时的 60°C 负载——曲线查表温度应左移（更保守）、
@@ -134,6 +143,7 @@ public enum FanPipeline {
                               now: Date,
                               nightActive: Bool = false,
                               envTemp: Double? = nil,
+                              palmComp: Double = 0,
                               wasSSDGuardActive: Bool = false,
                               wasSSDCriticalActive: Bool = false,
                               wasFailsafeActive: Bool = false,
@@ -156,7 +166,8 @@ public enum FanPipeline {
                 reason = .battery
                 // AI 个性化过的电池档曲线优先，没有则用出厂预设点。
                 // 查表温度同样减 envOff：环境补偿是"绝对温度→温升"的语义修正，
-                // 电池档不能豁免（夏天电池模式查表温度偏高 → 风扇无谓激进），与日间/夜间一致
+                // 电池档不能豁免（夏天电池模式查表温度偏高 → 风扇无谓激进），与日间/夜间一致。
+                // 体感补偿不参与电池/夜间档：它们是明确的安静意图，不被体感覆盖
                 target = FanConfig.percent(temp: smoothedTemp - envOff,
                                            curve: config.batteryCurve ?? bp.points)
             } else if nightActive && config.quietHours {
@@ -167,7 +178,8 @@ public enum FanPipeline {
                                            curve: config.nightCurve ?? CurvePreset.quiet.points)
             } else {
                 reason = .curve
-                target = config.percentFor(temp: smoothedTemp - envOff)
+                // 体感补偿（v3.3）：掌托超阈值 → 查表温度右移（更早介入更强散热）
+                target = config.percentFor(temp: smoothedTemp - envOff + palmComp)
             }
         case .ai:
             reason = .ai
