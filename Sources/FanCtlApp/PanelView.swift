@@ -93,12 +93,16 @@ struct ContentView: View {
                 .shadow(color: .blue.opacity(0.4), radius: 3, y: 1)
             Text("清风")
                 .font(.system(.title3, design: .rounded).weight(.semibold))
+                .lineLimit(1).fixedSize()
             Spacer()
-            // 整机功耗胶囊（发热的“因”，有传感器才显）
+            // 整机功耗胶囊（发热的"因"，有传感器才显）
+            // lineLimit(1)+fixedSize：头部三项胶囊+标题+菜单在 340pt 内空间紧张，
+            // 无此防护时文本会被压缩折行（"42 W"折成两行，审查截图实测）
             if let w = model.systemPower {
                 HStack(spacing: 3) {
                     Image(systemName: "bolt.fill").font(.system(size: 9))
-                    Text("\(Int(w.rounded())) W").font(.caption.monospacedDigit().weight(.medium))
+                    Text("\(Int(w.rounded()))W").font(.caption.monospacedDigit().weight(.medium))
+                        .lineLimit(1).fixedSize()
                         .contentTransition(.numericText())
                         .animation(.snappy, value: w)
                 }
@@ -113,6 +117,7 @@ struct ContentView: View {
                 HStack(spacing: 3) {
                     Image(systemName: model.envTempOverride != nil ? "thermometer.medium.circle.fill" : "thermometer.medium").font(.system(size: 9))
                     Text("环境 \(Int(env.rounded()))°").font(.caption.monospacedDigit().weight(.medium))
+                        .lineLimit(1).fixedSize()
                 }
                 .foregroundStyle(model.envTempOverride != nil ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
                 .padding(.horizontal, 8).padding(.vertical, 5)
@@ -132,6 +137,7 @@ struct ContentView: View {
                 Text(model.daemonAlive ? "运行中" : "未运行")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1).fixedSize()
                     .contentTransition(.opacity)
                     .animation(.smooth(duration: 0.3), value: model.daemonAlive)
             }
@@ -771,55 +777,43 @@ struct ContentView: View {
                     HStack(spacing: 4) {
                         Image(systemName: s.0).font(.caption.weight(.bold))
                         Text(i.label).font(.caption.weight(.medium))
+                            .lineLimit(1).fixedSize()
                     }
                     .foregroundStyle(s.1)
                     .padding(.horizontal, 7).padding(.vertical, 3)
                     .background(Capsule().fill(s.1.opacity(0.15)))
                     .id(i)
                     .transition(.opacity)
-                    // lineLimit(1)：电池+夜间+意图+经验四胶囊同现时 340pt 内放不下，
-                    // 无限制会换行撑高 ~14pt → aiContent 超 200pt 槽位裁剪底部学习条
-                    .lineLimit(1)
+                    // layoutPriority：意图是本行主信息，空间不足时优先完整显示；
+                    // 电池/体感/夜间胶囊与"经验"允许被截断（次要状态）
+                    .layoutPriority(1)
                 } else {
                     Text(model.controlReason == .aiIdle ? "风扇已交还系统" : "AI 状态同步中")
                         .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        .lineLimit(1).fixedSize()
                         .padding(.horizontal, 7).padding(.vertical, 3)
                         .background(Capsule().fill(.secondary.opacity(0.12)))
                         .id("pending")
                         .transition(.opacity)
-                        .lineLimit(1)
+                        .layoutPriority(1)
                 }
                 if model.onBattery && model.batterySaver {
-                    Label("电池 +4°", systemImage: "battery.50")
-                        .font(.caption2.weight(.medium)).foregroundStyle(.green)
-                        .padding(.horizontal, 6).padding(.vertical, 3)
-                        .background(Capsule().fill(.green.opacity(0.12)))
-                        .help("电池供电 · 目标自动放宽 +4°（更安静省电），与曲线\"电池安静档\"同语义")
-                        .transition(.opacity)
-                        .lineLimit(1)
+                    adaptiveChip(icon: "battery.50", text: "电池 +4°", color: .green,
+                                 help: "电池供电 · 目标自动放宽 +4°（更安静省电），与曲线\"电池安静档\"同语义")
                 }
                 if let pc = model.palmComp, pc > 0.5 {
-                    Label("体感 -\(Int(pc.rounded()))°", systemImage: "hand.raised.fill")
-                        .font(.caption2.weight(.medium)).foregroundStyle(.cyan)
-                        .padding(.horizontal, 6).padding(.vertical, 3)
-                        .background(Capsule().fill(.cyan.opacity(0.12)))
-                        .help("掌托 \(Int(model.palmRestTemp ?? 40))°C 超过舒适阈值：目标自动收紧（体感补偿）")
-                        .transition(.opacity)
-                        .lineLimit(1)
+                    adaptiveChip(icon: "hand.raised.fill", text: "体感 -\(Int(pc.rounded()))°", color: .cyan,
+                                 help: "掌托 \(Int(model.palmRestTemp ?? 40))°C 超过舒适阈值：目标自动收紧（体感补偿）")
                 }
                 if model.nightOverride {
-                    Label("夜间 +4°", systemImage: "moon.stars.fill")
-                        .font(.caption2.weight(.medium)).foregroundStyle(.teal)
-                        .padding(.horizontal, 6).padding(.vertical, 3)
-                        .background(Capsule().fill(.teal.opacity(0.12)))
-                        .help("夜间安静档（22:00–8:00）· AI 目标放宽 +4°，更安静")
-                        .transition(.opacity)
-                        .lineLimit(1)
+                    adaptiveChip(icon: "moon.stars.fill", text: "夜间 +4°", color: .teal,
+                                 help: "夜间安静档（22:00–8:00）· AI 目标放宽 +4°，更安静")
                 }
-                Spacer()
+                Spacer(minLength: 2)
                 if let ln = model.learnedNow {
                     Text("经验 \(Int(ln))%")
                         .font(.caption2.monospacedDigit()).foregroundStyle(.purple)
+                        .lineLimit(1).minimumScaleFactor(0.8)
                         .help("当前温度下，本机经验地图认为稳住温度所需的风量")
                         .contentTransition(.numericText())
                         .animation(.snappy, value: ln)
@@ -904,6 +898,25 @@ struct ContentView: View {
     // 一条 0-100% 轨道，紫色填充 = AI 实际输出，灰色刻度线 = 用户曲线基准。
     // 刻度线位置 = "用户期望转速"，填充条到紫色 = "AI 最终输出"，
     // 两者间距 = "AI 自适应修正量"（散热压不住则加码、散热好则放松）。
+    // 自适应状态胶囊：空间足够显示"图标+文字"，不足时降级为纯图标（悬停仍有完整说明）。
+    // ViewThatFits 避免"图标+省略号"的尴尬截断（旧 lineLimit(1) 无降级路径）；
+    // 两个变体都 fixedSize——压缩由 ViewThatFits 的选择完成，不由布局挤压完成
+    private func adaptiveChip(icon: String, text: String, color: Color, help: String) -> some View {
+        ViewThatFits(in: .horizontal) {
+            Label(text, systemImage: icon)
+                .font(.caption2.weight(.medium)).foregroundStyle(color)
+                .lineLimit(1).fixedSize()
+                .padding(.horizontal, 6).padding(.vertical, 3)
+                .background(Capsule().fill(color.opacity(0.12)))
+            Image(systemName: icon)
+                .font(.caption2.weight(.medium)).foregroundStyle(color)
+                .padding(.horizontal, 5).padding(.vertical, 3)
+                .background(Capsule().fill(color.opacity(0.12)))
+        }
+        .help(help)
+        .transition(.opacity)
+    }
+
     private func curveAIComboBar(curve: Double, ai: Double) -> some View {
         let curveC = min(max(curve, 0), 100)
         let aiC = min(max(ai, 0), 100)

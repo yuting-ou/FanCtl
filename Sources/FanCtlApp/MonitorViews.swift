@@ -118,51 +118,63 @@ struct HotspotList: View {
         if components.isEmpty {
             MonitorEmpty(text: "暂无传感器数据")
         } else {
-            VStack(spacing: 3) {
+            // 固定槽位自适应行高：槽位 92pt 内均分（spacing 占位后每行 ≈16pt），
+            // 行内内容用 minimumScaleFactor 兜底——5 部件（散热片/CPU/GPU/掌托/SSD
+            // 同时有效）时每行只有 ~16pt，行 padding 压到 1 否则最后一条背景被裁出槽位
+            // （旧实现行 padding 4 + 内容 11pt 固定高，4 行 ≈53pt 是上限，5 行必溢出）
+            VStack(spacing: 2) {
                 ForEach(Array(components.enumerated()), id: \.element.id) { idx, comp in
                     let c = MonitorStyle.color(comp.temp)
-                    HStack(spacing: 9) {
-                        // 部件图标 + 名称
-                        HStack(spacing: 5) {
-                            Image(systemName: icon(comp.id))
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                                .frame(width: 15)
-                            Text(comp.id)
-                                .font(.system(size: 11, weight: .medium, design: .rounded))
-                                .foregroundStyle(.primary)
-                        }
-                        .frame(width: 62, alignment: .leading)
-                        // 热度条：40~100°C 映射宽度，统一胶囊辉光能量条
-                        GlowBar(fraction: (comp.temp - 40) / 60, color: c)
-                            .frame(height: 6)
-                        HStack(spacing: 3) {
-                            if idx == 0 {
-                                Image(systemName: "flame.fill").font(.system(size: 9)).foregroundStyle(c)
-                                    .transition(.scale.combined(with: .opacity))
-                            }
-                            Text("\(Int(comp.temp.rounded()))°")
-                                .font(MonitorStyle.numeral(idx == 0 ? 15 : 13))
-                                .foregroundStyle(c.gradient)
-                                .contentTransition(.numericText())
-                                .animation(.snappy, value: comp.temp)
-                        }
-                        .frame(width: 50, alignment: .trailing)
-                    }
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 4)
-                    // 行背景：最热第一项用温度色强调，其余用极淡中性色，增强列表层次
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(idx == 0 ? c.opacity(0.10) : .secondary.opacity(0.05))
-                    )
-                    .frame(maxHeight: .infinity)
-                    .animation(.smooth(duration: 0.35), value: c)
+                    hotspotRow(idx: idx, comp: comp, color: c)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .animation(.spring(duration: 0.4, bounce: 0.2), value: components.map(\.id))
         }
+    }
+
+    // 单行：图标+名称 · 辉光热度条 · （火焰）温度数字。
+    // 名称/数字不换行不压缩布局：数字 minimumScaleFactor 只在 5 行挤压时缩 10%
+    private func hotspotRow(idx: Int, comp: FanModel.ComponentTempDisplay, color: Color) -> some View {
+        HStack(spacing: 8) {
+            // 部件图标 + 名称
+            HStack(spacing: 5) {
+                Image(systemName: icon(comp.id))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14)
+                Text(comp.id)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+            .frame(width: 58, alignment: .leading)
+            // 热度条：40~100°C 映射宽度，统一胶囊辉光能量条
+            GlowBar(fraction: (comp.temp - 40) / 60, color: color)
+                .frame(height: 5)
+            HStack(spacing: 3) {
+                if idx == 0 {
+                    Image(systemName: "flame.fill").font(.system(size: 8)).foregroundStyle(color)
+                        .transition(.scale.combined(with: .opacity))
+                }
+                Text("\(Int(comp.temp.rounded()))°")
+                    .font(MonitorStyle.numeral(idx == 0 ? 14 : 12))
+                    .foregroundStyle(color.gradient)
+                    .contentTransition(.numericText())
+                    .animation(.snappy, value: comp.temp)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            .frame(width: 44, alignment: .trailing)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 1)
+        // 行背景：最热第一项用温度色强调，其余用极淡中性色，增强列表层次
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(idx == 0 ? color.opacity(0.10) : .secondary.opacity(0.05))
+        )
+        .animation(.smooth(duration: 0.35), value: color)
     }
 }
 
