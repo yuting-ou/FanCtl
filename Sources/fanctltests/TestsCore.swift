@@ -346,3 +346,43 @@ func testCurveAntiDrift() {
            "功耗未变 + 热压力上升 → 1.5° 快速通道仍生效（未被功耗门控覆盖）")
 }
 
+
+// MARK: - v3.4 powermetrics golden 样本解析（外部依赖加固）
+//
+// powermetrics 文本输出是全项目最脆的外部面（Apple 不保证稳定；已踩 -u W 与
+// 千分位两个坑）。本组测试用真实输出样本 + 已知坏格式锁定解析契约：
+//   - macOS 26 真实格式（含 P/E-Cluster 干扰行、多样本取最后、0 mW）
+//   - 旧版格式
+//   - 完全无法解析（报错输出）→ nil → 调用方退回整机 PSTR 前馈 + 日志
+// golden 样本在 Fixtures/ 目录，用 #filePath 定位（零资源声明开销）。
+
+func goldenFixture(_ name: String) -> String {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()          // Sources/fanctltests/
+        .appendingPathComponent("Fixtures/\(name)")
+    return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+}
+
+func testPowerMetricsGolden() {
+    group("powermetrics golden 样本")
+    // macOS 26 真实输出：多样本取最后、P/E-Cluster 干扰行忽略、mW 换算
+    let m26 = goldenFixture("powermetrics-macos26.golden")
+    expect(!m26.isEmpty, "golden 样本可读取")
+    expectClose(PowerMetricsParser.watts(in: m26, key: "CPU Power:")!, 3.890, 1e-6,
+                "macOS26 CPU：多样本取最后（3890 mW）")
+    expectClose(PowerMetricsParser.watts(in: m26, key: "GPU Power:")!, 0.012, 1e-6,
+                "macOS26 GPU：第二样本 12 mW")
+    // E-Cluster 行不得被误认为 CPU Power
+    expect(PowerMetricsParser.watts(in: m26, key: "Cluster Power:") != 0.812,
+           "Cluster 干扰行不误匹配（子串 key 的边界）")
+    // 旧版格式
+    let legacy = goldenFixture("powermetrics-legacy.golden")
+    expectClose(PowerMetricsParser.watts(in: legacy, key: "CPU Power:")!, 2.345, 1e-6, "旧版 CPU")
+    expectClose(PowerMetricsParser.watts(in: legacy, key: "GPU Power:")!, 0.890, 1e-6, "旧版 GPU")
+    // 坏格式：usage/error 输出 → nil（调用方退回整机 PSTR）
+    let broken = goldenFixture("powermetrics-broken.golden")
+    expectEqual(PowerMetricsParser.watts(in: broken, key: "CPU Power:"), nil, "报错输出 → nil")
+    expectEqual(PowerMetricsParser.watts(in: "", key: "CPU Power:"), nil, "空输出 → nil")
+    // 单位歧义行：无单位裸数字按 W 采信（与修复前一致——真实输出恒有单位）
+    expectClose(PowerMetricsParser.watts(in: "CPU Power: 45", key: "CPU Power:")!, 45, 1e-9, "无单位按 W")
+}

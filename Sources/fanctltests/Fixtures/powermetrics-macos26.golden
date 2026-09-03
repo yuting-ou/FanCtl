@@ -1,0 +1,21 @@
+Machine model: Mac15,6
+OS version: 25A357
+Sampler descriptions: [cpu_power, gpu_power]
+
+*** Sampled system activity (Mon Sep  1 10:00:00 2026 +0800) (5003.02ms elapsed) ***
+
+CPU Power: 4578 mW
+CPU Energy: 22914 mJ
+E-Cluster Power: 812 mW
+P0-Cluster Power: 2103 mW
+P1-Cluster Power: 1560 mW
+
+GPU Power: 12 mW
+GPU Energy: 60 mJ
+GPU HW active frequency: 452 MHz
+GPU HW active residency: 12.3%
+
+*** Sampled system activity (Mon Sep  1 10:00:05 2026 +0800) (5001.44ms elapsed) ***
+
+CPU Power: 3890 mW
+GPU Power: 0 mW

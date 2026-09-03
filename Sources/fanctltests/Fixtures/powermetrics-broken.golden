@@ -1,0 +1,3 @@
+powermetrics: unable to sample CPU power
+powermetrics: invalid sampler specified: 12345
+Usage: powermetrics [-i sample_interval] [-r order] [-t wakeup_cost]
