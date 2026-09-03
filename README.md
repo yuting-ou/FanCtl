@@ -3,13 +3,15 @@
 ![Release](https://img.shields.io/github/v/release/yuting-ou/FanCtl)
 ![License](https://img.shields.io/github/license/yuting-ou/FanCtl)
 ![CI](https://github.com/yuting-ou/FanCtl/actions/workflows/ci.yml/badge.svg)
+![tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/yuting-ou/FanCtl/main/.github/badges/tests.json)
 ![Platform](https://img.shields.io/badge/macOS-26%2B-black)
 ![Swift](https://img.shields.io/badge/Swift-5.9-orange)
-![Tests](https://img.shields.io/badge/tests-2415-brightgreen)
 
 > 本文档面向**AI 助手/开发者**编写:读完即可理解本项目架构、控制逻辑、安全机制与开发流程,无需再通读全部源码。修改代码前请先读「给 AI 助手的注意事项」。
 
 **版本**:3.3 (build 49) · **语言**:Swift 5.9 · **平台**:macOS 26+ (Apple Silicon / Intel) · **无第三方依赖**
+
+> **为什么要求 macOS 26？** 面板 UI 使用了 macOS 26 的 Liquid Glass API（`glassEffect`）；控制逻辑本身（SMCCore）不依赖新系统——理论可行的方式是 UI 降级适配旧系统，但这需要维护两套界面实现，超出个人项目的维护预算。欢迎 fork 做向下移植。
 
 ---
 

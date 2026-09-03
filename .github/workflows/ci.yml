@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    name: 回归测试（2415 断言）+ Release 构建
+    name: 回归测试 + Release 构建
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
@@ -16,7 +16,20 @@ jobs:
         run: swift --version
 
       - name: 运行回归测试（失败即中断）
-        run: swift run -c release --disable-sandbox fanctltests
+        run: swift run -c release --disable-sandbox fanctltests | tee test-output.txt
+
+      - name: 更新断言数徽章（自 main 分支推送时）
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          N=$(grep -oE '[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1)
+          echo "断言数: $N"
+          mkdir -p .github/badges
+          jq -n --arg n "$N" '{schemaVersion: 1, label: "tests", message: ($n + " assertions"), color: "success"}' > .github/badges/tests.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/badges/tests.json
+          git diff --cached --quiet || git commit -m "CI: 更新断言数徽章 ($N)"
+          git push
 
       - name: Release 构建
         run: swift build -c release --disable-sandbox
