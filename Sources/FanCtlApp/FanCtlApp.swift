@@ -6,7 +6,8 @@ import SMCCore
 
 // FanCtl 菜单栏 App
 // macOS 26 Liquid Glass 风格面板：玻璃卡片分组 + 实时曲线图，自适应深/浅色。
-// 温度/转速通过 SMC 只读直取（无需 root）；模式切换写 config.json 交给守护进程执行。
+// 数据链：daemon 读 SMC 写 status.json，App 只读 status.json 展示（不直连 SMC）；
+// 模式切换写 config.json 交给守护进程执行（单一数据源）。
 
 // Liquid Glass 在 ImageRenderer 离屏渲染下无法正确合成（文字/材质会丢失），
 // 快照模式下改用实心材质渲染卡片，仅用于验证布局；运行时仍为玻璃。

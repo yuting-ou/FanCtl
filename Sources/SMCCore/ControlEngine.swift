@@ -969,7 +969,12 @@ public final class ControlEngine {
         // #8: 每 3 正常拍即使 summary 未变也强制写一次，保证 App deglitch 能检测到 daemon 存活
         if !fastConfigApply { forceWriteCounter += 1 }
         let forceWrite = !fastConfigApply && forceWriteCounter >= 3
-        if fastConfigApply || summary != lastStatusSummary || heartbeatDue || forceWrite {
+        // v3.4.5（2A）：删除 `fastConfigApply ||` 短路——statusChangeSummary 已含
+        // appliedPercent(s)/mode/reason，输出一变 summary 必变本就会写；App 对自己
+        // 写的 config 有乐观 UI，fast 拍无条件写盘只造成拖滑块时 ~10 次/秒的
+        // 全量 JSON 编码+原子写。fast-apply 后调度的 2s 跟进正常拍仍会把 RPM
+        // 物理爬升反映到 status。
+        if summary != lastStatusSummary || heartbeatDue || forceWrite {
             ConfigStore.saveStatus(status)
             lastStatusSummary = summary
             lastStatusWrite = now

@@ -142,12 +142,28 @@ final class FanModel: ObservableObject {
         cpuSampleTimer?.invalidate()
         cpuSampleTimer = nil
     }
+    // v3.4.5（2D）：ps 采样防重入——ps 子进程若挂起，readDataToEndOfFile 会永久
+    // 阻塞 detached 任务，3s 定时器继续叠加新 Task + Process（句柄无上界累积）。
+    // in-flight 标志 + 4s 强制过期（3s 采样周期的兜底释放），复制 daemon 侧
+    // PowerCompositionSampler 的同型防护。
+    @MainActor private var psSamplingInFlight = false
+    @MainActor private var psSamplingSince = Date.distantPast
+
     @MainActor private func sampleTopProcesses() {
+        if psSamplingInFlight,
+           Date().timeIntervalSince(psSamplingSince) < 4 {
+            return   // 上一次采样仍在途（≤4s 强制过期兜底），跳过本拍避免堆积
+        }
+        psSamplingInFlight = true
+        psSamplingSince = Date()
         // ps 采样涉及子进程，放后台线程执行，再切回主线程更新，避免阻塞 UI
         let owner = self
         Task.detached(priority: .utility) {
             let usage = NotificationService.sampleCPUUsage()
-            await MainActor.run { owner.topProcesses = usage }
+            await MainActor.run {
+                owner.topProcesses = usage
+                owner.psSamplingInFlight = false
+            }
         }
     }
     private var historyBuffer = RingBuffer<TempSample>(capacity: 200)

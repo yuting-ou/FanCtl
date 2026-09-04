@@ -687,12 +687,19 @@ public struct DailyStats: Codable {
     // 指定时刻的日期字符串。固定公历 + POSIX locale：系统日历设为佛历/和历时
     // yyyy 会输出 2569 等非公历年，会打断跨天归档、保留期裁剪与 AI 效果的日期
     // 比较链；时区保持用户本地（按本地自然日分天）。参数化时间便于测试注入。
-    public static func dayString(for date: Date) -> String {
+    // v3.4.5（2C）：formatter 提为静态缓存——每拍新建（含 locale/calendar 解析）
+    // 是著名 ~百微秒级开销，StatsSampler.record 每拍调用；日历/时区固定场景无失效问题。
+    // 主队列约定（daemon 全局状态单线程），App 侧亦主队列调用，无竞争。
+    private static let dayFormatter: DateFormatter = {
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.calendar = Calendar(identifier: .gregorian)
         fmt.dateFormat = "yyyy-MM-dd"
-        return fmt.string(from: date)
+        return fmt
+    }()
+
+    public static func dayString(for date: Date) -> String {
+        Self.dayFormatter.string(from: date)
     }
 
     public static func today() -> String { dayString(for: Date()) }

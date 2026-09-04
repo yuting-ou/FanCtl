@@ -630,14 +630,19 @@ public final class TemperatureSensors {
         // 一次 trackedMax 调用同时更新 max 和 lastAverage，避免重复 SMC 读
         let cpuMax = trackedMax(cpuKeys, track: &cpuTrack)
         let cpuAvg = cpuTrack.lastAverage
-        let gpu = gpuTemperature > 1 ? gpuTemperature : cpuMax
+        // v3.4.5（2B）：GPU 读数先落本地变量——三元两侧各写一次 gpuTemperature
+        // 会在 gpu ≤1°C（读失败）时对 gpuKeys 做两次全量 trackedMax 扫描
+        let gpuT = gpuTemperature
+        let gpu = gpuT > 1 ? gpuT : cpuMax
         let palm = palmRestTemperature > 1 ? palmRestTemperature : nil
         let hs = heatsinkTemperature > 1 ? heatsinkTemperature : nil
+        // nandTemperature 同为无 TTL 的 trackedMax：先落本地防同拍双读
+        let nandT = nandTemperature
         return SensorReadings(
             cpuDie: cpuMax,
             cpuAverage: cpuAvg > 0 ? cpuAvg : nil,
             gpuDie: gpu,
-            ssd: nandTemperature > 1 ? nandTemperature : nil,
+            ssd: nandT > 1 ? nandT : nil,
             palmRest: palm,
             heatsink: hs,
             otherHotspots: otherHotspotReadings()
