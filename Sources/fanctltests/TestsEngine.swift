@@ -13,6 +13,7 @@ final class MockSMC: SMCIO {
     var reads: [String] = []   // v3.4.1：读记录（缓存效果观测）
 
     func set(_ key: String, _ value: Double, type: String = "flt ") {
+        lock.lock(); defer { lock.unlock() }
         values[key] = (type, value)
     }
     func lastWrite(_ key: String) -> Double? { writes.last { $0.key == key }?.value }
@@ -21,6 +22,7 @@ final class MockSMC: SMCIO {
     /// smcReadings 等经 read() → doubleValue 的解码路径对 sp78/fpe2/ui8 完全没被测过。
     /// 编码格式与 SMC.swift 的真实约定一致（大端整型、sp78=值×256、fpe2=值×4）。
     func read(_ key: String) throws -> SMCValue {
+        lock.lock(); defer { lock.unlock() }
         guard let v = values[key] else { throw SMCError.keyNotFound(key) }
         switch v.type {
         case "sp78":
@@ -48,6 +50,7 @@ final class MockSMC: SMCIO {
         }
     }
     func readDouble(_ key: String) throws -> Double {
+        lock.lock(); defer { lock.unlock() }
         reads.append(key)
         guard let v = values[key] else { throw SMCError.keyNotFound(key) }
         return v.value
@@ -57,8 +60,17 @@ final class MockSMC: SMCIO {
         writes.append((key, value))
         values[key]?.value = value
     }
-    func keyExists(_ key: String) -> Bool { values[key] != nil }
-    func allKeys() throws -> [String] { Array(values.keys) }
+    func keyExists(_ key: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return values[key] != nil
+    }
+    // v3.4.5：NSLock 保护——rescanAllSensors 周期重扫在后台队列遍历 allKeys()，
+    // 与主线程 set() 写 values 的并发会崩（Dictionary 值语义 COW 损坏，段错误根因之一）
+    private let lock = NSLock()
+    func allKeys() throws -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return Array(values.keys)
+    }
 }
 
 

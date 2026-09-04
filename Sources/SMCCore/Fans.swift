@@ -374,6 +374,12 @@ public final class TemperatureSensors {
     }
 
     /// 同步全量扫描（初始化 / 测试 / 后台队列内部使用）
+    ///
+    /// v3.4.5 竞态修复：本函数从后台队列（rescanAllSensors）调用时，此前直接在
+    /// 后台线程写 self.cpuKeys/cpuTrack/cached* 等值类型字段——与主队列控制拍的
+    /// trackedMax(&cpuTrack)/cachedMax(&cachedPalmRest) 排他访问并发 → 段错误
+    ///（DoD-8 注释宣称"分类替换回主队列"但代码未实现）。现在后台只构建局部值，
+    /// 字段替换统一回主队列原子执行（主线程调用时同步执行，init 语义不变）。
     public func rescanAllSensorsBlocking(clockOverride: (() -> Date)? = nil) {
         let now = clockOverride?() ?? clock()
         let all = (try? smc.allKeys()) ?? []
@@ -388,29 +394,27 @@ public final class TemperatureSensors {
             }
         }
         // CPU/GPU/NAND/电池
-        var cpu = floatKeys(prefixes: ["Tp"])
-        var gpu = floatKeys(prefixes: ["Tg"])
-        self.nandKeys = floatKeys(prefixes: ["TH", "TS"])
-        self.battKeys = floatKeys(prefixes: ["TB"])
+        var newCpu = floatKeys(prefixes: ["Tp"])
+        var newGpu = floatKeys(prefixes: ["Tg"])
+        let newNand = floatKeys(prefixes: ["TH", "TS"])
+        let newBatt = floatKeys(prefixes: ["TB"])
 
         // 掌托/键盘体感：Ts0P/Ts1P/W0PR/W0PT/TB0T 等
-        self.palmRestKeys = floatKeys(prefixes: ["Ts", "W0P", "F0A"])
+        let newPalm = floatKeys(prefixes: ["Ts", "W0P", "F0A"])
         // 散热片/风道：Th0p/Th1p/Tf0s/Tf1s/TA0P 等
-        self.heatsinkKeys = floatKeys(prefixes: ["Th", "Tf", "TA"])
+        let newHeatsink = floatKeys(prefixes: ["Th", "Tf", "TA"])
 
         // 兜底：老 Intel 平台
-        if cpu.isEmpty {
-            cpu = ["TC0P", "TC0D", "TC0E", "TC0F", "TC1C", "TC2C"].filter { smc.keyExists($0) }
+        if newCpu.isEmpty {
+            newCpu = ["TC0P", "TC0D", "TC0E", "TC0F", "TC1C", "TC2C"].filter { smc.keyExists($0) }
         }
-        if gpu.isEmpty {
-            gpu = ["TG0P", "TG0D", "TG0F"].filter { smc.keyExists($0) }
+        if newGpu.isEmpty {
+            newGpu = ["TG0P", "TG0D", "TG0F"].filter { smc.keyExists($0) }
         }
-        self.cpuKeys = cpu
-        self.gpuKeys = gpu
 
         // 其他未归类但可能的温度键（T 开头 + 数字，排除已归类的前缀）
         let knownPrefixes: Set<String> = ["Tp", "Tg", "TH", "TS", "TB", "Ts", "W0P", "F0A", "Th", "Tf", "TA"]
-        self.otherHotKeys = all.filter { k in
+        let newOther = all.filter { k in
             guard k.hasPrefix("T") && k.count == 4 else { return false }
             // 排除已知分类
             let prefix = String(k.prefix(2))
@@ -421,20 +425,38 @@ public final class TemperatureSensors {
             return true
         }
 
-        lastScanTime = now
-        // 重置热点追踪，强制下次读取时全量扫描
-        cpuTrack = HotspotTrack()
-        gpuTrack = HotspotTrack()
-        nandTrack = HotspotTrack()
-        // 展示缓存也失效
-        cachedPalmRest = (0, .distantPast)
-        cachedHeatsink = (0, .distantPast)
-        cachedOtherHotspots = ([:], .distantPast)
-        cachedOtherMax = (0, .distantPast)
-        cachedBattery = (0, .distantPast)
-        let total = cpu.count + gpu.count + nandKeys.count + battKeys.count
-                    + palmRestKeys.count + heatsinkKeys.count + otherHotKeys.count
-        NSLog("fanctld: 传感器扫描完成 — CPU:\(cpu.count) GPU:\(gpu.count) SSD:\(nandKeys.count) 电池:\(battKeys.count) 掌托:\(palmRestKeys.count) 散热片:\(heatsinkKeys.count) 其他:\(otherHotKeys.count) 总计:\(total)")
+        func apply() {
+            cpuKeys = newCpu
+            gpuKeys = newGpu
+            nandKeys = newNand
+            battKeys = newBatt
+            palmRestKeys = newPalm
+            heatsinkKeys = newHeatsink
+            otherHotKeys = newOther
+
+            lastScanTime = now
+            // 重置热点追踪，强制下次读取时全量扫描
+            cpuTrack = HotspotTrack()
+            gpuTrack = HotspotTrack()
+            nandTrack = HotspotTrack()
+            // 展示缓存也失效
+            cachedPalmRest = (0, .distantPast)
+            cachedHeatsink = (0, .distantPast)
+            cachedOtherHotspots = ([:], .distantPast)
+            cachedOtherMax = (0, .distantPast)
+            cachedBattery = (0, .distantPast)
+            let total = cpuKeys.count + gpuKeys.count + nandKeys.count + battKeys.count
+                        + palmRestKeys.count + heatsinkKeys.count + otherHotKeys.count
+            NSLog("fanctld: 传感器扫描完成 — CPU:\(cpuKeys.count) GPU:\(gpuKeys.count) SSD:\(nandKeys.count) 电池:\(battKeys.count) 掌托:\(palmRestKeys.count) 散热片:\(heatsinkKeys.count) 其他:\(otherHotKeys.count) 总计:\(total)")
+        }
+        // 主线程（init/测试主流程）→ 同步应用（init 后续读取立即依赖分类结果）；
+        // 后台队列（rescanAllSensors 周期重扫）→ 回主队列原子替换，消除与控制拍
+        // inout 访问的排他性冲突（真数据竞态，段错误根因）
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.sync { apply() }
+        }
     }
 
     // 注意：checkRescan 不能在有 inout 参数激活的方法内部调用。
