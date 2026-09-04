@@ -43,6 +43,12 @@ struct FanCtlApp: App {
             // v2.6.2：先处理子视图快照分支（custom 会被 FanMode(rawValue:) 劫持成 .custom 模式，
             // 导致整面 custom 快照永远不可达——见下方 switch）
             let lastArg = CommandLine.arguments.last
+            // 排版实测用：--snapshot warn <mode> 强制最长警示条在场，量最坏情况总高
+            if CommandLine.arguments.contains("warn") { model.configWriteFailed = true }
+            // 排版实测用：--snapshot boost <mode> 预览冲刺倒计时态（boostBar 最高态）
+            if CommandLine.arguments.contains("boost") { model.boostEndDate = now.addingTimeInterval(900) }
+            // 排版实测用：--snapshot dead <mode> 预览 daemon 挂态（双标签同现最坏情况）
+            if CommandLine.arguments.contains("dead") { model.daemonAlive = false }
             if lastArg == "hotspots" || lastArg == "today" || lastArg == "custom" {
                 renderStandaloneViews(lastArg)
                 exit(0)
@@ -96,6 +102,9 @@ struct FanCtlApp: App {
             }
             let dark = CommandLine.arguments.contains("dark")
             if dark { suffix += "-dark" }
+            if CommandLine.arguments.contains("warn") { suffix += "-warn" }
+            if CommandLine.arguments.contains("boost") { suffix += "-boost" }
+            if CommandLine.arguments.contains("dead") { suffix += "-dead" }
             let wallpaper = dark
                 ? LinearGradient(
                     colors: [Color(red: 0.05, green: 0.06, blue: 0.12),

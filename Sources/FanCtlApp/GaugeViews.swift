@@ -141,6 +141,10 @@ struct TempGaugeCard: View {
                 .contentTransition(.opacity)
                 .transition(.opacity.combined(with: .scale(scale: 0.9)).combined(with: .move(edge: .top)))
             }
+            // 把 sparkline 锚到卡底：CPU 有副值 chip、GPU 无（GPU 无"核心均温"这类真实副指标，
+            // 不伪造数据、不为对称而改守护进程）。Spacer 吸收两卡高度差，使左右 sparkline
+            // 基线对齐，消除"CPU 多一行导致 GPU 折线悬空"的视觉不对称。
+            Spacer(minLength: 0)
             SparkLine(values: history, color: color)
                 .frame(height: 26)
                 .frame(maxWidth: .infinity)
@@ -154,7 +158,6 @@ struct TempGaugeCard: View {
 struct FanRow: View {
     let fan: FanState
     let name: String
-    let now: Date   // 父视图刷新拍时间戳，驱动子视图重渲染
     var offset: Double = 0        // 该风扇的独立偏移（%），0 = 无偏移
     var onOffsetChange: ((Double) -> Void)? = nil   // 用户调整偏移（nil = 不显示偏移控件）
 
@@ -207,6 +210,14 @@ struct FanRow: View {
             }
             // 独立偏移调节：双风扇散热能力不均/个体噪音差异时微调单侧
             if let onOffsetChange {
+                if snapshotPlainCards {
+                    // 快照：Menu 桥接 NSMenu 离屏退 🚫 → 等尺寸静态胶囊
+                    Text(offset == 0 ? "偏移" : "偏移 \(Int(offset))%")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(offset == 0 ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(Capsule().fill(.secondary.opacity(0.12)))
+                } else {
                 Menu {
                     ForEach([-20.0, -15, -10, -5, 0, 5, 10, 15, 20], id: \.self) { off in
                         Button(off == 0 ? "无偏移" : (off > 0 ? "\(name) +\(Int(off))%" : "\(name) \(Int(off))%")) {
@@ -223,6 +234,7 @@ struct FanRow: View {
                 }
                 .menuStyle(.button)
                 .fixedSize()
+                }
             }
         }
     }

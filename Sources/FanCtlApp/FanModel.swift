@@ -104,7 +104,7 @@ final class FanModel: ObservableObject {
         didSet {
             if panelVisible && !oldValue {
                 syncPanelData()  // 开面板立即同步，不等下一拍事件
-                startCPUSampling()  // 面板可见时开始采样"占用"进程榜
+                startCPUSamplingIfNeeded()  // v3.4.1：仅"占用"tab 需要 ps 采样
                 // v3.0：写入失败警示的探针恢复——用户重跑 install.sh 修好权限后，
                 // 开面板即重写一次配置，成功则清除警示（否则警示挂到下次改设置）
                 if configWriteFailed { saveConfig() }
@@ -113,11 +113,22 @@ final class FanModel: ObservableObject {
             }
         }
     }
+    @Published var monitorTab = 0   // 0=趋势 1=最热 2=今日 3=占用（App 侧持有，PanelView 绑定）
+    {
+        didSet {
+            // v3.4.1：离开/进入"占用"tab 即停/启 ps 子进程采样（DoD-5a）
+            if panelVisible {
+                if monitorTab == 3 { startCPUSamplingIfNeeded() } else { stopCPUSampling() }
+            }
+        }
+    }
     // "占用"进程榜采样定时器：仅面板打开时运行，3s 一拍，关闭即停
     private var cpuSampleTimer: Timer?
     // 面板长开时只读文件数据（学习/评测/战报）的低频刷新间隔
     private var lastPanelFileSync = Date.distantPast
-    private func startCPUSampling() {
+    /// v3.4.1：仅当面板可见且停在"占用"tab 时才启动 ps 子进程采样（DoD-5a）
+    private func startCPUSamplingIfNeeded() {
+        guard panelVisible, monitorTab == 3 else { return }
         cpuSampleTimer?.invalidate()
         sampleTopProcesses()
         let t = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
@@ -603,7 +614,9 @@ final class FanModel: ObservableObject {
             }
         }
 
-        lastRefresh = Date()
+        // v3.4.1：lastRefresh 仅面板可见时更新（唯一消费者 FanRow.now 已随 DoD-5c
+        // 移除；保留发布供未来 UI 计时使用，但不再每拍无谓触发 objectWillChange）
+        if panelVisible { lastRefresh = Date() }
 
         // 历史采样
         let hottest = max(cpuTemp, gpuTemp)

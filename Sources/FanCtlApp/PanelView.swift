@@ -7,11 +7,24 @@ import SMCCore
 struct ContentView: View {
     @ObservedObject var model: FanModel
     @AppStorage("menuBarStyle") private var menuBarStyle = "both"
-    @State private var monitorTab = 0  // 0 = 趋势，1 = 热点
+    // v3.4.1：model.monitorTab 由 FanModel 持有（DoD-5a：ps 采样仅在"占用"tab 采样）
 
     var body: some View {
-        GlassEffectContainer(spacing: 8) {
-            VStack(alignment: .leading, spacing: 12) {
+        // v3.4.1：快照模式下退 GlassEffectContainer（ImageRenderer 离屏无法
+        // 合成 Liquid Glass——容器把未覆盖的 glassEffect 渲染成系统黄色 🚫 占位）。
+        // snapshotCapsule/snapshotPlainCards 分支已覆盖各玻璃站点。
+        if snapshotPlainCards {
+            panelContent
+        } else {
+            GlassEffectContainer(spacing: 8) {
+                panelContent
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var panelContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
                 // daemon 挂时内容较少，固定高度下会留出大片底部空白；
                 // 用上下 Spacer 让内容垂直居中，留白均匀分布更自然
                 if !model.daemonAlive { Spacer(minLength: 0) }
@@ -29,23 +42,26 @@ struct ContentView: View {
                         .transition(.opacity)
                     Spacer(minLength: 0)
                 }
-                // 警示条按优先级只显示最高一条：面板固定高度（正常态 938/940 仅 2px 余量），
-                // 三条同现 ≈160px 会从底部溢出裁剪——恰在最需要警示的状态下警示被切掉
-                if let warn = activeWarning {
+                // 警示条按优先级只显示最高一条：面板固定高度 908 = 警示两行态 906 + 2px，
+                // 多条同现会从底部溢出裁剪——恰在最需要警示的状态下警示被切掉。
+                // daemon 挂时抑制警示条：「守护进程未运行」标签已覆盖"调速不会生效"语义，
+                // 双标签同现 919pt 会裁掉警示——且 daemon 死亡时闭环/对账警示均已失真。
+                if model.daemonAlive, let warn = activeWarning {
                     Label(warn.text, systemImage: warn.icon)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(warn.color)
                         .tintedCard(warn.color)
                         .transition(.opacity)
                 }
-            }
         }
         .padding(14)
-        .frame(width: 340, height: 940, alignment: .top)
+        .frame(width: 340, height: 908, alignment: .top)
         // 固定高度根治"面板跳"：MenuBarExtra 窗口尺寸 = 内容 idealSize，
         // 各模式/刷新瞬间 idealSize 有 1px 浮点差异就会触发窗口重排（表现为"跳"）。
         // 固定总高后窗口 idealSize 恒定，任何内部内容切换都不再改变窗口尺寸。
-        // 940 覆盖正常模式最大高度（938）留 2px 余量；daemon 挂时底部留白属异常态，可接受。
+        // v3.4.1 快照实测收紧 940→908：正常态最满内容 842pt（四模式同高，200pt 槽位固定），
+        // 警示条两行态 906pt 为真实最坏情况——908 覆盖它留 2px，警示永不被裁（旧 940 的
+        // "938 最大高度"注释来自最热列表瘦身前的旧排版，已失效）。
         // 动画必须无回弹（.smooth）：spring 默认 bounce 0.15，结合下方 .move 过渡
         // 曾导致面板内容溢出边界引发窗口收起（与冲刺/静音按钮同类教训）。
         .animation(.smooth(duration: 0.3), value: model.daemonAlive)
@@ -60,8 +76,8 @@ struct ContentView: View {
         }
     }
 
-    // 面板警示条按优先级只显示最高一条：面板固定高度（正常态 938/940 仅 2px 余量），
-    // 三条同现 ≈160px 会从底部溢出裁剪——恰在最需要警示的状态下警示本身被切掉。
+    // 面板警示条按优先级只显示最高一条：面板固定高度 908 仅容一条两行警示（906pt），
+    // 多条同现会从底部溢出裁剪——恰在最需要警示的状态下警示本身被切掉。
     // 优先级：写入失败（设置不生效，用户可行动）> 调速闭环故障 > 配置对账
     private var activeWarning: (text: String, icon: String, color: Color)? {
         if model.configWriteFailed {
@@ -108,7 +124,7 @@ struct ContentView: View {
                 }
                 .foregroundStyle(.yellow)
                 .padding(.horizontal, 8).padding(.vertical, 5)
-                .glassEffect(.regular, in: Capsule())
+                .snapshotCapsule()
                 .help("整机实时功耗（发热根源）")
                 .transition(.opacity)
             }
@@ -121,7 +137,7 @@ struct ContentView: View {
                 }
                 .foregroundStyle(model.envTempOverride != nil ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
                 .padding(.horizontal, 8).padding(.vertical, 5)
-                .glassEffect(.regular, in: Capsule())
+                .snapshotCapsule()
                 .help(model.envTempOverride != nil ? "手动覆盖: \(Int(model.envTempOverride!))°C。点击可修改" : "环境温度代理：电池/掌托/散热片的有效低值。点击可手动覆盖")
                 .contextMenu {
                     Button("自动检测") { model.setEnvTempOverride(nil) }
@@ -143,7 +159,14 @@ struct ContentView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
-            .glassEffect(.regular, in: Capsule())
+            .snapshotCapsule()
+            if snapshotPlainCards {
+                // 快照：Menu 桥接 NSMenu 离屏退 🚫 → 等尺寸静态省略号图标
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            } else {
             Menu {
                 Text("清风 \(Self.appVersion)")
                 Divider()
@@ -204,6 +227,7 @@ struct ContentView: View {
             .buttonStyle(.glass)
             .menuIndicator(.hidden)
             .fixedSize()
+            }
         }
     }
 
@@ -317,7 +341,7 @@ struct ContentView: View {
     }
 
     private var temperatureCards: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {   // 与面板纵向卡间距 12 对齐，横竖节奏统一
             TempGaugeCard(label: "CPU", symbol: "cpu", temp: model.cpuTemp,
                           history: model.history.suffix(120).map(\.cpu),
                           subTemp: model.cpuAverageTemp)
@@ -330,38 +354,34 @@ struct ContentView: View {
     private var monitorCard: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Picker("", selection: $monitorTab) {
-                    Text("趋势").tag(0)
-                    Text("最热").tag(1)
-                    Text("今日").tag(2)
-                    Text("占用").tag(3)
-                }
-                .pickerStyle(.segmented)
+                SnapshotSegmentedPicker(
+                    items: [("趋势", 0), ("最热", 1), ("今日", 2), ("占用", 3)],
+                    selection: Binding(get: { model.monitorTab }, set: { model.monitorTab = $0 }))
                 .controlSize(.mini)
                 .labelsHidden()
                 .fixedSize()
                 Spacer()
-                if monitorTab == 0, let first = model.history.first {
+                if model.monitorTab == 0, let first = model.history.first {
                     let mins = max(1, Int(Date().timeIntervalSince(first.id) / 60))
                     Text("最近 \(mins) 分钟")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                } else if monitorTab == 1 {
+                } else if model.monitorTab == 1 {
                     Text("各部件温度 · 最热在顶")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                } else if monitorTab == 2 {
+                } else if model.monitorTab == 2 {
                     Text("今日战报")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                } else if monitorTab == 3 {
+                } else if model.monitorTab == 3 {
                     Text("CPU 占用最高 · GPU 温度")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
             }
             ZStack(alignment: .top) {
-                switch monitorTab {
+                switch model.monitorTab {
                 case 1: HotspotList(components: model.components).transition(.opacity)
                 case 2: TodayStatsView(stats: model.stats).transition(.opacity)
                 case 3: ProcessHogView(processes: model.topProcesses, gpuTemp: model.gpuTemp).transition(.opacity)
@@ -370,7 +390,7 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity, alignment: .top)
             .frame(height: MonitorStyle.height, alignment: .top)
-            .animation(.smooth(duration: 0.28), value: monitorTab)
+            .animation(.smooth(duration: 0.28), value: model.monitorTab)
         }
         .cardStyle()
     }
@@ -436,18 +456,21 @@ struct ContentView: View {
                     .help("全速 15 分钟后自动还原")
 
                     Button { model.startQuiet() } label: {
+                        // 对比度修复：淡紫字(.indigo)压淡紫底在浅色模式仅 ~2.5:1，看似禁用；
+                        // 文字改深靛蓝（≈7:1），描边加深使胶囊边缘清晰，与实心"冲刺"按钮形成
+                        // 主次分明但仍可读的配对
                         Label("静音", systemImage: "moon.fill")
                             .font(.callout.weight(.semibold))
-                            .foregroundStyle(.indigo)
+                            .foregroundStyle(Color(red: 0.30, green: 0.26, blue: 0.62))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 6)
                             .background(
                                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                    .fill(.indigo.opacity(0.16))
+                                    .fill(.indigo.opacity(0.14))
                             )
                             .overlay(
                                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                    .strokeBorder(.indigo.opacity(0.35))
+                                    .strokeBorder(.indigo.opacity(0.5))
                             )
                     }
                     .buttonStyle(PressableButtonStyle())
@@ -458,7 +481,7 @@ struct ContentView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .top)
-        .frame(height: 54, alignment: .top)
+        .frame(height: 48, alignment: .top)   // 实测：倒计时卡 46pt（快照 --snapshot boost），按钮态 28.5pt
         .animation(.smooth(duration: 0.3), value: model.boostEndDate)
         .animation(.smooth(duration: 0.3), value: model.quietEndDate)
     }
@@ -468,54 +491,48 @@ struct ContentView: View {
         return String(format: "%d:%02d", remain / 60, remain % 60)
     }
 
-    // 评测摘要文案：时长 <90 分钟显示分钟、否则换算小时（账本可达数千分钟/数十小时）。
-    // display 为单行紧凑版；full 为悬停完整版（含峰值/调速次数等一行放不下的指标）
-    private static func evaluationText(_ m: AIControlMetrics) -> (display: String, full: String) {
-        func compact(_ seconds: Double) -> String {
-            if seconds < 90 { return String(format: "%.0f 秒", seconds) }
-            let minutes = seconds / 60
-            if minutes < 90 { return String(format: "%.0f 分", minutes) }
-            return String(format: "%.1f 小时", minutes / 60)
-        }
-        let display = "评测 \(compact(m.activeSeconds)) · 均温 \(Int(m.averageTemp.rounded()))°" +
-            " · 波动 \(String(format: "%.1f", m.temperatureStdDev))°" +
-            " · 输出 \(Int(m.averageOutput.rounded()))%" +
-            " · 超温 \(compact(m.highTempSeconds))"
+    // 磁贴用超紧凑时长：s/m/h 单字母后缀（"130h"、"1.6h"），完整表述在悬停 full 里
+    private static func compactDuration(_ seconds: Double) -> String {
+        if seconds < 90 { return String(format: "%.0fs", seconds) }
+        let minutes = seconds / 60
+        if minutes < 90 { return String(format: "%.0fm", minutes) }
+        let hours = minutes / 60
+        return String(format: hours >= 10 ? "%.0fh" : "%.1fh", hours)
+    }
+
+    // 评测摘要：磁贴行取原始秒数自行格式化；full 为悬停完整版（含峰值/调速次数等磁贴放不下的指标）
+    private static func evaluationText(_ m: AIControlMetrics) -> (seconds: Double, highSeconds: Double, full: String) {
         let full = """
         AI 评测（目标 \(Int(m.targetTemp))°，\(m.sampleCount) 个样本）
         时长 \(duration(m.activeSeconds)) · 均温 \(String(format: "%.1f", m.averageTemp))° · 峰值 \(String(format: "%.1f", m.peakTemp))°
         波动 \(String(format: "%.1f", m.temperatureStdDev))° · 最大过冲 +\(Int(m.maxOvershoot.rounded()))° · 平均输出 \(String(format: "%.0f", m.averageOutput))%
         调速 \(m.outputChangeCount) 次 · 超温（≥目标+5°）累计 \(duration(m.highTempSeconds))
         """
-        return (display, full)
+        return (m.activeSeconds, m.highTempSeconds, full)
     }
 
     private var fanCard: some View {
         VStack(spacing: 10) {
-            // 决策可解释行：让用户看懂“风扇为何这么转”（守护进程提供的决策因素）
+            // 决策可解释行：让用户看懂“风扇为何这么转”（守护进程提供的决策因素）。
+            // v3.4.1 单一职责：胶囊只说"为什么"（原因标签），不再挂 appliedPercent 数字——
+            // 该数字与详情卡的设定值（手动 manualPercent / 曲线当前输出 / AI 协同输出）
+            // 同形不同源，曾出现"手动固定转速 24%" vs 详情"100%"的冲突。
+            // "转多少"由下方 FanRow 的实际 RPM 与详情卡各自表达。
             if model.daemonAlive, let r = model.controlReason {
                 HStack(spacing: 5) {
                     Image(systemName: Self.reasonIcon(r)).font(.system(size: 10, weight: .semibold))
                     Text(r.label).font(.caption2.weight(.medium))
-                    Spacer()
-                    // auto 模式下我们不控风扇（输出为 0），显示百分比会与风扇实际转速矛盾，故仅非 auto 时显示
-                    if r != .auto {
-                        Text("\(Int(model.appliedPercent))%")
-                            .font(.caption2.monospacedDigit().weight(.semibold))
-                            .contentTransition(.numericText())
-                            .animation(.snappy, value: model.appliedPercent)
-                    }
                 }
                 .foregroundStyle(Self.reasonColor(r))
                 .padding(.horizontal, 9).padding(.vertical, 5)
                 .background(Capsule().fill(Self.reasonColor(r).opacity(0.14)))
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .id(r)  // 强制视图身份变化，触发内容转场
                 .transition(.opacity)
             }
             ForEach(model.fans, id: \.id) { fan in
                 FanRow(fan: fan,
                        name: model.fans.count == 2 ? (fan.id == 0 ? "左风扇" : "右风扇") : "风扇 \(fan.id + 1)",
-                       now: model.lastRefresh,
                        offset: model.offsetForFan(fanIndex: fan.id),
                        onOffsetChange: { model.setFanOffset(fanIndex: fan.id, offset: $0) })
             }
@@ -554,17 +571,23 @@ struct ContentView: View {
 
     private var controlCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Picker("模式", selection: Binding(
-                get: { model.mode },
-                set: { model.setMode($0) }
-            )) {
-                Text("自动").tag(FanMode.auto)
-                Text("曲线").tag(FanMode.curve)
-                Text("AI").tag(FanMode.ai)
-                Text("手动").tag(FanMode.manual)
+            if snapshotPlainCards {
+                SnapshotSegmentedPicker(items: [("自动", FanMode.auto), ("曲线", FanMode.curve),
+                                                ("AI", FanMode.ai), ("手动", FanMode.manual)],
+                                        selection: Binding(get: { model.mode }, set: { model.setMode($0) }))
+            } else {
+                Picker("模式", selection: Binding(
+                    get: { model.mode },
+                    set: { model.setMode($0) }
+                )) {
+                    Text("自动").tag(FanMode.auto)
+                    Text("曲线").tag(FanMode.curve)
+                    Text("AI").tag(FanMode.ai)
+                    Text("手动").tag(FanMode.manual)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
 
             // 固定高度容器：各模式内容高度一致，窗口尺寸不变，
             // 避免 MenuBarExtra 面板因尺寸突变而意外收起（bug 修复）
@@ -591,17 +614,22 @@ struct ContentView: View {
 
     private var curveContent: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Picker("预设", selection: Binding(
-                get: { model.preset },
-                set: { model.setPreset($0) }
-            )) {
-                ForEach(CurvePreset.allCases, id: \.self) { p in
-                    Text(p.displayName).tag(p)
+            if snapshotPlainCards {
+                SnapshotSegmentedPicker(items: CurvePreset.allCases.map { ($0.displayName, $0) },
+                                        selection: Binding(get: { model.preset }, set: { model.setPreset($0) }))
+            } else {
+                Picker("预设", selection: Binding(
+                    get: { model.preset },
+                    set: { model.setPreset($0) }
+                )) {
+                    ForEach(CurvePreset.allCases, id: \.self) { p in
+                        Text(p.displayName).tag(p)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .controlSize(.small)
 
             // 自定义档：可拖动控制点；其余预设只读展示。
             // 电池档/夜间档覆盖生效时画对应档位曲线，否则橘色输出点会脱离曲线悬空。
@@ -654,15 +682,40 @@ struct ContentView: View {
                     .truncationMode(.tail)
                     .help(model.aiDetail ?? "")
                 Spacer(minLength: 4)
-                Button {
-                    model.applyAICurve()
-                } label: {
+                if snapshotPlainCards {
+                    // 快照：borderless Button 桥接 AppKit 离屏退 🚫 → 等尺寸静态标签
                     Label("AI 优化", systemImage: "sparkles")
                         .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.purple)
+                } else {
+                    Button {
+                        model.applyAICurve()
+                    } label: {
+                        Label("AI 优化", systemImage: "sparkles")
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .buttonStyle(.borderless)
+                    .tint(.purple)
+                    .help("分析这台机器的历史温度分布，自动生成专属风扇曲线（纯本地分析，不联网）")
                 }
-                .buttonStyle(.borderless)
-                .tint(.purple)
-                .help("分析这台机器的历史温度分布，自动生成专属风扇曲线（纯本地分析，不联网）")
+            }
+            // 控制点摘要行：把图上 5 个锚点数值化（温度→转速%），填补曲线卡底部留白，
+            // 也让"预设已个性化"这类抽象文案有具体落点。建议块在场时让位（200pt 槽位）。
+            if model.pendingAICurve == nil {
+                HStack(spacing: 4) {
+                    ForEach(Array(displayedCurvePoints.enumerated()), id: \.offset) { _, p in
+                        VStack(spacing: 0) {
+                            Text("\(Int(p.temp))°")
+                                .font(.system(size: 10, weight: .semibold, design: .rounded)).monospacedDigit()
+                            Text("\(Int(p.percent))%")
+                                .font(.system(size: 9)).monospacedDigit().foregroundStyle(.blue)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(Color.blue.opacity(0.06)))
+                    }
+                }
             }
             if let suggestion = model.pendingAICurve {
                 VStack(alignment: .leading, spacing: 6) {
@@ -686,6 +739,17 @@ struct ContentView: View {
         }
     }
     
+    // 曲线卡当前实际展示的锚点（与 CurveChart/EditableCurveChart 数据源一致）
+    private var displayedCurvePoints: [CurvePoint] {
+        if model.preset == .custom && !model.batteryOverride && !model.nightOverride {
+            return model.customPoints
+        }
+        if model.batteryOverride || model.nightOverride {
+            return model.points(for: .quiet)
+        }
+        return model.config.curve
+    }
+
     // 电源感知覆盖时给用户一个明确提示，避免“曲线和实际输出对不上”的困惑
     private var batteryHint: String? {
         model.batteryOverride
@@ -722,12 +786,32 @@ struct ContentView: View {
                 Image(systemName: "fanblades")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
-                Slider(value: Binding(
-                    get: { model.manualPercent },
-                    set: { model.setManualPercent($0) }
-                ), in: 0...100, step: 5)
-                .tint(LinearGradient(colors: [.blue, .indigo],
-                                     startPoint: .leading, endPoint: .trailing))
+                if snapshotPlainCards {
+                    // 快照：Slider 桥接 AppKit 离屏退 🚫 → 等尺寸静态轨道
+                    GeometryReader { geo in
+                        let pct = CGFloat(min(max(model.manualPercent, 0), 100) / 100)
+                        let x = geo.size.width * pct
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.secondary.opacity(0.25)).frame(height: 4)
+                            Capsule()
+                                .fill(LinearGradient(colors: [.blue, .indigo],
+                                                     startPoint: .leading, endPoint: .trailing))
+                                .frame(width: x, height: 4)
+                            Circle().fill(.white).frame(width: 14, height: 14)
+                                .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
+                                .offset(x: min(max(x - 7, 0), geo.size.width - 14))
+                        }
+                        .frame(maxHeight: .infinity, alignment: .center)
+                    }
+                    .frame(height: 20)
+                } else {
+                    Slider(value: Binding(
+                        get: { model.manualPercent },
+                        set: { model.setManualPercent($0) }
+                    ), in: 0...100, step: 5)
+                    .tint(LinearGradient(colors: [.blue, .indigo],
+                                         startPoint: .leading, endPoint: .trailing))
+                }
                 Image(systemName: "fanblades.fill")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.blue.opacity(0.85))
@@ -735,6 +819,24 @@ struct ContentView: View {
             Text("0% = 最低转速 · 100% = 全速 · 高温 92°C 自动全速兜底")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+            // 快捷档位：拖动之外给一键落点，同时填满 200pt 槽位底部留白。
+            // 用可点胶囊而非 Button——borderless Button 在 ImageRenderer 离屏退 🚫
+            HStack(spacing: 6) {
+                ForEach([0.0, 25.0, 50.0, 75.0, 100.0], id: \.self) { step in
+                    let active = abs(model.manualPercent - step) < 0.5
+                    Text(step == 0 ? "静音" : "\(Int(step))%")
+                        .font(.caption2.weight(active ? .semibold : .regular))
+                        .monospacedDigit()
+                        .foregroundStyle(active ? Color.white : Color.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(active ? AnyShapeStyle(Color.blue.gradient)
+                                         : AnyShapeStyle(Color.secondary.opacity(0.08))))
+                        .contentShape(Rectangle())
+                        .onTapGesture { model.setManualPercent(step) }
+                }
+            }
             Spacer(minLength: 0)
         }
     }
@@ -750,6 +852,26 @@ struct ContentView: View {
             Text("FanCtl 不介入，与原生行为完全一致")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+            // 系统调度下的实时转速读数（读 status.json，App 侧不重算控制语义）：
+            // 让"不介入"不再是空态——用户能看到系统此刻把风扇开到多少
+            if model.daemonAlive && !model.fans.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(model.fans, id: \.id) { fan in
+                        VStack(spacing: 1) {
+                            Text("\(Int(fan.actualRPM))")
+                                .font(.system(size: 15, weight: .semibold, design: .rounded)).monospacedDigit()
+                                .contentTransition(.numericText())
+                            Text(fan.id == 0 ? "左风扇 RPM" : "右风扇 RPM")
+                                .font(.system(size: 8)).foregroundStyle(.tertiary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.secondary.opacity(0.07)))
+                    }
+                }
+                .padding(.top, 2)
+            }
             Spacer()
         }
         .frame(maxWidth: .infinity)
@@ -865,29 +987,37 @@ struct ContentView: View {
                 .transition(.opacity)
             }
             // 目标温度选择：越高越安静、越低越凉
-            Picker("", selection: Binding(get: { model.aiTargetTemp }, set: { model.setAITarget($0) })) {
-                Text("性能 72°").tag(72.0)
-                Text("均衡 76°").tag(76.0)
-                Text("静音 80°").tag(80.0)
+            if snapshotPlainCards {
+                SnapshotSegmentedPicker(items: [("性能 72°", 72.0), ("均衡 76°", 76.0), ("静音 80°", 80.0)],
+                                        selection: Binding(get: { model.aiTargetTemp }, set: { model.setAITarget($0) }))
+            } else {
+                Picker("", selection: Binding(get: { model.aiTargetTemp }, set: { model.setAITarget($0) })) {
+                    Text("性能 72°").tag(72.0)
+                    Text("均衡 76°").tag(76.0)
+                    Text("静音 80°").tag(80.0)
+                }
+                .pickerStyle(.segmented).controlSize(.small).labelsHidden()
             }
-            .pickerStyle(.segmented).controlSize(.small).labelsHidden()
             // v7 曲线锚定后 AI 仍在自学习：展示学习状态（学习中/稳定/积累）+ 已掌握温度点覆盖
             learningStatus(points: model.learnedPoints,
                            samples: model.learnedSamples,
                            learning: model.learningRecently)
             // 评测摘要：仅在无事件级提示时显示（有提示时优先让位，保证 200pt 内不裁剪）。
-            // v2.9.1：单行 300pt 装不下长账本（"评测 3727 分钟 · … · 超温 5080s"直接截断，
-            // 尾部指标不可见）——时长智能换算小时/分钟 + 压缩文案 + 悬停查看完整数据。
-            // 不能改成两行：aiContent 在 200pt 固定槽位内已占满（约 199pt），加行必裁底部。
+            // v3.4.1：单行 run-on（"评测 130 小时 · 均温 55° · …"）拆为 5 个紧凑磁贴——
+            // 一行连读 5 指标难扫视；磁贴各占一格、数值/标签分层，悬停仍看完整账本。
+            // 磁贴仅 31pt，替换原 14pt 行 +17pt，评测在场时事件行必缺席，槽位余量足够。
             if let m = model.aiMetrics, m.sampleCount > 0, !model.targetUnreachable,
                !model.aiHighEffort,
                model.aiRecommendedTarget == nil || abs(model.aiRecommendedTarget! - model.aiTargetTemp) <= 0.5 {
                 let eval = Self.evaluationText(m)
-                Text(eval.display)
-                    .font(.system(size: 10)).foregroundStyle(.tertiary)
-                    .lineLimit(1).truncationMode(.tail)
-                    .minimumScaleFactor(0.8)
-                    .help(eval.full)
+                HStack(spacing: 4) {
+                    aiMetricTile(value: Self.compactDuration(eval.seconds), label: "评测")
+                    aiMetricTile(value: "\(Int(m.averageTemp.rounded()))°", label: "均温")
+                    aiMetricTile(value: String(format: "%.1f°", m.temperatureStdDev), label: "波动")
+                    aiMetricTile(value: "\(Int(m.averageOutput.rounded()))%", label: "均输出")
+                    aiMetricTile(value: Self.compactDuration(eval.highSeconds), label: "超温")
+                }
+                .help(eval.full)
             }
             Spacer(minLength: 0)
         }
@@ -901,6 +1031,24 @@ struct ContentView: View {
     // 自适应状态胶囊：空间足够显示"图标+文字"，不足时降级为纯图标（悬停仍有完整说明）。
     // ViewThatFits 避免"图标+省略号"的尴尬截断（旧 lineLimit(1) 无降级路径）；
     // 两个变体都 fixedSize——压缩由 ViewThatFits 的选择完成，不由布局挤压完成
+    // AI 评测磁贴：数值/标签两层，等宽数字防跳动，紧凑 31pt 高
+    private func aiMetricTile(value: String, label: String) -> some View {
+        VStack(spacing: 1) {
+            Text(value)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1).minimumScaleFactor(0.75)
+            Text(label)
+                .font(.system(size: 8))
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(Color.secondary.opacity(0.07)))
+    }
+
     private func adaptiveChip(icon: String, text: String, color: Color, help: String) -> some View {
         ViewThatFits(in: .horizontal) {
             Label(text, systemImage: icon)
@@ -1166,6 +1314,31 @@ final class BreathingDotView: NSView {
     }
 }
 
+
+// v3.4.1：快照专用的纯 SwiftUI 分段选择器。
+// 原因：SwiftUI segmented Picker 桥接 NSSegmentedControl，ImageRenderer 离屏
+// 无法合成 AppKit 控件 → 渲染为系统黄色 🚫 占位。快照下用等尺寸 SwiftUI 实现
+// 忠实反映布局；运行时不受影响（调用方按 snapshotPlainCards 分支）。
+struct SnapshotSegmentedPicker<Item: Hashable>: View {
+    let items: [(label: String, tag: Item)]
+    @Binding var selection: Item
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(items, id: \.1) { item in
+                Text(item.label)
+                    .font(.caption2.weight(selection == item.tag ? .semibold : .regular))
+                    .padding(.horizontal, 10).padding(.vertical, 3)
+                    .background(
+                        Capsule().fill(selection == item.tag ? Color.primary.opacity(0.10) : Color.clear)
+                    )
+            }
+        }
+        .padding(2)
+        .background(Capsule().fill(Color.secondary.opacity(0.12)))
+    }
+}
+
 // 带按压反馈的按钮样式：按下时轻微缩放 + 半透明，松开回弹，让交互更跟手
 private struct PressableButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
@@ -1287,6 +1460,20 @@ private struct CardBackground: ViewModifier {
                 .overlay(shape.strokeBorder(.white.opacity(0.12)))
         } else {
             base.glassEffect(.regular, in: shape)
+        }
+    }
+}
+
+
+extension View {
+    /// v3.4.1：快照模式下 glassEffect Capsule 退实心材质圆胶囊
+    ///（ImageRenderer 离屏无法合成 Liquid Glass，渲染为系统黄色 🚫 占位）。
+    @ViewBuilder
+    func snapshotCapsule() -> some View {
+        if snapshotPlainCards {
+            self.background(.regularMaterial, in: Capsule())
+        } else {
+            self.glassEffect(.regular, in: Capsule())
         }
     }
 }
