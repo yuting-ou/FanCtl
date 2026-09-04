@@ -270,7 +270,7 @@ func testAmbientValley() {
     let smc2 = MockSMC()
     smc2.set("Tp01", 40)   // CPU 仅 40°
     smc2.set("TB0t", 39)   // 候选 39 ≥ cpu−3 → 不可信
-    let ts2 = try! TemperatureSensors(smc: smc2)
+    let ts2 = try! makeTemperatureSensors(smc: smc2, clock: { Date() })
     expect(ts2.ambientEstimate(now: Date()) == nil, "候选贴近芯片温度判热浸泡，关闭补偿")
 }
 
@@ -332,8 +332,9 @@ final class EngineCollector {
 func makeEngine(smc: MockSMC, clock: FakeClock, collector: EngineCollector,
                 onBattery: @escaping () -> Bool = { false },
                 powerComponents: @escaping () -> (cpu: Double?, gpu: Double?) = { (nil, nil) }) -> ControlEngine {
-    let sensors = try! TemperatureSensors(smc: smc)
-    sensors.clock = { clock.time() }   // TTL 缓存与测试时间轴同步
+    // v3.4.5：走时钟安全构造（makeTemperatureSensors），否则真实时间在 FakeClock
+    // 基准（本地正午）之前时每拍触发后台重扫 → 并发写竞态（间歇 exit 139 真根因）
+    let sensors = try! makeTemperatureSensors(smc: smc, clock: { clock.time() })
     return ControlEngine(fans: try! FanController(smc: smc),
                   sensors: sensors,
                   hooks: ControlEngine.Hooks(
@@ -418,6 +419,7 @@ testSMCReadBudget()
 testFanLimitsCache()
 testSMCBytes()
 testEngineWiring()
+testLearnSaturatedGate()
 testRescanAsync()
 print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过

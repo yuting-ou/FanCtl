@@ -697,11 +697,20 @@ public final class ControlEngine {
             //   4. 温度在目标附近（AI 模式）：|temp - target| ≤ 4°C
             //      只在 AI 成功控制温度时才学习，过冲/过冷时 output 不反映"稳态需求"。
             //      curve/battery 模式无目标概念，不检查此条件。
-            //   5. baseTarget 不在极值（<95%）：100% 是饱和值，不反映真实需求
-            //   6. baseTarget 不在极低（>5%）：0% 是交还后的默认值，不反映真实需求
+            //   5. baseTarget 不在极低（>5%）：0% 是交还后的默认值，不反映真实需求
+            // v3.4.5（3A）：高温饱和门——AI 模式、温度高于目标、输出饱和（≥90%）时
+            // 也记录："压不住时的真实需求上限"恰是过冲区间（目标+4°以上）最值钱的先验，
+            // 旧门（|temp−target|≤4 且 baseTarget<95）让该区域永远学不到（82°+ 桶空）。
+            // 低温饱和（<5%）仍排除：0% 是交还默认值；温度上界（目标+15°）防御
+            // 兜底边缘的极端瞬态；稳态门（LearningGate）继续生效排除瞬态采样。
+            let overTargetSaturated = effectiveConfig.mode == .ai
+                && temp > aiTargetEff
+                && temp <= aiTargetEff + 15
+                && baseTarget >= 90
             let tempNearTarget = effectiveConfig.mode != .ai
                 || abs(temp - aiTargetEff) <= 4.0
-            let baseTargetNotSaturated = baseTarget > 5 && baseTarget < 95
+                || overTargetSaturated
+            let baseTargetNotSaturated = baseTarget > 5 && (baseTarget < 95 || overTargetSaturated)
             // v2.7: 稳态判定阈值改按秒标定（LearningGate）——每拍语义在自适应间隔下严格度漂移
             if !fastConfigApply, let prevT = prevSmoothedTemp,
                let prevBase = prevBaseTarget,

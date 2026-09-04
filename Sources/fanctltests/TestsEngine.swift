@@ -296,7 +296,7 @@ func testFanLimitsCache() {
     _ = fc.allStates()
     expect(smc.reads.count - reads1 - delta == 4, "失效后重读 Mn/Mx")
     // PSTR 短缓存
-    let ts = try! TemperatureSensors(smc: smc)
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { Date() })
     let a = ts.systemPowerWatts
     let r1 = smc.reads.count
     let b = ts.systemPowerWatts
@@ -339,7 +339,7 @@ func testSMCBytes() {
     expectEqual(fourCC(""), 0, "空串 → 0")
     // 经 SMCConnection 同款解码链路的温度读取（Intel sp78 全链路）
     smc.set("TC0P", 71.5, type: "sp78"); smc.set("TG0D", 55.0, type: "sp78")
-    let ts = try! TemperatureSensors(smc: smc)
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { Date() })
     expectClose(ts.cpuTemperature, 71.5, 0.01, "Intel sp78 全链路（read→doubleValue→热点）")
 }
 
@@ -450,6 +450,57 @@ func testEngineWiring() {
     }
 }
 
+// v3.4.5（3A）：高温饱和记录门——AI 模式、温度高于目标、输出饱和（≥90%）的
+// 稳态拍写入学习桶（"压不住时的真实需求"，旧门让 82°+ 桶永远学不到）；
+// 温度超目标+15 上界（兜底边缘）时即使饱和也不记录。
+func testLearnSaturatedGate() {
+    group("高温饱和记录门（3A）")
+    // 正例：temp 88 > 目标 76，PD 推满（baseTarget≥90%）+ 稳态 → 学习 88° 桶
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 76, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 88); smc.set("PSTR", 45)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col,
+                                powerComponents: { (40, 15) })
+        for _ in 0..<20 {
+            engine.beat()
+            if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+            clock.advance(3)
+        }
+        expect(engine.aiController.output >= 90,
+               "PD 已推至饱和（得 \(Int(engine.aiController.output))%）")
+        let b88 = TempHistogram.bucketIndex(for: 88)
+        expect(engine.thermalLearn.samplesByBucket[b88] > 0,
+               "高温饱和稳态拍写入学习桶（压不住的真实需求，旧门为 0）")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+    // 反例：温度超目标+15（91.5 > 76+15）→ 即使饱和也不记录（兜底边缘不学）
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 76, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 91.5); smc.set("PSTR", 45)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col,
+                                powerComponents: { (40, 15) })
+        for _ in 0..<20 {
+            engine.beat()
+            if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+            clock.advance(3)
+        }
+        let b91 = TempHistogram.bucketIndex(for: 91.5)
+        expect(engine.thermalLearn.samplesByBucket[b91] == 0,
+               "超目标+15 上界不记录（兜底边缘瞬态无学习价值）")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+}
+
 // v3.4.1 DoD-8：周期重扫后台化——旧分类在后台扫描完成前保持可用（控制不中断），
 // 完成后分类原子刷新；init 首扫仍同步（后续读取依赖分类）。
 func testRescanAsync() {
@@ -458,7 +509,7 @@ func testRescanAsync() {
     smc.set("Tp01", 55)
     smc.set("TVV0", 50)
     let clock = FakeClock()
-    let ts = try! TemperatureSensors(smc: smc)   // 同步首扫：CPU:1 other:1
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { clock.time() })   // 同步首扫：CPU:1 other:1
     expect(ts.sensorCounts.cpu == 1, "首扫同步完成")
     smc.set("Tp02", 60)   // 新增键：只有重扫才能发现
     // 异步版不在此测试中发起（后台写入 vs 主线程断言 = 数据竞争，偶发 trap 的来源）；
@@ -477,7 +528,7 @@ func testSensorsMock() {
     smc.set("Tg03", 48); smc.set("Tg0y", 130)                      // ≥120 启动时即排除
     smc.set("TH0a", 70); smc.set("TB0t", 30)
     smc.set("PSTR", 38)
-    let ts = try! TemperatureSensors(smc: smc)
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { Date() })
     let c = ts.sensorCounts
     expectEqual(c.cpu, 3, "CPU 键含零读数（启动排除会永久丢失休眠核心）")
     expectEqual(c.gpu, 1, "GPU 排除启动即越界的键")
@@ -504,7 +555,7 @@ func testSensorsMock() {
     // Intel 兜底：无 Tp* 键时回落经典 sp78 键
     let smc2 = MockSMC()
     smc2.set("TC0P", 65, type: "sp78"); smc2.set("TG0D", 55, type: "sp78")
-    let ts2 = try! TemperatureSensors(smc: smc2)
+    let ts2 = try! makeTemperatureSensors(smc: smc2, clock: { Date() })
     expectEqual(ts2.cpuTemperature, 65, "Intel 经典键兜底")
     expectEqual(ts2.gpuTemperature, 55, "Intel GPU 键兜底")
     expect(ts2.systemPowerWatts == nil, "无功耗键返回 nil")

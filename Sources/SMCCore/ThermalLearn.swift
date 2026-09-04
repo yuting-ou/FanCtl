@@ -16,6 +16,9 @@ public struct ThermalLearn: Equatable {
     private static let emaAlpha = 0.15      // EMA 系数：新样本权重（旧经验缓慢演化）
     private static let earlyAvgCount = 5    // 前 N 个样本算术平均，之后切换到 EMA
     private static let staleDays: Double = 14  // 超过 14 天未更新的桶视为过时
+    // v3.4.5（3B）：高温单调化下限——查询温度 ≥75° 时查表结果与更低温度采信桶取 max。
+    // 与 sanitize 的分工：sanitize 管 <75° 的低温高输出污染，单调化管 ≥75° 的高温低输出非单调。
+    static let monotonicFloorTemp = 75.0
 
     public private(set) var outputByBucket: [Double]   // 每 2°C 桶学到的稳态输出
     public private(set) var samplesByBucket: [Int]     // 每桶样本数
@@ -106,22 +109,40 @@ public struct ThermalLearn: Equatable {
 
     private func percent(for temp: Double, output: [Double], samples: [Int]) -> Double? {
         let b = TempHistogram.bucketIndex(for: temp)
-        if samples[b] >= Self.minSamples { return output[b] }
-        var lo = b - 1
-        var hi = b + 1
-        while lo >= 0 && samples[lo] < Self.minSamples { lo -= 1 }
-        while hi < output.count && samples[hi] < Self.minSamples { hi += 1 }
-        switch (lo >= 0, hi < output.count) {
-        case (true, true):
-            let tLo = TempHistogram.midTemp(of: lo)
-            let tHi = TempHistogram.midTemp(of: hi)
-            // tHi > tLo 恒成立（不同桶中值不同），无需除零保护
-            let t = (temp - tLo) / (tHi - tLo)
-            return output[lo] + t * (output[hi] - output[lo])
-        case (true, false): return output[lo]
-        case (false, true): return output[hi]
-        default: return nil
+        var result: Double?
+        if samples[b] >= Self.minSamples {
+            result = output[b]
+        } else {
+            var lo = b - 1
+            var hi = b + 1
+            while lo >= 0 && samples[lo] < Self.minSamples { lo -= 1 }
+            while hi < output.count && samples[hi] < Self.minSamples { hi += 1 }
+            switch (lo >= 0, hi < output.count) {
+            case (true, true):
+                let tLo = TempHistogram.midTemp(of: lo)
+                let tHi = TempHistogram.midTemp(of: hi)
+                // tHi > tLo 恒成立（不同桶中值不同），无需除零保护
+                let t = (temp - tLo) / (tHi - tLo)
+                result = output[lo] + t * (output[hi] - output[lo])
+            case (true, false): result = output[lo]
+            case (false, true): result = output[hi]
+            default: result = nil
+            }
         }
+        // v3.4.5（3B）：高温段（≥75°）单调化——先验只允许随温度不下降。
+        // 真实学习图出现过 86°=74%、88°=62% 低于 82° 的 85%（瞬态采样污染），
+        // 非单调先验在过冲区导致高温欠冷；向上取 max 方向安全（只多冷不过热）。
+        // 与更低温度全部采信桶取运行最大值；<75° 区间不钳（sanitize 负责低温污染）。
+        if let r = result, TempHistogram.midTemp(of: b) >= Self.monotonicFloorTemp {
+            var envelope = r
+            var i = b - 1
+            while i >= 0 {
+                if samples[i] >= Self.minSamples { envelope = max(envelope, output[i]) }
+                i -= 1
+            }
+            result = envelope
+        }
+        return result
     }
 
     // MARK: 功耗分档（15/35W 边界带 2W 滞回，纯函数便于测试）

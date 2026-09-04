@@ -1028,6 +1028,20 @@ func testThermalLearn() {
         expectClose(q.percent(for: 50)!, 25, 1e-9, "50°C 合理桶保留")
     }
 
+    // v3.4.5（3B）：高温段单调化——非单调先验在 ≥75° 查询时向上取包络
+    do {
+        var nm = ThermalLearn()
+        for _ in 0..<3 { nm.record(temp: 82, percent: 85) }   // 82° 桶采信（高需求）
+        for _ in 0..<3 { nm.record(temp: 88, percent: 62) }   // 88° 桶采信（瞬态污染，低于 82°）
+        expectClose(nm.percent(for: 88)!, 85, 1e-9, "高温非单调向上取包络（88° 需求 ≥ 82°）")
+        expectClose(nm.percent(for: 86)!, 85, 1e-9, "86° 插值(73.5) 后仍取包络 85")
+        // 低温段（<75°）不钳：<75° 查询保持原值（低温污染由 sanitize 负责）
+        var lo = ThermalLearn()
+        for _ in 0..<3 { lo.record(temp: 60, percent: 30) }
+        for _ in 0..<3 { lo.record(temp: 70, percent: 20) }   // 70° 低于 60°（低温非单调）
+        expectClose(lo.percent(for: 70)!, 20, 1e-9, "低温段不单调化（70° 保持 20）")
+    }
+
     // v5: NaN/Inf 防御——record 接收 NaN percent 时不污染学习数据
     // 修复前：min(max(NaN, 0), 100) 依赖 Swift NaN 比较返回 false 的隐式行为得到 0
     // 修复后：显式 isFinite 检查，NaN 记为 0（不污染，但占用样本计数）
