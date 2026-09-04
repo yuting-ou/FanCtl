@@ -15,17 +15,17 @@ struct ContentView: View {
         // 浅层瓦片（主色低透填充 + 发丝描边）。此前每张卡独立 glassEffect，系统投影
         // 带方向性（光左上影右下），恰好整条落在卡与窗口右缘间 14pt 玻璃条上（左侧
         // 同位置被卡片自身遮住）→ 恒定暗带，视觉"面板偏左"。单一玻璃面后投影被面块
-        // 自身吸收，暗带消失；液态玻璃质感保留且更接近系统面板的单一连续表面。
+        // 自身吸收，暗带消失。
+        //
+        // ⚠️ glassEffect 必须直接修饰 panelContent（玻璃在内容之后渲染）。
+        // 不可放进 GlassEffectContainer 的 .background{Color.clear.glassEffect()}：
+        // 容器把玻璃形状合成到内容层之上，整面玻璃会盖住全部内容（真机复现）。
+        // 瓦片已无独立玻璃，容器无合并对象，故不使用。
         if snapshotPlainCards {
             panelContent
         } else {
-            GlassEffectContainer(spacing: 8) {
-                panelContent
-                    .background {
-                        Color.clear
-                            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-                    }
-            }
+            panelContent
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
         }
     }
 
