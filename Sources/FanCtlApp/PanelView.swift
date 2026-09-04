@@ -11,21 +11,16 @@ struct ContentView: View {
 
     var body: some View {
         // 快照模式：无玻璃（ImageRenderer 离屏无法合成 Liquid Glass），实心卡直出。
-        // 运行时（v3.4.2 排版重做）：整面一块液态玻璃 sheet 打底，卡片是玻璃面上的
-        // 浅层瓦片（主色低透填充 + 发丝描边）。此前每张卡独立 glassEffect，系统投影
-        // 带方向性（光左上影右下），恰好整条落在卡与窗口右缘间 14pt 玻璃条上（左侧
-        // 同位置被卡片自身遮住）→ 恒定暗带，视觉"面板偏左"。单一玻璃面后投影被面块
-        // 自身吸收，暗带消失。
-        //
-        // ⚠️ glassEffect 必须直接修饰 panelContent（玻璃在内容之后渲染）。
-        // 不可放进 GlassEffectContainer 的 .background{Color.clear.glassEffect()}：
-        // 容器把玻璃形状合成到内容层之上，整面玻璃会盖住全部内容（真机复现）。
-        // 瓦片已无独立玻璃，容器无合并对象，故不使用。
+        // 运行时：GlassEffectContainer 把各卡的独立玻璃融合成连续液态玻璃面
+        // （用户定调的原生观感）。⚠️ z 序教训：glassEffect 只能作为内容链上的
+        // 修饰符（玻璃在内容后），放进 .background{Color.clear.glassEffect()} 会被
+        // 容器合成到内容之上盖住全部内容（9f0ffee 修过一次）。
         if snapshotPlainCards {
             panelContent
         } else {
-            panelContent
-                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            GlassEffectContainer(spacing: 8) {
+                panelContent
+            }
         }
     }
 
@@ -341,23 +336,14 @@ struct ContentView: View {
         }
     }
 
-    // 温度英雄区（v3.4.2）：CPU/GPU 合入同一张玻璃瓦片——单卡单投影，
-    // 消除双卡拼缝与外缘投影暗带；中缝发丝分隔线代替硬分割
     private var temperatureCards: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 12) {   // 与面板纵向卡间距 12 对齐，横竖节奏统一
             TempGaugeCard(label: "CPU", symbol: "cpu", temp: model.cpuTemp,
                           history: model.history.suffix(120).map(\.cpu),
                           subTemp: model.cpuAverageTemp)
-            Rectangle().fill(Color.primary.opacity(0.06)).frame(width: 1).padding(.vertical, 14)
             TempGaugeCard(label: "GPU", symbol: "cpu.fill", temp: model.gpuTemp,
                           history: model.history.suffix(120).map(\.gpu))
         }
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.primary.opacity(0.05)))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(.white.opacity(0.12)))
     }
 
     // 监测卡：趋势 sparkline / 哪里最热明细，固定高度避免切换时面板尺寸突变
@@ -1453,19 +1439,22 @@ final class PulseDotView: NSView {
 
 // MARK: - 卡片背景
 
-// v3.4.2：玻璃面上的浅层瓦片——主色低透填充 + 白发丝描边。
-// 不再对每张卡独立 glassEffect：系统玻璃投影带方向性，会在卡与窗口右缘间的
-// 窄玻璃条上形成恒定暗带（"面板偏左"的根源）；瓦片填充由面块玻璃托底，
-// 深浅色自适应（primary = 浅色黑 5% / 深色白 5%），且 ImageRenderer 可渲染
-// ——快照与运行时同构，🚫 风险面进一步收窄。
+// v3.4.4（用户定调回原生）：每卡独立 glassEffect，由 GlassEffectContainer 融合成
+// 连续液态玻璃面——即 4b5394f 时代的外观（用户认可的版本）。方向性投影会经容器
+// 融合后均匀化，右缘窄条暗带在原生观感下可接受。
 private struct CardBackground: ViewModifier {
+    @ViewBuilder
     func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
-        content
+        let shape = RoundedRectangle(cornerRadius: 17, style: .continuous)
+        let base = content
             .padding(13)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(shape.fill(Color.primary.opacity(0.05)))
-            .overlay(shape.strokeBorder(.white.opacity(0.12)))
+        if snapshotPlainCards {
+            base.background(.regularMaterial, in: shape)
+                .overlay(shape.strokeBorder(.white.opacity(0.12)))
+        } else {
+            base.glassEffect(.regular, in: shape)
+        }
     }
 }
 
@@ -1491,15 +1480,18 @@ extension View {  // 跨文件使用（TempGaugeCard 等），不能 private
 // 带色彩渲染的玻璃卡（用于冲刺中 / 告警等需要强调的状态）
 private struct TintedCard: ViewModifier {
     let tint: Color
+    @ViewBuilder
     func body(content: Content) -> some View {
-        // 与 CardBackground 同代的着色瓦片（冲刺倒计时/警示条/daemon 挂提示）：
-        // 着色填充 + 同色描边，快照与运行时同构
-        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
-        content
+        let shape = RoundedRectangle(cornerRadius: 17, style: .continuous)
+        let base = content
             .padding(13)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(shape.fill(tint.opacity(0.15)))
-            .overlay(shape.strokeBorder(tint.opacity(0.32)))
+        if snapshotPlainCards {
+            base.background(tint.opacity(0.18), in: shape)
+                .overlay(shape.strokeBorder(tint.opacity(0.35)))
+        } else {
+            base.glassEffect(.regular.tint(tint.opacity(0.22)), in: shape)
+        }
     }
 }
 

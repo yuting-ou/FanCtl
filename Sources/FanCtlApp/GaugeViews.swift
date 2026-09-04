@@ -87,11 +87,7 @@ struct TempGaugeCard: View {
     }
 
     var body: some View {
-        // v3.4.3 均衡排版：三段式固定节奏——表头（状态行）/ 数字区（垂直居中）
-        // / 折线（锚底）。副值行占固定 18pt 槽位：CPU 有核心均温、GPU 没有时
-        // GPU 槽位留空，两半的表头与折线位置严格对齐，数字区在剩余空间居中，
-        // 消除"内容偏左上、GPU 半边空"的失衡（苹果卡片式留白：等距呼吸）。
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 5) {
                 Image(systemName: symbol)
                     .font(.caption)
@@ -112,53 +108,49 @@ struct TempGaugeCard: View {
                         .transition(.opacity.combined(with: .scale(scale: 0.85)))
                 }
             }
-            .frame(height: 20)
-            // 数字区：在表头与折线之间垂直居中（副值 chip 叠加在数字区底部固定槽位）
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .firstTextBaseline, spacing: 1) {
-                    Text(temp > 1 ? "\(Int(temp))" : "--")
-                        .font(.system(size: 32, weight: .semibold, design: .rounded))
-                        .foregroundStyle(color.gradient)
-                        .monospacedDigit()
-                        // 主温度也用数字滚动（numericText），与 RPM/功耗/百分比一致，实时读数更"活"。
-                        // 由卡片级 .animation(.smooth(0.45)) 驱动，温度小幅变化时平滑滚动而非生硬跳变。
-                        .contentTransition(.numericText())
-                        // 柔和辉光：让主温度数字从玻璃卡中"浮起"，强化视觉主从
-                        .shadow(color: color.opacity(0.35), radius: 4, y: 1)
-                    Text("°")
-                        .font(.system(size: 22, weight: .medium, design: .rounded))
-                        .foregroundStyle(color.opacity(0.6))
-                }
-                // 副值固定 18pt 槽位：无副值时也占位，保证两半折线/表头严格对齐
-                ZStack(alignment: .leading) {
-                    if showSubTemp, let s = subTemp {
-                        HStack(spacing: 4) {
-                            Circle()
-                                .fill(color.opacity(0.5))
-                                .frame(width: 4, height: 4)
-                            Text("核心均温 \(Int(s))°")
-                                .font(.system(size: 10, weight: .medium, design: .rounded))
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(.quaternary.opacity(0.5)))
-                        .contentTransition(.opacity)
-                        .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                    }
-                }
-                .frame(height: 18)
+            // 主温度独占一行，保持视觉冲击力
+            HStack(alignment: .firstTextBaseline, spacing: 1) {
+                Text(temp > 1 ? "\(Int(temp))" : "--")
+                    .font(.system(size: 32, weight: .semibold, design: .rounded))
+                    .foregroundStyle(color.gradient)
+                    .monospacedDigit()
+                    // 主温度也用数字滚动（numericText），与 RPM/功耗/百分比一致，实时读数更"活"。
+                    // 由卡片级 .animation(.smooth(0.45)) 驱动，温度小幅变化时平滑滚动而非生硬跳变。
+                    .contentTransition(.numericText())
+                    // 柔和辉光：让主温度数字从玻璃卡中"浮起"，强化视觉主从
+                    .shadow(color: color.opacity(0.35), radius: 4, y: 1)
+                Text("°")
+                    .font(.system(size: 22, weight: .medium, design: .rounded))
+                    .foregroundStyle(color.opacity(0.6))
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            // 副值：Apple 风 chip 标签，紧贴主温度下方，主从层级清晰
+            // 小圆点 + "核心均温 X°"，用 capsule 背景与主温度形成视觉分隔
+            if showSubTemp, let s = subTemp {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(color.opacity(0.5))
+                        .frame(width: 4, height: 4)
+                    Text("核心均温 \(Int(s))°")
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(.quaternary.opacity(0.5)))
+                .contentTransition(.opacity)
+                .transition(.opacity.combined(with: .scale(scale: 0.9)).combined(with: .move(edge: .top)))
+            }
+            // 把 sparkline 锚到卡底：CPU 有副值 chip、GPU 无（GPU 无"核心均温"这类真实副指标，
+            // 不伪造数据、不为对称而改守护进程）。Spacer 吸收两卡高度差，使左右 sparkline
+            // 基线对齐，消除"CPU 多一行导致 GPU 折线悬空"的视觉不对称。
+            Spacer(minLength: 0)
             SparkLine(values: history, color: color)
                 .frame(height: 26)
                 .frame(maxWidth: .infinity)
                 .animation(.smooth(duration: 0.4), value: color)
         }
-        // v3.4.2：自身不再带卡底——CPU/GPU 两半由调用方合入同一张玻璃瓦片；
-        // v3.4.3：13pt 内距与全卡节奏统一（CardBackground 同值）
-        .padding(13)
+        .cardStyle()
         .animation(.smooth(duration: 0.45), value: temp)
     }
 }
