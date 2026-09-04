@@ -663,13 +663,17 @@ final class FanModel: ObservableObject {
             // 此前停留在打开瞬间的值，与实时学习/统计脱节
             if Date().timeIntervalSince(lastPanelFileSync) > 30 {
                 lastPanelFileSync = Date()
+                // v3.5.1（R2，P2 合并优先）：history.json（30 天全量，贵的那个）解码一次
+                // 向下传参；旧路径 loadDaysWithToday 每周期被调 3 次。stats 直读保持
+                // "今日零样本显示今日空态"语义（days.last 会退化成昨天数据）。
                 stats = ConfigStore.loadStats()
+                let days = loadDaysWithToday(preloadedStats: stats)
                 learnedPoints = ConfigStore.loadLearn()?.learnedBucketCount ?? 0
                 let hot = max(cpuTemp, gpuTemp)
                 learnedNow = hot > 1 ? (ConfigStore.loadLearn()?.percent(for: hot) ?? nil) : nil
                 aiMetrics = ConfigStore.loadAIMetrics()
-                refreshAIStatus()
-                refreshThermalHealth()
+                refreshAIStatus(preloadedDays: days)
+                refreshThermalHealth(preloadedDays: days)
             }
         }
     }
@@ -917,9 +921,9 @@ final class FanModel: ObservableObject {
 
     // MARK: AI 效果与基准快照
 
-    private func loadDaysWithToday() -> [DailyStats] {
+    private func loadDaysWithToday(preloadedStats: DailyStats? = nil) -> [DailyStats] {
         var days = ConfigStore.loadHistory()
-        if let s = ConfigStore.loadStats(), s.tempCount > 0 {
+        if let s = preloadedStats ?? ConfigStore.loadStats(), s.tempCount > 0 {
             days.removeAll { $0.date == s.date }
             days.append(s)
         }
@@ -948,16 +952,18 @@ final class FanModel: ObservableObject {
         return try? JSONDecoder().decode(AIBaseline.self, from: d)
     }
 
-    private func reoptimizeState() -> (afterDays: Int, effect: AIEffect?) {
+    // v3.5.1（R2，P2 合并优先）：preloadedDays 传入调用方已读的 days 快照，
+    // 避免 30s 同步里 history.json+stats.json 被重复解码（原每周期 3 次 loadDaysWithToday）
+    private func reoptimizeState(preloadedDays: [DailyStats]? = nil) -> (afterDays: Int, effect: AIEffect?) {
         guard let b = loadBaseline() else { return (0, nil) }
-        let after = loadDaysWithToday().filter { $0.date > b.date }
+        let after = (preloadedDays ?? loadDaysWithToday()).filter { $0.date > b.date }
         guard let ag = Self.aggregate(after) else { return (after.count, nil) }
         return (after.count, AIEffect(days: after.count, beforeAvg: b.avgTemp,
                                       afterAvg: ag.avg, beforeHot: b.hotRatio, afterHot: ag.hot))
     }
 
-    private func refreshAIStatus() {
-        let st = reoptimizeState()
+    private func refreshAIStatus(preloadedDays: [DailyStats]? = nil) {
+        let st = reoptimizeState(preloadedDays: preloadedDays)
         aiNudge = st.afterDays >= 3
         if let e = st.effect {
             let dAvg = e.beforeAvg - e.afterAvg
@@ -1075,8 +1081,8 @@ final class FanModel: ObservableObject {
     // 最近 7 天 vs 之前 7 天，比值上升 >15% 提示清灰/换硅脂。
     @Published var thermalHealthText: String? = nil
 
-    func refreshThermalHealth() {
-        let days = loadDaysWithToday().filter { $0.avgPower > 1 && $0.tempCount > 0 }
+    func refreshThermalHealth(preloadedDays: [DailyStats]? = nil) {
+        let days = (preloadedDays ?? loadDaysWithToday()).filter { $0.avgPower > 1 && $0.tempCount > 0 }
         guard days.count >= 14 else {
             thermalHealthText = days.count >= 2
                 ? "散热趋势积累中（需约 2 周数据，已 \(days.count) 天）"
