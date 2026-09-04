@@ -780,21 +780,23 @@ struct ContentView: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             // 快捷档位：拖动之外给一键落点，同时填满 200pt 槽位底部留白。
-            // 用可点胶囊而非 Button——borderless Button 在 ImageRenderer 离屏退 🚫
+            // 真 Button（AXPress 可达）；自绘样式，非 borderless（后者快照退 🚫）
             HStack(spacing: 6) {
                 ForEach([0.0, 25.0, 50.0, 75.0, 100.0], id: \.self) { step in
                     let active = abs(model.manualPercent - step) < 0.5
-                    Text(step == 0 ? "静音" : "\(Int(step))%")
-                        .font(.caption2.weight(active ? .semibold : .regular))
-                        .monospacedDigit()
-                        .foregroundStyle(active ? Color.white : Color.secondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 5)
-                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(active ? AnyShapeStyle(Color.blue.gradient)
-                                         : AnyShapeStyle(Color.secondary.opacity(0.08))))
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.setManualPercent(step) }
+                    Button { model.setManualPercent(step) } label: {
+                        Text(step == 0 ? "静音" : "\(Int(step))%")
+                            .font(.caption2.weight(active ? .semibold : .regular))
+                            .monospacedDigit()
+                            .foregroundStyle(active ? Color.white : Color.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 5)
+                            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(active ? AnyShapeStyle(Color.blue.gradient)
+                                             : AnyShapeStyle(Color.secondary.opacity(0.08))))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SegmentedItemButtonStyle())
                 }
             }
             Spacer(minLength: 0)
@@ -1289,11 +1291,13 @@ struct PanelSegmentedPicker<Item: Hashable>: View {
     var body: some View {
         HStack(spacing: 2) {
             ForEach(items, id: \.1) { item in
-                PanelSegmentedItem(label: item.label, isActive: selection == item.tag)
-                    .onTapGesture {
-                        guard selection != item.tag else { return }
-                        selection = item.tag
-                    }
+                Button {
+                    guard selection != item.tag else { return }
+                    selection = item.tag
+                } label: {
+                    PanelSegmentedItem(label: item.label, isActive: selection == item.tag)
+                }
+                .buttonStyle(SegmentedItemButtonStyle())
             }
         }
         .padding(2)
@@ -1302,7 +1306,9 @@ struct PanelSegmentedPicker<Item: Hashable>: View {
     }
 }
 
-// 分段选择器单项：白色胶囊滑块样式（选中态），与 macOS 系统设置同款语言
+// 分段选择器单项：白色胶囊滑块样式（选中态），与 macOS 系统设置同款语言。
+// 必须是真 Button：onTapGesture 不暴露 AXPress（辅助功能无法触发）；
+// Button 鼠标/AXPress/键盘全通。纯 SwiftUI，ImageRenderer 快照可渲染。
 private struct PanelSegmentedItem: View {
     let label: String
     let isActive: Bool
@@ -1317,9 +1323,15 @@ private struct PanelSegmentedItem: View {
             .padding(.horizontal, 11).padding(.vertical, 4)
             .background(Capsule().fill(fill).shadow(color: shadow, radius: 2.5, y: 1))
             .contentShape(Capsule())
-            .accessibilityElement()
-            .accessibilityLabel(label)
-            .accessibilityAddTraits(isActive ? [.isSelected, .isButton] : [.isButton])
+    }
+}
+
+// 无缩放按压反馈：按下轻微降透明度；视觉全由滑块承担
+private struct SegmentedItemButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.65 : 1.0)
+            .animation(.snappy(duration: 0.12), value: configuration.isPressed)
     }
 }
 
