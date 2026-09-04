@@ -316,7 +316,10 @@ final class EngineCollector {
     var schedules: [Double] = []
 }
 
-func makeEngine(smc: MockSMC, clock: FakeClock, collector: EngineCollector) -> ControlEngine {
+// v3.4.1：钩子可注入（DoD-7）——电池/分项功耗/wake 路径此前零覆盖
+func makeEngine(smc: MockSMC, clock: FakeClock, collector: EngineCollector,
+                onBattery: @escaping () -> Bool = { false },
+                powerComponents: @escaping () -> (cpu: Double?, gpu: Double?) = { (nil, nil) }) -> ControlEngine {
     let sensors = try! TemperatureSensors(smc: smc)
     sensors.clock = { clock.time() }   // TTL 缓存与测试时间轴同步
     return ControlEngine(fans: try! FanController(smc: smc),
@@ -325,8 +328,8 @@ func makeEngine(smc: MockSMC, clock: FakeClock, collector: EngineCollector) -> C
                     now: { clock.time() },
                     log: { collector.logs.append($0) },
                     schedule: { collector.schedules.append($0) },
-                    onBattery: { false },
-                    powerComponents: { (nil, nil) },
+                    onBattery: onBattery,
+                    powerComponents: powerComponents,
                     setPowerInterval: { _ in }))
 }
 
@@ -397,8 +400,19 @@ testPowerHistogram()
 testFamilyScan()
 testFamilyDefense()
 testPowerMetricsGolden()
+testOtherHotspotCache()
+testFanLimitsCache()
+testSMCBytes()
+testEngineWiring()
+testRescanAsync()
 print("——")
+// 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
+let minAssertions = 2499
 if failures == 0 {
+    if checks < minAssertions {
+        print("❌ 断言数 \(checks) 低于契约下限 \(minAssertions)（测试被删/跳过？）")
+        exit(1)
+    }
     print("✅ 全部通过：\(checks) 项断言")
     exit(0)
 } else {

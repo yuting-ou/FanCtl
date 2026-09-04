@@ -17,14 +17,30 @@ jobs:
       - name: 显示工具链
         run: swift --version
 
+      # v3.4.1 真实契约：不用 `| tee` 管道（bash 默认取管道右侧退出码，
+      # swift test 失败时 tee 成功 → 假绿 → 徽章照样发 success）。
+      # 直接运行 swift test：失败时本步骤退出码非 0，后续所有步骤不执行。
       - name: 运行回归测试（失败即中断）
-        run: swift run -c release --disable-sandbox fanctltests | tee test-output.txt
+        run: swift run -c release --disable-sandbox fanctltests
 
-      - name: 更新断言数徽章（自 main 分支推送时）
+      # 断言数提取 + 契约下限：再跑一次（全绿状态下很快，增量缓存），
+      # 断言数低于下限 = 有测试被删/跳过 → 红灯，徽章不发 success
+      - name: 提取断言数（契约下限校验）
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
-          N=$(grep -oE '[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1)
+          swift run -c release --disable-sandbox fanctltests 2>&1 | tee test-output.txt && \
+          N=$(grep -oE '[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1) || exit 1
           echo "断言数: $N"
+          if [ -z "$N" ] || [ "$N" -lt 2499 ]; then
+            echo "::error::断言数 $N 低于契约下限 2499（测试被删/跳过？）"
+            exit 1
+          fi
+          echo "ASSERTIONS=$N" >> "$GITHUB_ENV"
+
+      - name: 更新断言数徽章
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          N="${ASSERTIONS:?断言数缺失}"
           mkdir -p .github/badges
           jq -n --arg n "$N" '{schemaVersion: 1, label: "tests", message: ($n + " assertions"), color: "success"}' > .github/badges/tests.json
           git config user.name "github-actions[bot]"

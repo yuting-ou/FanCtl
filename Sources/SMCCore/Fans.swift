@@ -30,6 +30,14 @@ public final class FanController {
     private let smc: SMCIO
     public let fanCount: Int
     private let hasModeKey: Bool  // F0Md 存在 → Apple Silicon 风格
+    // v3.4.1 Mn/Mx 静态缓存（硬件常量；唤醒时由 ControlEngine.wake 调 invalidateFanLimits，
+    // rescanAllSensors 是 TemperatureSensors 的方法触达不到这里——引擎层接线更干净）
+    var cachedFanLimits: [Int: (min: Double, max: Double)] = [:]
+
+    /// 清空风扇 Mn/Mx 静态缓存（唤醒/固件异常防御时调用）
+    public func invalidateFanLimits() {
+        cachedFanLimits.removeAll()
+    }
 
     public init(smc: SMCIO) throws {
         self.smc = smc
@@ -47,15 +55,29 @@ public final class FanController {
     // 且 Mn/Mx 读失败(0) 时 rpm(forPercent:) 恒为 0，会把 92°C 兜底的 100% 也写成 Tg=0，
     // 散热红线被静默击穿。严格化后失败风扇被 allStates 跳过，daemon 走写入失败路径上报。
     public func state(of fan: Int) throws -> FanState {
-        FanState(id: fan,
+        // Ac/Tg 每拍新鲜读（转速与目标是控制反馈）；Mn/Mx 走静态缓存
+        let limits: (min: Double, max: Double)
+        if let c = cachedFanLimits[fan] {
+            limits = c
+        } else {
+            limits = (try smc.readDouble("F\(fan)Mn"), try smc.readDouble("F\(fan)Mx"))
+            // 防御：Mn/Mx 无效（读失败兜 0 / 固件异常）不缓存，下次重读
+            if limits.max > limits.min, limits.max > 0, limits.min >= 0 {
+                cachedFanLimits[fan] = limits
+            }
+        }
+        return FanState(id: fan,
                  actualRPM: try smc.readDouble("F\(fan)Ac"),
-                 minRPM: try smc.readDouble("F\(fan)Mn"),
-                 maxRPM: try smc.readDouble("F\(fan)Mx"),
+                 minRPM: limits.min,
+                 maxRPM: limits.max,
                  targetRPM: try smc.readDouble("F\(fan)Tg"))
     }
 
     public func allStates() -> [FanState] {
-        (0..<fanCount).compactMap { try? state(of: $0) }
+        (0..<fanCount).compactMap { id in
+            guard let st = try? state(of: id) else { return nil }
+            return st
+        }
     }
 
     // 强制指定转速（需要 root）
@@ -253,6 +275,8 @@ public struct FanFeedbackHealth: Equatable {
 
 public final class TemperatureSensors {
     private let smc: SMCIO
+    /// SMC 读计数（非原子、仅供测试在单线程下观测缓存效果；生产无读者零成本）
+    public private(set) var smcReadCount = 0
     // 测试注入时钟：TTL 缓存（电池控制缓存/展示缓存）基于真实时间在快节奏测试里
     // 永不过期——生产保持 { Date() }，测试注入 FakeClock 与被测时间轴同步
     public var clock: () -> Date = { Date() }
@@ -289,6 +313,9 @@ public final class TemperatureSensors {
     private var cachedPalmRest: (value: Double, time: Date) = (0, .distantPast)
     private var cachedHeatsink: (value: Double, time: Date) = (0, .distantPast)
     private var cachedOtherHotspots: ([String: Double], Date) = ([:], .distantPast)
+    private var cachedOtherMax: (value: Double, time: Date) = (0, .distantPast)   // v3.4.1 otherHotspotMax 缓存
+    /// otherHotKeys 全量读轮次计数（测试观测缓存效果；生产无读者）
+    public private(set) var otherMaxScanCount = 0
     private var cachedBattery: (value: Double, time: Date) = (0, .distantPast)   // 控制输入级短缓存（电池托底+环境代理同源）
     private let displayCacheTTL: TimeInterval = 10
     private let controlCacheTTL: TimeInterval = 3
@@ -313,11 +340,38 @@ public final class TemperatureSensors {
         self.heatsinkKeys = []
         self.otherHotKeys = []
         self.powerKey = ["PSTR", "PDTR"].first { smc.keyExists($0) }
-        rescanAllSensors()
+        rescanAllSensorsBlocking()   // 首扫必须同步：后续读取依赖分类结果
     }
 
     // 重新扫描所有传感器（定期调用，或唤醒后调用）
+    // v3.4.1 DoD-8：rescan 拆拍化。同步版（rescanAllSensorsBlocking）保留给
+    // 初始化路径（首扫必须同步——后续读取依赖分类结果）；周期重扫/唤醒走
+    // rescanAllSensors()：后台队列执行，完成后主队列原子替换分类。
+    // 削峰原理：~110 键 × 每键 2 次 IOKit 往返（枚举+验证读）≈ 1-2s 主队列阻塞，
+    // 每周期重扫都在控制环中间插进 2s 停顿；后台化后主队列零阻塞。
+    // 线程安全：分类数组替换回主队列（daemon 全局状态本就主队列约定）。
+    private let rescanQueue = DispatchQueue(label: "fanctld.rescan", qos: .utility)
+    private var rescanInFlight = false
+    private var rescanRequestedAt: Date = .distantPast
+
+    /// 周期/唤醒重扫：后台化（首扫用 rescanAllSensorsBlocking）
     public func rescanAllSensors() {
+        if rescanInFlight { return }
+        rescanInFlight = true
+        rescanRequestedAt = clock()
+        let capturedClock = clock
+        rescanQueue.async { [weak self] in
+            guard let self else { return }
+            self.rescanAllSensorsBlocking(clockOverride: capturedClock)
+            DispatchQueue.main.async { [weak self] in
+                self?.rescanInFlight = false
+            }
+        }
+    }
+
+    /// 同步全量扫描（初始化 / 测试 / 后台队列内部使用）
+    public func rescanAllSensorsBlocking(clockOverride: (() -> Date)? = nil) {
+        let now = clockOverride?() ?? clock()
         let all = (try? smc.allKeys()) ?? []
         // 按前缀分类的辅助函数
         func floatKeys(prefixes: [String]) -> [String] {
@@ -363,7 +417,7 @@ public final class TemperatureSensors {
             return true
         }
 
-        lastScanTime = Date()
+        lastScanTime = now
         // 重置热点追踪，强制下次读取时全量扫描
         cpuTrack = HotspotTrack()
         gpuTrack = HotspotTrack()
@@ -372,6 +426,7 @@ public final class TemperatureSensors {
         cachedPalmRest = (0, .distantPast)
         cachedHeatsink = (0, .distantPast)
         cachedOtherHotspots = ([:], .distantPast)
+        cachedOtherMax = (0, .distantPast)
         cachedBattery = (0, .distantPast)
         let total = cpu.count + gpu.count + nandKeys.count + battKeys.count
                     + palmRestKeys.count + heatsinkKeys.count + otherHotKeys.count
@@ -384,7 +439,7 @@ public final class TemperatureSensors {
     // 会触发 Swift 排他性冲突导致 daemon 崩溃。
     // 因此 checkRescan 只在无 inout 激活的入口点调用。
     private func checkRescan() {
-        if Date().timeIntervalSince(lastScanTime) > scanInterval {
+        if clock().timeIntervalSince(lastScanTime) > scanInterval {
             rescanAllSensors()
         }
     }
@@ -442,6 +497,7 @@ public final class TemperatureSensors {
     // 无追踪的全量读取（电池等低频分类，键通常很少）
     // 注意：调用方必须在 inout 激活前调用 checkRescan()
     private func maxTemp(_ keys: [String]) -> Double {
+        smcReadCount += keys.count
         var m = 0.0
         for k in keys {
             if let v = try? smc.readDouble(k), v > 1, v < 120 {
@@ -475,7 +531,22 @@ public final class TemperatureSensors {
     public var batteryTemperature: Double { checkRescan(); return cachedMax(battKeys, cache: &cachedBattery, ttl: controlCacheTTL) }
     public var palmRestTemperature: Double { checkRescan(); return cachedMax(palmRestKeys, cache: &cachedPalmRest) }
     public var heatsinkTemperature: Double { checkRescan(); return cachedMax(heatsinkKeys, cache: &cachedHeatsink) }
-    public var otherHotspotMax: Double { checkRescan(); return maxTemp(otherHotKeys) }
+    // v3.4.1：走展示缓存——otherHotKeys 可达 ~110 个键，此前每拍全量读是
+    // 全项目最大的 IOKit 乘数浪费（3150 万拍/年 × 110 ≈ 35 亿次调用）。
+    // otherHotspotReadings()（明细展示）本来就缓存 10s；max 用于环境谷值候选与
+    // envTemp 展示，10s 语义一致。
+    public var otherHotspotMax: Double {
+        checkRescan()
+        let now = clock()   // 走注入时钟（与其它 TTL 缓存一致，测试可控）
+        if now.timeIntervalSince(cachedOtherMax.1) < displayCacheTTL,
+           cachedOtherMax.1 != .distantPast {
+            return cachedOtherMax.0
+        }
+        let v = maxTemp(otherHotKeys)
+        otherMaxScanCount += 1
+        cachedOtherMax = (v, now)
+        return v
+    }
 
     // 环境温度代理（环境补偿的输入）——谷值追踪版，语义见 ambientEstimate(now:)。
     public var envTemperature: Double? {
@@ -577,9 +648,21 @@ public final class TemperatureSensors {
     }
 
     // 整机功耗（W）；无可用键或读数异常返回 nil（UI 隐藏）
+    // v3.4.1：PSTR 走 2s 控制级缓存——同拍内统计/学习/status 多处读只付 1 次成本；
+    // 跨拍时缓存已过期（拍间隔 ≥1s > 2s 只在 fast-apply 同拍复现），语义不变
+    private var cachedPower: (value: Double?, time: Date) = (nil, .distantPast)
+
     public var systemPowerWatts: Double? {
-        guard let key = powerKey, let v = try? smc.readDouble(key),
-              v > 0.1, v < 1000 else { return nil }
+        let now = clock()
+        if now.timeIntervalSince(cachedPower.1) < 2, cachedPower.1 != .distantPast {
+            return cachedPower.0
+        }
+        let v: Double? = {
+            guard let key = powerKey, let w = try? smc.readDouble(key),
+                  w > 0.1, w < 1000 else { return nil }
+            return w
+        }()
+        cachedPower = (v, now)
         return v
     }
 

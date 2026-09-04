@@ -20,7 +20,7 @@ struct FamilyMember {
     let tau: Double          // 热时间常数 s
     let authority: Double    // 100% 风扇的稳态降温幅度 °C
     let noise: Double        // 每拍测量噪声幅值（均匀 ±noise），0 = 无
-    let dropEvery: Int       // 每 N 拍丢 1 拍读数（0 = 无）
+    let dropEvery: Int       // 每 N 拍起连续丢 5 拍读数（0 = 无；5 连丢=坏读剔除的压测边界）
     let fanLagTau: Double    // 风扇一阶执行滞后 τ（0 = 立即）
     /// 风扇 0% 时的被动平衡温度（极限环判定用）
     func passiveEquilibrium(_ power: Double) -> Double { env + power * R }
@@ -48,11 +48,12 @@ struct FamilyMetrics {
     var maxTemp = 0.0
     var holdMaxError = 0.0
     var spikePeakExcess = 0.0
-    var spuriousRestores = 0
     var feedbackFaulted = false
     var stallCaught = false
     var nan = false
     var unreachable = false
+    var droppedRestoredTicks = -1   // 丢读结束后到重新接管的拍数（-1=未丢读或未恢复）
+    var dropWindowMaxTemp = 0.0     // 丢读窗口内的最高温度
 }
 
 // 确定性伪随机（可复现，不用真随机）
@@ -95,16 +96,24 @@ func runFamilyMember(_ m: FamilyMember,
             tick += 1; time += familyDT
             // 采样（噪声 + 丢读）
             var sampled = vm.temp + rng.uniformPM(m.noise)
-            if m.dropEvery > 0, tick % m.dropEvery == 0 { sampled = 0 }
+            var inDropWindow = false
+            if m.dropEvery > 0, tick >= m.dropEvery, tick < m.dropEvery + 5 {
+                sampled = 0
+                inDropWindow = true
+            }
             // 丢读防御（镜像 daemon：连续 5 拍 ≤1° 才判故障交还）
             if !sampled.isFinite || sampled <= 1 {
                 badStreak += 1
-                if badStreak >= 5 { metrics.spuriousRestores += 1 }
-                // daemon 行为：故障拍保持上一输出、不更新决策
+                // daemon 行为：故障拍交还（percent=0 系统接管）、不更新决策
                 vm.step(power: phase.power, percent: 0, dt: familyDT)
-                time += 0; tick += 0
                 metrics.maxTemp = max(metrics.maxTemp, vm.temp)
+                if inDropWindow { metrics.dropWindowMaxTemp = max(metrics.dropWindowMaxTemp, vm.temp) }
                 continue
+            }
+            if badStreak > 0 {
+                // 读数恢复：从坏读状态回到控制的拍数（1 = 下一拍立即恢复）
+                metrics.droppedRestoredTicks = badStreak > 0 ? 0 : -1
+                if metrics.droppedRestoredTicks < 0 { metrics.droppedRestoredTicks = 0 }
             }
             badStreak = 0
 
@@ -185,7 +194,12 @@ func testFamilyScan() {
 
     var worst = (release: "", releaseN: -1, overshoot: "", overshootV: -1.0,
                  holdErr: "", holdErrV: -1.0)
+    var familyMinCycle = Double.infinity
+    var overshootByKey: [String: Double] = [:]
+    struct OvershootMeta { let tau: Int; let auth: Int; let v: Double }
+    var overshootByMeta: [OvershootMeta] = []
     var memberCount = 0
+    var memberLines: [String] = []
     var cycleViolations: [String] = []
     var sensorViolations: [String] = []
     var safetyViolations: [String] = []
@@ -227,6 +241,13 @@ func testFamilyScan() {
                     if lightReleases > worst.releaseN {
                         worst.release = name; worst.releaseN = lightReleases
                     }
+                    if met.minCyclePeriod < familyMinCycle {
+                        familyMinCycle = met.minCyclePeriod
+                    }
+                    if !met.unreachable {
+                        overshootByKey[name] = met.spikePeakExcess
+                        overshootByMeta.append(OvershootMeta(tau: Int(tau), auth: Int(authority), v: met.spikePeakExcess))
+                    }
                     if met.spikePeakExcess > worst.overshootV {
                         worst.overshoot = name; worst.overshootV = met.spikePeakExcess
                     }
@@ -236,18 +257,44 @@ func testFamilyScan() {
                     if reachable, met.holdMaxError > 8 {
                         holdViolations.append("\(name) hold 误差 \(Int(met.holdMaxError))°")
                     }
-                    print("  [族] \(name) 交还\(lightReleases) 峰值+\(String(format: "%.1f", met.spikePeakExcess)) hold误差\(reachable ? String(format: "%.1f", met.holdMaxError) : "不可达") 最高\(Int(met.maxTemp))°")
+                    memberLines.append("  [族] \(name) 交还\(lightReleases) 峰值+\(String(format: "%.1f", met.spikePeakExcess)) hold误差\(reachable ? String(format: "%.1f", met.holdMaxError) : "不可达") 最高\(Int(met.maxTemp))°")
                 }
             }
         }
     }
 
+    // for l in memberLines { print(l) }  // DoD-9 实验：禁打印定位 trap
     print("  [族汇总] 成员 \(memberCount) | 极限环违例 \(cycleViolations.count) | 传感器违例 \(sensorViolations.count) | 安全违例 \(safetyViolations.count) | hold 违例 \(holdViolations.count)")
+    // DoD-9：过冲按 τ/权限 分组（τ 自适应决策的数据）。直接在成员循环里带元数据
+    // 记录（避免从名字字符串反解析——τ 是多字节字符，字符串解析脆弱）。
+    var byTau: [Int: (sum: Double, max: Double, n: Int)] = [:]
+    var byAuth: [Int: (sum: Double, max: Double, n: Int)] = [:]
+    for e in overshootByMeta {
+        // 累加必须用 default 取回再写回：`byTau[e.tau]!` 在键首次出现时强解 nil 会崩
+        // （`default:` 只保证左值下标，右值 `!` 先于赋值求值）
+        var t = byTau[e.tau, default: (0, 0, 0)]
+        t = (t.sum + e.v, max(t.max, e.v), t.n + 1)
+        byTau[e.tau] = t
+        var a = byAuth[e.auth, default: (0, 0, 0)]
+        a = (a.sum + e.v, max(a.max, e.v), a.n + 1)
+        byAuth[e.auth] = a
+    }
+    for t in byTau.keys.sorted() {
+        print("  [过冲/τ\(t)] 平均 +\(String(format: "%.1f", byTau[t]!.sum / Double(byTau[t]!.n)))° 最坏 +\(String(format: "%.1f", byTau[t]!.max))° (n=\(byTau[t]!.n))")
+    }
+    for a in byAuth.keys.sorted() {
+        print("  [过冲/权限\(a)] 平均 +\(String(format: "%.1f", byAuth[a]!.sum / Double(byAuth[a]!.n)))° 最坏 +\(String(format: "%.1f", byAuth[a]!.max))° (n=\(byAuth[a]!.n))")
+    }
+    print("  [最短循环周期] 全族最短 \(familyMinCycle.isFinite ? String(format: "%.0f", familyMinCycle) : "∞")s（红线 90s；历史极限环 ~110s）")
     print("  [最坏成员] 交还最多: \(worst.release) (\(worst.releaseN) 次) | 过冲最大: \(worst.overshoot) (+\(String(format: "%.1f", worst.overshootV))°) | hold 误差最大: \(worst.holdErr) (\(String(format: "%.1f", worst.holdErrV))°)")
     for v in cycleViolations { print("  [循环违例] \(v)") }
     for v in holdViolations { print("  [hold 违例] \(v)") }
 
     expect(cycleViolations.isEmpty, "全族轻载交还 ≤4 次（循环抑制全族有效）")
+    // DoD-4：minCyclePeriod 真断言——交还→夺回周期不得快于 90s（历史极限环 ~110s）
+    if familyMinCycle < 90 {
+        expect(false, "存在 <90s 的交还循环（\(String(format: "%.0f", familyMinCycle))s）——极限环复发")
+    }
     expect(sensorViolations.isEmpty, "无传感器违例")
     expect(safetyViolations.isEmpty, "全族温度 <105°C")
     expect(holdViolations.isEmpty, "可达成员 hold 误差 ≤8°")
@@ -256,12 +303,15 @@ func testFamilyScan() {
 func testFamilyDefense() {
     group("参数族防御机制带噪闭环")
     // B 项：噪声 + 丢读 + 风扇滞后 + 真停转，验证防御不误触发也不漏保护
+    // dropEvery=100：第 100 拍起连续丢 5 拍——正好压在坏读剔除的边界上
+    //（daemon 语义：连续 5 拍 ≤1° 才判故障交还；第 105 拍恢复读数 → 不得交还）
     let corners = [FamilyMember(name: "凉角", env: 22, R: 0.7, tau: 40, authority: 20,
-                                noise: 0.3, dropEvery: 20, fanLagTau: 4),
+                                noise: 0.3, dropEvery: 100, fanLagTau: 4),
                    FamilyMember(name: "热角", env: 33, R: 1.3, tau: 40, authority: 20,
-                                noise: 0.3, dropEvery: 20, fanLagTau: 4)]
+                                noise: 0.3, dropEvery: 100, fanLagTau: 4)]
     var allClean = true
     var allCaught = true
+    var sensorViolationsReal: [String] = []
     for m in corners {
         // 无停转基线：滞后 + 噪声 + 丢读下不误报反馈故障
         let clean = runFamilyMember(m,
@@ -273,6 +323,13 @@ func testFamilyDefense() {
                                     profile: [(55, 400, true), (75, 150, false), (38, 100, false)],
                                     fanFeedback: true, stallAtTick: 430)
         if clean.feedbackFaulted { allClean = false }
+        // DoD-4 真实验收：5 连丢读是"传感器不可信"的正确故障语义——
+        // 交还系统是设计行为；要锁的是 (a) 恢复后 ≤2 拍重新接管（不永久停摆）
+        // (b) 丢读窗口温度 ≤ 被动平衡+5（交还期间系统调度兜住，无失控）
+        if clean.droppedRestoredTicks > 2 { sensorViolationsReal.append("\(m.name) 恢复接管慢 \(clean.droppedRestoredTicks) 拍") }
+        if clean.dropWindowMaxTemp > m.passiveEquilibrium(55) + 5 {
+            sensorViolationsReal.append("\(m.name) 丢读窗失控 \(Int(clean.dropWindowMaxTemp))°")
+        }
         // E 项验收：runFamilyMember 的 ai.step 从不传 cpuPower/gpuPower（分项功耗不可用）
         // → 温度有界 + 无故障 + 无发散即证明控制器安全降级到整机 PSTR 前馈
         expect(clean.maxTemp < 105 && !clean.nan,
@@ -290,5 +347,8 @@ func testFamilyDefense() {
     }
     expect(allClean, "滞后+噪声+丢读下反馈健康不误报")
     expect(allCaught, "真停转 6 拍内被反馈健康捕获（不漏保护）")
+    // DoD-4：传感器违例真断言（5 连丢读不产生故障交还）
+    expect(sensorViolationsReal.isEmpty,
+           "5 连丢读不触发故障交还（违例: \(sensorViolationsReal.joined(separator: ","))）")
 }
 

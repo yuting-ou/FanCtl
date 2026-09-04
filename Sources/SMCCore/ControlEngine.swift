@@ -203,6 +203,7 @@ public final class ControlEngine {
     /// 系统唤醒（主队列调用）：清理残留状态、重扫传感器、立即跑一拍
     public func wake() {
         setSuspended(false)
+        fans.invalidateFanLimits()   // v3.4.1：唤醒重读风扇 Mn/Mx（固件可能重置）
         fans.restoreAutoAll()
         controller.invalidateTemp()
         controller.clearOutput()

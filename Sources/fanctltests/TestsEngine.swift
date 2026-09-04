@@ -10,19 +10,45 @@ import SMCCore
 final class MockSMC: SMCIO {
     var values: [String: (type: String, value: Double)] = [:]
     var writes: [(key: String, value: Double)] = []
+    var reads: [String] = []   // v3.4.1：读记录（缓存效果观测）
 
     func set(_ key: String, _ value: Double, type: String = "flt ") {
         values[key] = (type, value)
     }
     func lastWrite(_ key: String) -> Double? { writes.last { $0.key == key }?.value }
 
+    /// v3.4.1：按声明类型真实编码——此前恒按 Float32 编码，
+    /// smcReadings 等经 read() → doubleValue 的解码路径对 sp78/fpe2/ui8 完全没被测过。
+    /// 编码格式与 SMC.swift 的真实约定一致（大端整型、sp78=值×256、fpe2=值×4）。
     func read(_ key: String) throws -> SMCValue {
         guard let v = values[key] else { throw SMCError.keyNotFound(key) }
-        var f = Float32(v.value)
-        let bytes = withUnsafeBytes(of: &f) { Array($0) }
-        return SMCValue(key: key, dataType: v.type, dataSize: 4, bytes: bytes)
+        switch v.type {
+        case "sp78":
+            // sp78 = 8.8 有符号定点：负温度合法（-12.25 → 0xFC E0）。
+            // 教训：UInt16(负数) 直接 trap——有符号必须走 Int16.bitPattern
+            let i = Int16(clamping: Int((v.value * 256).rounded()))
+            let raw = UInt16(bitPattern: i)
+            return SMCValue(key: key, dataType: v.type, dataSize: 2,
+                            bytes: [UInt8(raw >> 8), UInt8(raw & 0xFF)])
+        case "fpe2":
+            let raw = UInt16(max(0, min(65535, v.value * 4)).rounded())
+            return SMCValue(key: key, dataType: v.type, dataSize: 2,
+                            bytes: [UInt8(raw >> 8), UInt8(raw & 0xFF)])
+        case "ui8 ":
+            return SMCValue(key: key, dataType: v.type, dataSize: 1,
+                            bytes: [UInt8(max(0, min(255, v.value)))])
+        case "ui16":
+            let raw = UInt16(max(0, min(65535, v.value)))
+            return SMCValue(key: key, dataType: v.type, dataSize: 2,
+                            bytes: [UInt8(raw >> 8), UInt8(raw & 0xFF)])
+        default:  // "flt "：小端 IEEE754（Apple Silicon 约定）
+            var f = Float32(v.value)
+            let bytes = withUnsafeBytes(of: &f) { Array($0) }
+            return SMCValue(key: key, dataType: v.type, dataSize: 4, bytes: bytes)
+        }
     }
     func readDouble(_ key: String) throws -> Double {
+        reads.append(key)
         guard let v = values[key] else { throw SMCError.keyNotFound(key) }
         return v.value
     }
@@ -144,6 +170,222 @@ func testFanControllerMock() {
     }
 }
 
+
+// v3.4.1 DoD-2 计数测试：otherHotspotMax 缓存生效——10s TTL 内连续多拍
+// ambientEstimate 对 otherHotKeys 零 SMC 读；过期后恰好重读一轮。
+func testOtherHotspotCache() {
+    group("otherHotspotMax 缓存")
+    let smc = MockSMC()
+    smc.set("Tp01", 55)
+    smc.set("TB0t", 30)
+    for k in ["TVV0", "TVD0", "TCMb", "Te05", "Te06"] { smc.set(k, 50) }
+    let clock = FakeClock()
+    let ts = try! TemperatureSensors(smc: smc)
+    ts.clock = { clock.time() }
+    _ = ts.ambientEstimate(now: clock.time(), cpu: 55)   // 首拍：建立缓存（1 轮全量）
+    let scans0 = ts.otherMaxScanCount
+    for _ in 0..<5 { clock.advance(3); _ = ts.ambientEstimate(now: clock.time(), cpu: 55) }
+    // 无缓存时 = 每拍 1 轮 × 5 拍 = 5 轮（×5 键 = 25 次 SMC 读）；
+    // 10s TTL 下 5 拍(15s)至多 2 轮——乘数浪费被消除 ≥60%
+    expect(ts.otherMaxScanCount - scans0 <= 2,
+           "5 拍(15s) other 全量读 ≤2 轮（得 \(ts.otherMaxScanCount - scans0)，无缓存为 5）")
+    clock.advance(11)
+    for _ in 0..<3 { _ = ts.ambientEstimate(now: clock.time(), cpu: 55) }
+    // 过期后 3 拍至多重读 1-2 轮（边界拍可能各触发一次），远好于无缓存的每拍 1 轮
+    expect(ts.otherMaxScanCount - scans0 <= 2,
+           "TTL 过期后 3 拍 ≤2 轮全量读（得 \(ts.otherMaxScanCount - scans0)，无缓存为 3）")
+}
+
+// v3.4.1 DoD-3：Mn/Mx 静态缓存——allStates 二次调用 Mn/Mx 零读（Ac/Tg 仍每拍读）；
+// invalidateFanLimits 后恢复重读；PSTR 2s 缓存同拍复用。
+func testFanLimitsCache() {
+    group("风扇静态键缓存")
+    let smc = makeFanSMC()
+    smc.set("PSTR", 30)
+    let fc = try! FanController(smc: smc)
+    _ = fc.allStates()   // 首轮：读 Mn/Mx 建缓存
+    let w1 = smc.writes.count
+    let reads1 = smc.reads.count
+    _ = fc.allStates()   // 二轮：只读 Ac/Tg（每风扇 2 读而非 4）
+    let delta = smc.reads.count - reads1
+    expect(delta == 2, "二轮 allStates 只读 Ac/Tg（得 \(delta)，无缓存为 4）")
+    fc.invalidateFanLimits()
+    _ = fc.allStates()
+    expect(smc.reads.count - reads1 - delta == 4, "失效后重读 Mn/Mx")
+    // PSTR 短缓存
+    let ts = try! TemperatureSensors(smc: smc)
+    let a = ts.systemPowerWatts
+    let r1 = smc.reads.count
+    let b = ts.systemPowerWatts
+    expect(smc.reads.count - r1 == 0, "2s 内二次读 PSTR 走缓存")
+    expect(a == b && a == 30, "缓存值一致")
+}
+
+// v3.4.1 DoD-6：SMC 字节解码/编码真测试——此前 MockSMC.read 恒按 Float32 编码，
+// sp78/fpe2/ui8/ui16 的 doubleValue 解码路径零覆盖（Intel 平台 sp78 完全靠运气）。
+func testSMCBytes() {
+    group("SMC 字节解码/编码")
+    // sp78：值×256 大端有符号（Intel 温度键）
+    let smc = MockSMC()
+    smc.set("TC0P", 65.5, type: "sp78")
+    let v = try! smc.read("TC0P")
+    expectEqual(v.bytes, [0x41, 0x80], "sp78 65.5 → 0x4180 大端")
+    expectClose(v.doubleValue!, 65.5, 1e-9, "sp78 解码往返")
+    // 负值（sp78 有符号）
+    smc.set("TC0P", -12.25, type: "sp78")
+    expectClose(try! smc.read("TC0P").doubleValue!, -12.25, 1e-9, "sp78 负值")
+    // fpe2：值×4 大端无符号（Intel 风扇 RPM）
+    smc.set("F0Mn", 1200, type: "fpe2")
+    let f = try! smc.read("F0Mn")
+    expectEqual(f.bytes, [0x12, 0xC0], "fpe2 1200 → 0x12C0")
+    expectClose(f.doubleValue!, 1200, 1e-9, "fpe2 解码往返")
+    // ui8 / ui16 大端
+    smc.set("FNum", 2, type: "ui8 ")
+    expectEqual(try! smc.read("FNum").bytes, [2], "ui8 编码")
+    expectEqual(try! smc.read("FNum").doubleValue!, 2, "ui8 解码")
+    smc.set("FS! ", 5, type: "ui16")
+    expectEqual(try! smc.read("FS! ").bytes, [0, 5], "ui16 大端编码")
+    expectEqual(try! smc.read("FS! ").doubleValue!, 5, "ui16 解码")
+    // writeDouble 按目标键类型编码（写 ui8 钳位、fpe2 ×4）
+    smc.set("F0Tg", 0, type: "fpe2")
+    try! smc.writeDouble("F0Tg", value: 3000)
+    expectClose(smc.values["F0Tg"]!.value, 3000, 1e-9, "fpe2 写入")
+    // fourCC 往返
+    expectEqual(fourCCToString(fourCC("TC0P")), "TC0P", "fourCC 往返")
+    expectEqual(fourCCToString(fourCC("FS! ")), "FS! ", "fourCC 特殊字符")
+    expectEqual(fourCC(""), 0, "空串 → 0")
+    // 经 SMCConnection 同款解码链路的温度读取（Intel sp78 全链路）
+    smc.set("TC0P", 71.5, type: "sp78"); smc.set("TG0D", 55.0, type: "sp78")
+    let ts = try! TemperatureSensors(smc: smc)
+    expectClose(ts.cpuTemperature, 71.5, 0.01, "Intel sp78 全链路（read→doubleValue→热点）")
+}
+
+// v3.4.1 DoD-7：引擎级接线测试——此前 makeEngine 写死 onBattery:false /
+// powerComponents:nil / FakeClock 正午，电池安静档、分项功耗前馈、夜间档、
+// wake/enterSleep 的引擎接线全部零覆盖。
+func testEngineWiring() {
+    group("引擎接线(DoD-7)")
+
+    // ① 电池安静档接线：onBattery=true + batteryPreset 开启 → reason=.battery、安静档曲线
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced,
+                                         batteryPreset: .quiet, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 70); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col,
+                                onBattery: { true })
+        engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.reason, .battery, "电池供电 → 安静档接线生效")
+        expect(ConfigStore.loadStatus()?.batteryOverride == true, "batteryOverride 下发")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+
+    // ② 分项功耗前馈接线：cpuPower 突增 >8W → 输出抬升（对比无分项）
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+        // 74°：目标带外（>76−2），PD 主动控制而非空闲交还
+        let smc = makeFanSMC(); smc.set("Tp01", 74); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let colA = EngineCollector(), colB = EngineCollector()
+        var cpuPowerNow = 12.0   // 可变分项功耗（突增由这里注入）
+        let engineA = makeEngine(smc: smc, clock: clock, collector: colA,
+                                 powerComponents: { (cpuPowerNow, 10) })
+        let smcB = makeFanSMC(); smcB.set("Tp01", 74); smcB.set("PSTR", 30)
+        let engineB = makeEngine(smc: smcB, clock: clock, collector: colB,
+                                 powerComponents: { (nil, nil) })
+        for _ in 0..<4 { engineA.beat(); engineB.beat(); clock.advance(3)
+            if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+            if let tg = smcB.lastWrite("F0Tg") { smcB.set("F0Ac", tg) } }
+        // 第 5-8 拍：A 的分项功耗突增 12→24W（>8W 阈值）→ 快速前馈抬输出；
+        // 对比决策积分（aiController.output）而非写入 RPM——slew 限速会拉平单拍差。
+        // PSTR 恒 30：整机前馈两路同置，只有分项通路能感知突增
+        smc.set("PSTR", 30)
+        cpuPowerNow = 40   // 12→40：+28W → 分项前馈 min(12, 20×0.7)=11.2%
+        for _ in 0..<4 {
+            smc.set("PSTR", 30)
+            engineA.beat(); engineB.beat()
+            if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+            if let tg = smcB.lastWrite("F0Tg") { smcB.set("F0Ac", tg) }
+            clock.advance(3)
+        }
+        let a = engineA.aiController.output, b = engineB.aiController.output
+        expect(a > b + 4,   // 预期差 ≥11%（前馈上限 12%）减 slew 摊薄
+               "分项功耗突增（仅分项可见）→ 前馈接线生效（决策 A\(Int(a))% > B\(Int(b))%）")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+
+    // ③ 夜间档接线：FakeClock 到 23:00 → reason=.night / nightOverride
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false,
+                                         quietHours: true))
+        let smc = makeFanSMC(); smc.set("Tp01", 70); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.reason, .curve, "白天正常曲线")
+        clock.advance(3600 * 12)   // 正午 → 23:00（进入夜间窗）
+        engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.reason, .night, "23:00 → 夜间安静档接线生效")
+        expect(ConfigStore.loadStatus()?.nightOverride == true, "nightOverride 下发")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+
+    // ④ wake()/enterSleep()：唤醒后 forcedMode 重建 + 心跳/挂起标志复位
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 70); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        engine.beat()
+        expect(smc.lastWrite("F0Md") == 1, "唤醒前已接管")
+        engine.enterSleep()
+        expect(engine.isSuspendedForSleep, "enterSleep 置挂起")
+        expect(smc.lastWrite("F0Md") == 0, "入睡交还系统")
+        smc.set("F0Md", 0)
+        engine.wake()
+        expect(!engine.isSuspendedForSleep, "wake 清挂起")
+        expect(col.schedules.last == 0, "wake 立即安排一拍")
+        clock.advance(3)
+        engine.beat()
+        expect(smc.lastWrite("F0Md") == 1, "唤醒后重新接管（强制模式重建）")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+}
+
+// v3.4.1 DoD-8：周期重扫后台化——旧分类在后台扫描完成前保持可用（控制不中断），
+// 完成后分类原子刷新；init 首扫仍同步（后续读取依赖分类）。
+func testRescanAsync() {
+    group("rescan 拆拍")
+    let smc = MockSMC()
+    smc.set("Tp01", 55)
+    smc.set("TVV0", 50)
+    let clock = FakeClock()
+    let ts = try! TemperatureSensors(smc: smc)   // 同步首扫：CPU:1 other:1
+    expect(ts.sensorCounts.cpu == 1, "首扫同步完成")
+    smc.set("Tp02", 60)   // 新增键：只有重扫才能发现
+    // 异步版不在此测试中发起（后台写入 vs 主线程断言 = 数据竞争，偶发 trap 的来源）；
+    // 它的幂等/发起语义由 rescanInFlight 锁定，完成语义直接测同一函数体的阻塞版：
+    let clockBox = FakeClock()
+    ts.clock = { clockBox.time() }
+    ts.rescanAllSensorsBlocking(clockOverride: { clockBox.time() })
+    expect(ts.sensorCounts.cpu == 2, "扫描完成后新键被分类（Tp02 发现）")
+    expect(ts.sensorCounts.other == 1, "other 分类保持（TVV0）")
+}
 
 func testSensorsMock() {
     group("传感器发现(mock)")
