@@ -56,6 +56,13 @@ struct ContentView: View {
         }
         .padding(14)
         .frame(width: 340, height: 908, alignment: .top)
+        // 居中修复：卡片 glassEffect 的系统投影带方向性（光左上→影右下），
+        // 会落在卡片与窗口边缘之间仅 14pt 的玻璃条上——右侧投影可见、左侧被卡片
+        // 自身遮住，实测右缘外恒定一条 ~14pt 暗带（亮度低 ~25），视觉即"面板偏左"。
+        // 垫一层不透明的厚材质托盘：吸收投影、稳定左右亮度；卡片玻璃浮于托盘上
+        // （苹果控制中心同构：实心托盘 + 玻璃控件）。仅显示层，不涉控制语义。
+        .background(.thickMaterial, ignoresSafeAreaEdges: .all)
+        .clipShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
         // 固定高度根治"面板跳"：MenuBarExtra 窗口尺寸 = 内容 idealSize，
         // 各模式/刷新瞬间 idealSize 有 1px 浮点差异就会触发窗口重排（表现为"跳"）。
         // 固定总高后窗口 idealSize 恒定，任何内部内容切换都不再改变窗口尺寸。
@@ -1456,6 +1463,8 @@ private struct CardBackground: ViewModifier {
                 .overlay(shape.strokeBorder(.white.opacity(0.12)))
         } else {
             base.glassEffect(.regular, in: shape)
+                // 面板有实心托盘底后，玻璃卡需发丝描边定义轮廓（托盘上白玻璃对比度低）
+                .overlay(shape.strokeBorder(.white.opacity(0.14)))
         }
     }
 }
