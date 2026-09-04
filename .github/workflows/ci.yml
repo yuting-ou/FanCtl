@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']     # v3.4.5（4A）：tag 推送触发 release job 打包发行
   pull_request:
 
 jobs:
@@ -51,3 +52,42 @@ jobs:
 
       - name: Release 构建
         run: swift build -c release --disable-sandbox
+
+  # v3.4.5（4A）：tag 推送时打包 dist/ 附到 GitHub Release——访客不必自备
+  # Swift 工具链源码编译（第一公里）。产物含 daemon 二进制 + 完整 App bundle +
+  # install/uninstall 脚本，按 tag 命名（如 FanCtl-v3.5.0.zip）。
+  release:
+    name: 打包 Release 附件
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 运行回归测试（tag 也必须全绿才发版）
+        run: swift run -c release --disable-sandbox fanctltests
+
+      - name: 打包（build.sh 从 VERSION 读取版本并组装 App bundle）
+        run: ./scripts/build.sh
+
+      - name: 收集发行物
+        run: |
+          VERSION=$(head -1 VERSION | awk '{print $1}')
+          STAGE="FanCtl-${VERSION}"
+          mkdir -p "$STAGE"
+          cp -R dist/FanCtl.app "$STAGE/"
+          cp dist/fanctld "$STAGE/"
+          cp scripts/install.sh "$STAGE/"
+          cp scripts/uninstall.sh "$STAGE/"
+          zip -qr "FanCtl-v${VERSION}.zip" "$STAGE"
+          echo "ASSET=FanCtl-v${VERSION}.zip" >> "$GITHUB_ENV"
+
+      - name: 发布 GitHub Release（gh CLI，第一方工具）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ASSET" \
+            --title "清风 $GITHUB_REF_NAME" \
+            --notes "解压后：sudo ./install.sh 安装（详见 README 快速安装）。macOS 26+ Apple Silicon。" \
+            --generate-notes

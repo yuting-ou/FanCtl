@@ -12,6 +12,22 @@ swift run -c release --disable-sandbox fanctltests
 echo "==> 编译 release 版本..."
 swift build -c release --disable-sandbox
 
+# 版本单一来源（4B）：根目录 VERSION 文件 = "主版本 build号"。
+# App（Info.plist）与 daemon（fanctld -v）都从这里读，消除 README/脚本/二进制三处硬编码漂移。
+read -r APP_VERSION BUILD_NUMBER < "$ROOT/VERSION"
+export FANCTL_VERSION="$APP_VERSION"
+export FANCTL_BUILD="$BUILD_NUMBER"
+
+# daemon 版本常量（4E）：从 VERSION 重生成，与 App plist 同源。
+# 提交的占位文件供裸 swift build/test 使用；打包构建时严格同步。
+cat > "$ROOT/Sources/fanctld/Version.generated.swift" <<EOF
+// 由 scripts/build.sh 从根目录 VERSION 重新生成（勿手改）。
+// 占位值供裸 \`swift build\` / \`swift test\` 使用；打包构建时与 VERSION 严格同步（4B 单一来源）。
+import Foundation
+
+let fanctldVersion = "$APP_VERSION ($BUILD_NUMBER)"
+EOF
+
 BIN="$ROOT/.build/release"
 rm -rf "$DIST"
 mkdir -p "$DIST"
@@ -28,7 +44,7 @@ cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT/scripts/uninstall.sh" "$APP/Contents/Resources/uninstall.sh"
 chmod +x "$APP/Contents/Resources/uninstall.sh"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -50,9 +66,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>3.4.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>50</string>
+    <string>${BUILD_NUMBER}</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>LSUIElement</key>

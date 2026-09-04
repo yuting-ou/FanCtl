@@ -53,6 +53,13 @@ func log(_ msg: String) {
 
 FanCtlPaths.ensureDirectories()
 
+// v3.4.5（4E）：-v/--version 打印版本退出——排障时回答"跑的是哪个版本的 fanctld"。
+// 版本常量在 Version.generated.swift（build.sh 从根目录 VERSION 重生成，单一来源）。
+if CommandLine.arguments.contains(where: { $0 == "-v" || $0 == "--version" }) {
+    print("fanctld \(fanctldVersion)")
+    exit(0)
+}
+
 guard getuid() == 0 else {
     log("fanctld 必须以 root 运行（风扇 SMC 写入需要特权）")
     exit(1)
@@ -76,7 +83,7 @@ guard fans.fanCount > 0 else {
 }
 
 let counts = sensors.sensorCounts
-log("启动: 风扇 x\(fans.fanCount), CPU x\(counts.cpu), GPU x\(counts.gpu), SSD x\(counts.nand), 电池 x\(counts.batt), 掌托 x\(counts.palm), 散热片 x\(counts.heatsink), 其他 x\(counts.other)")
+log("启动: fanctld \(fanctldVersion) — 风扇 x\(fans.fanCount), CPU x\(counts.cpu), GPU x\(counts.gpu), SSD x\(counts.nand), 电池 x\(counts.batt), 掌托 x\(counts.palm), 散热片 x\(counts.heatsink), 其他 x\(counts.other)")
 
 // 启动时无条件清理 SMC 强制模式残留：上一实例被 SIGKILL/崩溃/断电终止时
 // SMC 可能仍处强制模式（Md=1、Tg=旧值）。若 config.mode == .auto，

@@ -18,6 +18,15 @@ struct FanCtlApp: App {
     @StateObject private var model = FanModel()
 
     init() {
+        // v3.4.5（4D）：卸载入口——SMAppService 登录项在 App 被删除后无法反注册
+        //（无系统 CLI），卸载脚本在 pkill/删文件前用本参数让 App 自行注销。
+        if CommandLine.arguments.contains("--unregister-login-item") {
+            if Bundle.main.bundleIdentifier != nil {
+                try? SMAppService.mainApp.unregister()
+                print("已注销「登录时启动」项")
+            }
+            exit(0)
+        }
         // 调试用：离屏渲染面板到 PNG（验证 UI 无需手动点开菜单栏）
         if CommandLine.arguments.contains("--snapshot") {
             snapshotPlainCards = true

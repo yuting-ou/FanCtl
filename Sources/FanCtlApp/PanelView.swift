@@ -322,10 +322,11 @@ struct ContentView: View {
 
         sudo /Applications/清风.app/Contents/Resources/uninstall.sh
 
-        卸载将停止并移除守护进程、恢复系统风扇调度，并删除：
+        卸载将注销登录项、停止并移除守护进程、恢复系统风扇调度，并删除：
         • /Library/LaunchDaemons/com.fanctl.daemon.plist
         • /Library/Application Support/FanCtl
-        • /Applications/清风.app（需手动拖入废纸篓）
+        • /Applications/清风.app（脚本一并删除，无需手动操作）
+        • /Library/Logs/FanCtl（守护进程日志）
         """
         alert.addButton(withTitle: "复制命令")
         alert.addButton(withTitle: "关闭")

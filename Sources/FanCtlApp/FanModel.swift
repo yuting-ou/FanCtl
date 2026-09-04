@@ -332,9 +332,9 @@ final class FanModel: ObservableObject {
             fanOffsets = [offs[0], offs.count > 1 ? offs[1] : 0]
         }
 
-        if Bundle.main.bundleIdentifier != nil {
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        }
+        // v3.4.5（4E）：通知权限改为事件前请求——不再启动即弹系统授权框
+        //（首次启动观感突兀，且用户尚未理解通知的价值）。首个过热/风扇健康
+        // 事件发生时由 NotificationService.ensureAuthorized() 懒请求。
 
         // 恢复冲刺状态
         if let end = UserDefaults.standard.object(forKey: Self.boostEndKey) as? Date {

@@ -1,17 +1,37 @@
 # FanCtl(清风)— macOS 风扇智能管理
 
+> **清风**是一款 macOS 菜单栏风扇控制工具：四种调速模式（系统自动 / 温度曲线 / AI 自适应 / 手动），
+> 多层安全红线（高温兜底、SSD/电池托底）永远压过用户意图，本地自适应学习你的机器散热特性，
+> 无需配置、完全离线、卸载即还原。**English TL;DR:** a native macOS menu-bar fan controller with
+> four modes (system / curve / adaptive-AI / manual), hard safety overrides (92°C failsafe, SSD &
+> battery guards) above user intent, and fully local adaptive learning. macOS 26+ (Apple Silicon
+> only), Swift 5.9, zero third-party dependencies.
+
 ![Release](https://img.shields.io/github/v/release/yuting-ou/FanCtl)
 ![License](https://img.shields.io/github/license/yuting-ou/FanCtl)
 ![CI](https://github.com/yuting-ou/FanCtl/actions/workflows/ci.yml/badge.svg)
 ![tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/yuting-ou/FanCtl/main/.github/badges/tests.json)
-![Platform](https://img.shields.io/badge/macOS-26%2B-black)
+![Platform](https://img.shields.io/badge/macOS-26%2B%20Apple%20Silicon-black)
 ![Swift](https://img.shields.io/badge/Swift-5.9-orange)
 
-> 本文档面向**AI 助手/开发者**编写:读完即可理解本项目架构、控制逻辑、安全机制与开发流程,无需再通读全部源码。修改代码前请先读「给 AI 助手的注意事项」。
+![面板预览](assets/panel-preview.png)
 
-**版本**:3.4 (build 50) · **语言**:Swift 5.9 · **平台**:macOS 26+ (Apple Silicon / Intel) · **无第三方依赖**
+**版本**：以 [Releases](https://github.com/yuting-ou/FanCtl/releases) 与仓库根 `VERSION` 文件为准（单一来源） · **断言数**：见上方 tests 徽章（CI 每次推送自动更新，正文不再硬编码） · **语言**：Swift 5.9 · **平台**：macOS 26+（**仅 Apple Silicon**——macOS 26 已放弃 Intel；控制逻辑本身不依赖新系统，欢迎 fork 做 UI 降级移植）
 
-> **为什么要求 macOS 26？** 面板 UI 使用了 macOS 26 的 Liquid Glass API（`glassEffect`）；控制逻辑本身（SMCCore）不依赖新系统——理论可行的方式是 UI 降级适配旧系统，但这需要维护两套界面实现，超出个人项目的维护预算。欢迎 fork 做向下移植。
+> 本文档后半部分（§7 起）面向 **AI 助手/开发者**：读完即可理解本项目架构、控制逻辑、安全机制与开发流程。普通用户只需读下面的「快速安装」。
+
+## 快速安装（用户看这里）
+
+```bash
+# 1) 下载 Release 附件并解压（Releases 页 → FanCtl-vX.Y.Z.zip），cd 进解压目录
+#    或自行源码构建：git clone 后 ./scripts/build.sh
+# 2) 安装（需密码：daemon 装入系统目录 + 菜单栏 App 装入 /Applications）
+sudo ./install.sh
+# 3) 菜单栏出现「清风」图标即完成；建议在面板菜单里打开「登录时启动」
+
+# 卸载（完全卸载：登录项 / daemon / App / 数据 / 日志一并清理）
+sudo ./uninstall.sh
+```
 
 ---
 
@@ -23,7 +43,7 @@
 - **多层安全红线**:高温兜底(92°C 全速)、SSD 托底(70°→60%、78°→100%)、电池托底(45°→60%、48°→100%)、传感器卡死/偏低失真门控、看门狗——优先级永远高于用户意图
 - **体感补偿**:掌托超过 40°C 时自动收紧目标（可选），直接服务"烫不烫手"而非代理指标
 - **自适应学习**:记录"这台机器稳住每个温度需要多少风量"(查表)+ 在线辨识散热参数(RLS 线性模型)；**81 成员参数化热模型族扫描**保证标定在整族硬件上稳健
-- **可验证**:2499 项纯逻辑断言（含 81 成员参数化 HIL 闭环扫描），CI 每次推送自动回归
+- **可验证**:2500+ 项纯逻辑断言（含 81 成员参数化 HIL 闭环扫描），CI 每次推送自动回归——准确数字见顶部 tests 徽章
 - **可解释性**:status.json 携带"当前转速由谁决定"(reason)与 AI 实时意图,UI 直接展示
 
 > **关于"AI"命名**:AI 模式的实质是**自适应控制**——增量式 PD + 功耗前馈 + 在线热参数辨识(RLS 回归 + 非参数查表),不是神经网络,不做模型训练,完全本地运行。命名取其"自适应、免配置"的用户语义。
@@ -76,7 +96,7 @@ Sources/
 ├── fanctld/main.swift   root 守护进程:自适应主循环、文件监控、睡眠/唤醒、故障恢复
 ├── FanCtlApp/           SwiftUI 菜单栏 App(面板/曲线编辑器/通知)
 ├── fanprobe/main.swift  只读诊断工具(无需 root)
-└── fanctltests/main.swift  纯逻辑测试(自带断言 harness,~2100 断言)
+└── fanctltests/main.swift  纯逻辑测试(自带断言 harness,2500+)
 scripts/                 build.sh / install.sh / deploy.sh / uninstall.sh
 dist/                    构建产物(FanCtl.app + fanctld)
 ```
@@ -131,10 +151,10 @@ dist/                    构建产物(FanCtl.app + fanctld)
 ## 6. 构建 / 测试 / 部署
 
 ```bash
-# 测试(无需 Xcode,~2100 断言,失败退出码非 0)
+# 测试(无需 Xcode,2500+ 断言,失败退出码非 0)
 swift run -c release --disable-sandbox fanctltests
 
-# 构建(先跑测试再组装 dist;版本号在 build.sh 的 Info.plist)
+# 构建(先跑测试再组装 dist;版本号单一来源 = 根目录 VERSION 文件)
 ./scripts/build.sh
 
 # 安装(需 sudo:daemon → /usr/local/libexec + LaunchDaemon;App → /Applications/清风.app)
@@ -155,7 +175,7 @@ swift run -c release --disable-sandbox fanprobe
 ## 7. 给 AI 助手的注意事项
 
 1. **改逻辑前必读对应文件头注释**:核心模块顶部有详细的物理依据与线上调试经验(振荡/漂移/污染的踩坑史)。
-2. **改 SMCCore 后必须跑 `fanctltests`**:测试与 daemon 共用同一份决策代码,2061+ 断言覆盖管线优先级、控制律、学习、AI 状态机、Codable 兼容。
+2. **改 SMCCore 后必须跑 `fanctltests`**:测试与 daemon 共用同一份决策代码,2500+ 断言覆盖管线优先级、控制律、学习、AI 状态机、Codable 兼容（徽章为准）。
 3. **向后兼容是硬约束**:config/status/stats/learn 各 JSON 都有自定义 Codable 处理旧数据缺字段;新增字段时,非 Optional 字段必须 decodeIfPresent + 默认值。
 4. **时间语义**:自适应循环间隔 1~20s,所有"每拍"参数(限速、学习阈值)按 3s 标称拍标定;按秒的计时(idle 交还等)用秒。改任何"每拍"参数要考虑间隔漂移。
 5. **安全红线不可让**:92°C 兜底 / SSD 78°C 危急 / 传感器故障交还,任何新功能不得压低或绕过;静音/夜间/电池档都是"在红线之上的覆盖"。

@@ -12,6 +12,18 @@ struct ProcessInfo: Identifiable, Equatable {
 final class NotificationService {
     private let canNotify = Bundle.main.bundleIdentifier != nil
 
+    // v3.4.5（4E）：通知权限懒请求——不再 App 启动即弹系统授权框（首次启动
+    // 观感突兀且用户尚未理解通知价值）。首个通知事件发生前请求一次。
+    private var authorizationRequested = false
+
+    /// 事件前请求授权：首次调用发起系统弹窗，此后幂等。授权被拒时通知静默
+    /// 失效（add 无害），行为与启动即请求一致。
+    private func ensureAuthorized() {
+        guard canNotify, !authorizationRequested else { return }
+        authorizationRequested = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
     // 风扇健康状态
     private var fanAnomalySince: [Int: Date] = [:]
     private var lastFanAlertAt: Date = .distantPast
@@ -41,6 +53,7 @@ final class NotificationService {
                   now.timeIntervalSince(lastFanAlertAt) > 6 * 3600 else { continue }
             lastFanAlertAt = now
             fanAnomalySince[f.id] = nil
+            ensureAuthorized()
             notifyFanIssue(f, stalled: stalled, fanCount: entries.count)
         }
     }
@@ -67,6 +80,7 @@ final class NotificationService {
                Date().timeIntervalSince(since) >= 30,
                Date().timeIntervalSince(lastOverheatNotify) > 600 {
                 lastOverheatNotify = Date()
+                ensureAuthorized()
                 notifyOverheat(temp: temp)
             }
         } else if temp < 85 {
@@ -95,6 +109,7 @@ final class NotificationService {
         let c = UNMutableNotificationContent()
         c.title = "清风生成了新的曲线建议"
         c.body = "请打开面板确认后应用：" + r.summary
+        ensureAuthorized()
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: "auto-optimize", content: c, trigger: nil))
     }
