@@ -640,12 +640,18 @@ final class FanModel: ObservableObject {
         // 历史采样
         let hottest = max(cpuTemp, gpuTemp)
         if hottest > 1 {
+            // 内存采样照常：200 样本环形缓冲让"重开面板立即可见最近趋势"
             historyBuffer.append(TempSample(id: Date(), cpu: cpuTemp, gpu: gpuTemp))
             // #7: RingBuffer 自动淘汰最旧元素，O(1) 追加，无 removeAll 线性扫描
-            historySaveCounter += 1
-            if historySaveCounter >= 30 {
-                historySaveCounter = 0
-                persistHistory()
+            // v3.5.1（R3）：落盘仅在面板可见时进行——trend 文件唯一消费者是面板
+            // 打开时的快速恢复；面板长关期间每 30 事件一次 200 样本原子写是纯浪费
+            //（内存环仍在累积，App 退出时 willTerminate 兜底落盘）
+            if panelVisible {
+                historySaveCounter += 1
+                if historySaveCounter >= 30 {
+                    historySaveCounter = 0
+                    persistHistory()
+                }
             }
         }
 
