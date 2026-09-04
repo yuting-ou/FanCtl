@@ -457,11 +457,13 @@ final class FanModel: ObservableObject {
             // status.json 在 idle 状态下每 20s 更新一次（10s 心跳检查只在 runControlLoop 中）。
             // 阈值需 > 20s + 系统调度余量，避免 idle 状态下误判 daemon 死了。
             daemonAlive = age < 30
+            // v3.5.1（R1，P2 合并优先）：本函数已解码一次 status，刷新直接传参复用——
+            // 旧路径 refreshFromStatus() 会再次读盘解码同一文件（12s 兜底每周期 2 次解码）。
             if !wasAlive && daemonAlive {
                 // daemon 重新上线（如重启后），立即刷新
-                refreshFromStatus()
+                refreshFromStatus(preloaded: status)
             } else if daemonAlive && status.timestamp != lastStatusTimestamp {
-                refreshFromStatus()
+                refreshFromStatus(preloaded: status)
             } else if wasAlive && !daemonAlive {
                 // daemon 刚下线：立即清除过期决策状态，避免 UI 长时间显示
                 // 过期的 controlReason/aiIntent/controlFault（下次 refreshFromStatus 最多 12s 后）
@@ -506,9 +508,10 @@ final class FanModel: ObservableObject {
         maybeAutoOptimize()
     }
 
-    // 从 status.json 刷新 UI 状态
-    private func refreshFromStatus() {
-        guard let status = ConfigStore.loadStatus() else {
+    // 从 status.json 刷新 UI 状态。preloaded：调用方已解码的同一文件内容
+    // （12s 兜底/文件事件路径传入，省一次读盘+全量 JSON 解码；nil = 自读）
+    private func refreshFromStatus(preloaded: DaemonStatus? = nil) {
+        guard let status = preloaded ?? ConfigStore.loadStatus() else {
             daemonAlive = false
             controlReason = nil
             aiIntent = nil
