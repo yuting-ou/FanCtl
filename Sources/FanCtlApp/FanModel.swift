@@ -457,11 +457,13 @@ final class FanModel: ObservableObject {
             // status.json 在 idle 状态下每 20s 更新一次（10s 心跳检查只在 runControlLoop 中）。
             // 阈值需 > 20s + 系统调度余量，避免 idle 状态下误判 daemon 死了。
             daemonAlive = age < 30
+            // v3.5.1（R1，P2 合并优先）：本函数已解码一次 status，刷新直接传参复用——
+            // 旧路径 refreshFromStatus() 会再次读盘解码同一文件（12s 兜底每周期 2 次解码）。
             if !wasAlive && daemonAlive {
                 // daemon 重新上线（如重启后），立即刷新
-                refreshFromStatus()
+                refreshFromStatus(preloaded: status)
             } else if daemonAlive && status.timestamp != lastStatusTimestamp {
-                refreshFromStatus()
+                refreshFromStatus(preloaded: status)
             } else if wasAlive && !daemonAlive {
                 // daemon 刚下线：立即清除过期决策状态，避免 UI 长时间显示
                 // 过期的 controlReason/aiIntent/controlFault（下次 refreshFromStatus 最多 12s 后）
@@ -506,9 +508,10 @@ final class FanModel: ObservableObject {
         maybeAutoOptimize()
     }
 
-    // 从 status.json 刷新 UI 状态
-    private func refreshFromStatus() {
-        guard let status = ConfigStore.loadStatus() else {
+    // 从 status.json 刷新 UI 状态。preloaded：调用方已解码的同一文件内容
+    // （12s 兜底/文件事件路径传入，省一次读盘+全量 JSON 解码；nil = 自读）
+    private func refreshFromStatus(preloaded: DaemonStatus? = nil) {
+        guard let status = preloaded ?? ConfigStore.loadStatus() else {
             daemonAlive = false
             controlReason = nil
             aiIntent = nil
@@ -637,12 +640,18 @@ final class FanModel: ObservableObject {
         // 历史采样
         let hottest = max(cpuTemp, gpuTemp)
         if hottest > 1 {
+            // 内存采样照常：200 样本环形缓冲让"重开面板立即可见最近趋势"
             historyBuffer.append(TempSample(id: Date(), cpu: cpuTemp, gpu: gpuTemp))
             // #7: RingBuffer 自动淘汰最旧元素，O(1) 追加，无 removeAll 线性扫描
-            historySaveCounter += 1
-            if historySaveCounter >= 30 {
-                historySaveCounter = 0
-                persistHistory()
+            // v3.5.1（R3）：落盘仅在面板可见时进行——trend 文件唯一消费者是面板
+            // 打开时的快速恢复；面板长关期间每 30 事件一次 200 样本原子写是纯浪费
+            //（内存环仍在累积，App 退出时 willTerminate 兜底落盘）
+            if panelVisible {
+                historySaveCounter += 1
+                if historySaveCounter >= 30 {
+                    historySaveCounter = 0
+                    persistHistory()
+                }
             }
         }
 
@@ -660,13 +669,17 @@ final class FanModel: ObservableObject {
             // 此前停留在打开瞬间的值，与实时学习/统计脱节
             if Date().timeIntervalSince(lastPanelFileSync) > 30 {
                 lastPanelFileSync = Date()
+                // v3.5.1（R2，P2 合并优先）：history.json（30 天全量，贵的那个）解码一次
+                // 向下传参；旧路径 loadDaysWithToday 每周期被调 2 次。stats 直读保持
+                // "今日零样本显示今日空态"语义（days.last 会退化成昨天数据）。
                 stats = ConfigStore.loadStats()
+                let days = loadDaysWithToday(preloadedStats: stats)
                 learnedPoints = ConfigStore.loadLearn()?.learnedBucketCount ?? 0
                 let hot = max(cpuTemp, gpuTemp)
                 learnedNow = hot > 1 ? (ConfigStore.loadLearn()?.percent(for: hot) ?? nil) : nil
                 aiMetrics = ConfigStore.loadAIMetrics()
-                refreshAIStatus()
-                refreshThermalHealth()
+                refreshAIStatus(preloadedDays: days)
+                refreshThermalHealth(preloadedDays: days)
             }
         }
     }
@@ -914,9 +927,9 @@ final class FanModel: ObservableObject {
 
     // MARK: AI 效果与基准快照
 
-    private func loadDaysWithToday() -> [DailyStats] {
+    private func loadDaysWithToday(preloadedStats: DailyStats? = nil) -> [DailyStats] {
         var days = ConfigStore.loadHistory()
-        if let s = ConfigStore.loadStats(), s.tempCount > 0 {
+        if let s = preloadedStats ?? ConfigStore.loadStats(), s.tempCount > 0 {
             days.removeAll { $0.date == s.date }
             days.append(s)
         }
@@ -945,16 +958,18 @@ final class FanModel: ObservableObject {
         return try? JSONDecoder().decode(AIBaseline.self, from: d)
     }
 
-    private func reoptimizeState() -> (afterDays: Int, effect: AIEffect?) {
+    // v3.5.1（R2，P2 合并优先）：preloadedDays 传入调用方已读的 days 快照，
+    // 避免 30s 同步里 history.json 被重复解码（原每周期 2 次 loadDaysWithToday）
+    private func reoptimizeState(preloadedDays: [DailyStats]? = nil) -> (afterDays: Int, effect: AIEffect?) {
         guard let b = loadBaseline() else { return (0, nil) }
-        let after = loadDaysWithToday().filter { $0.date > b.date }
+        let after = (preloadedDays ?? loadDaysWithToday()).filter { $0.date > b.date }
         guard let ag = Self.aggregate(after) else { return (after.count, nil) }
         return (after.count, AIEffect(days: after.count, beforeAvg: b.avgTemp,
                                       afterAvg: ag.avg, beforeHot: b.hotRatio, afterHot: ag.hot))
     }
 
-    private func refreshAIStatus() {
-        let st = reoptimizeState()
+    private func refreshAIStatus(preloadedDays: [DailyStats]? = nil) {
+        let st = reoptimizeState(preloadedDays: preloadedDays)
         aiNudge = st.afterDays >= 3
         if let e = st.effect {
             let dAvg = e.beforeAvg - e.afterAvg
@@ -1072,8 +1087,8 @@ final class FanModel: ObservableObject {
     // 最近 7 天 vs 之前 7 天，比值上升 >15% 提示清灰/换硅脂。
     @Published var thermalHealthText: String? = nil
 
-    func refreshThermalHealth() {
-        let days = loadDaysWithToday().filter { $0.avgPower > 1 && $0.tempCount > 0 }
+    func refreshThermalHealth(preloadedDays: [DailyStats]? = nil) {
+        let days = (preloadedDays ?? loadDaysWithToday()).filter { $0.avgPower > 1 && $0.tempCount > 0 }
         guard days.count >= 14 else {
             thermalHealthText = days.count >= 2
                 ? "散热趋势积累中（需约 2 周数据，已 \(days.count) 天）"
