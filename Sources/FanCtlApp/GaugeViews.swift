@@ -150,7 +150,10 @@ struct TempGaugeCard: View {
                 .frame(maxWidth: .infinity)
                 .animation(.smooth(duration: 0.4), value: color)
         }
-        .cardStyle()
+        // v3.4.2：自身不再带卡底——CPU/GPU 两半由调用方合入同一张玻璃瓦片
+        // （单瓦片英雄区，减少玻璃投影边缘）；水平内距在此供给
+        .padding(.horizontal, 10)
+        .padding(.vertical, 2)
         .animation(.smooth(duration: 0.45), value: temp)
     }
 }

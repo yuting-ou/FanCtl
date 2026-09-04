@@ -10,14 +10,21 @@ struct ContentView: View {
     // v3.4.1：model.monitorTab 由 FanModel 持有（DoD-5a：ps 采样仅在"占用"tab 采样）
 
     var body: some View {
-        // v3.4.1：快照模式下退 GlassEffectContainer（ImageRenderer 离屏无法
-        // 合成 Liquid Glass——容器把未覆盖的 glassEffect 渲染成系统黄色 🚫 占位）。
-        // snapshotCapsule/snapshotPlainCards 分支已覆盖各玻璃站点。
+        // 快照模式：无玻璃（ImageRenderer 离屏无法合成 Liquid Glass），实心卡直出。
+        // 运行时（v3.4.2 排版重做）：整面一块液态玻璃 sheet 打底，卡片是玻璃面上的
+        // 浅层瓦片（主色低透填充 + 发丝描边）。此前每张卡独立 glassEffect，系统投影
+        // 带方向性（光左上影右下），恰好整条落在卡与窗口右缘间 14pt 玻璃条上（左侧
+        // 同位置被卡片自身遮住）→ 恒定暗带，视觉"面板偏左"。单一玻璃面后投影被面块
+        // 自身吸收，暗带消失；液态玻璃质感保留且更接近系统面板的单一连续表面。
         if snapshotPlainCards {
             panelContent
         } else {
             GlassEffectContainer(spacing: 8) {
                 panelContent
+                    .background {
+                        Color.clear
+                            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                    }
             }
         }
     }
@@ -56,13 +63,6 @@ struct ContentView: View {
         }
         .padding(14)
         .frame(width: 340, height: 908, alignment: .top)
-        // 居中修复：卡片 glassEffect 的系统投影带方向性（光左上→影右下），
-        // 会落在卡片与窗口边缘之间仅 14pt 的玻璃条上——右侧投影可见、左侧被卡片
-        // 自身遮住，实测右缘外恒定一条 ~14pt 暗带（亮度低 ~25），视觉即"面板偏左"。
-        // 垫一层不透明的厚材质托盘：吸收投影、稳定左右亮度；卡片玻璃浮于托盘上
-        // （苹果控制中心同构：实心托盘 + 玻璃控件）。仅显示层，不涉控制语义。
-        .background(.thickMaterial, ignoresSafeAreaEdges: .all)
-        .clipShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
         // 固定高度根治"面板跳"：MenuBarExtra 窗口尺寸 = 内容 idealSize，
         // 各模式/刷新瞬间 idealSize 有 1px 浮点差异就会触发窗口重排（表现为"跳"）。
         // 固定总高后窗口 idealSize 恒定，任何内部内容切换都不再改变窗口尺寸。
@@ -118,34 +118,29 @@ struct ContentView: View {
                 .font(.system(.title3, design: .rounded).weight(.semibold))
                 .lineLimit(1).fixedSize()
             Spacer()
-            // 整机功耗胶囊（发热的"因"，有传感器才显）
-            // lineLimit(1)+fixedSize：头部三项胶囊+标题+菜单在 340pt 内空间紧张，
-            // 无此防护时文本会被压缩折行（"42 W"折成两行，审查截图实测）
+            // 元信息行（v3.4.2 去胶囊化）：小字直排省 chrome，图标带语义色、文字次级灰，
+            // 悬停有完整说明；环境温度保留右键覆盖菜单。单行高度与旧胶囊行一致（26pt 约束）。
             if let w = model.systemPower {
                 HStack(spacing: 3) {
                     Image(systemName: "bolt.fill").font(.system(size: 9))
-                        .foregroundStyle(.yellow)   // 色彩只给图标，文字保持主色（苹果式克制）
-                    Text("\(Int(w.rounded()))W").font(.caption.monospacedDigit().weight(.medium))
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(.yellow)   // 色彩只给图标
+                    Text("\(Int(w.rounded()))W").font(.caption2.monospacedDigit().weight(.medium))
+                        .foregroundStyle(.secondary)
                         .lineLimit(1).fixedSize()
                         .contentTransition(.numericText())
                         .animation(.snappy, value: w)
                 }
-                .padding(.horizontal, 8).padding(.vertical, 5)
-                .snapshotCapsule()
                 .help("整机实时功耗（发热根源）")
                 .transition(.opacity)
             }
-            // 环境温度胶囊（环境补偿的输入，v8）
             if let env = model.envTemp {
                 HStack(spacing: 3) {
                     Image(systemName: model.envTempOverride != nil ? "thermometer.medium.circle.fill" : "thermometer.medium").font(.system(size: 9))
-                    Text("环境 \(Int(env.rounded()))°").font(.caption.monospacedDigit().weight(.medium))
+                    Text("\(Int(env.rounded()))°").font(.caption2.monospacedDigit().weight(.medium))
+                        .foregroundStyle(.secondary)
                         .lineLimit(1).fixedSize()
                 }
                 .foregroundStyle(model.envTempOverride != nil ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
-                .padding(.horizontal, 8).padding(.vertical, 5)
-                .snapshotCapsule()
                 .help(model.envTempOverride != nil ? "手动覆盖: \(Int(model.envTempOverride!))°C。点击可修改" : "环境温度代理：电池/掌托/散热片的有效低值。点击可手动覆盖")
                 .contextMenu {
                     Button("自动检测") { model.setEnvTempOverride(nil) }
@@ -156,18 +151,16 @@ struct ContentView: View {
                 }
                 .transition(.opacity)
             }
-            HStack(spacing: 5) {
+            HStack(spacing: 4) {
                 DaemonStatusDot(alive: model.daemonAlive)
                 Text(model.daemonAlive ? "运行中" : "未运行")
-                    .font(.caption.weight(.medium))
+                    .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1).fixedSize()
                     .contentTransition(.opacity)
                     .animation(.smooth(duration: 0.3), value: model.daemonAlive)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .snapshotCapsule()
+            .help(model.daemonAlive ? "守护进程运行中，风扇由 FanCtl 接管" : "守护进程未运行，调速不会生效")
             if snapshotPlainCards {
                 // 快照：Menu 桥接 NSMenu 离屏退 🚫 → 等尺寸静态省略号图标
                 Image(systemName: "ellipsis")
@@ -348,14 +341,23 @@ struct ContentView: View {
         }
     }
 
+    // 温度英雄区（v3.4.2）：CPU/GPU 合入同一张玻璃瓦片——单卡单投影，
+    // 消除双卡拼缝与外缘投影暗带；中缝发丝分隔线代替硬分割
     private var temperatureCards: some View {
-        HStack(spacing: 12) {   // 与面板纵向卡间距 12 对齐，横竖节奏统一
+        HStack(spacing: 0) {
             TempGaugeCard(label: "CPU", symbol: "cpu", temp: model.cpuTemp,
                           history: model.history.suffix(120).map(\.cpu),
                           subTemp: model.cpuAverageTemp)
+            Rectangle().fill(Color.primary.opacity(0.06)).frame(width: 1).padding(.vertical, 14)
             TempGaugeCard(label: "GPU", symbol: "cpu.fill", temp: model.gpuTemp,
                           history: model.history.suffix(120).map(\.gpu))
         }
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.primary.opacity(0.05)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(.white.opacity(0.12)))
     }
 
     // 监测卡：趋势 sparkline / 哪里最热明细，固定高度避免切换时面板尺寸突变
@@ -1451,21 +1453,19 @@ final class PulseDotView: NSView {
 
 // MARK: - 卡片背景
 
+// v3.4.2：玻璃面上的浅层瓦片——主色低透填充 + 白发丝描边。
+// 不再对每张卡独立 glassEffect：系统玻璃投影带方向性，会在卡与窗口右缘间的
+// 窄玻璃条上形成恒定暗带（"面板偏左"的根源）；瓦片填充由面块玻璃托底，
+// 深浅色自适应（primary = 浅色黑 5% / 深色白 5%），且 ImageRenderer 可渲染
+// ——快照与运行时同构，🚫 风险面进一步收窄。
 private struct CardBackground: ViewModifier {
-    @ViewBuilder
     func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 17, style: .continuous)
-        let base = content
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        content
             .padding(13)
             .frame(maxWidth: .infinity, alignment: .leading)
-        if snapshotPlainCards {
-            base.background(.regularMaterial, in: shape)
-                .overlay(shape.strokeBorder(.white.opacity(0.12)))
-        } else {
-            base.glassEffect(.regular, in: shape)
-                // 面板有实心托盘底后，玻璃卡需发丝描边定义轮廓（托盘上白玻璃对比度低）
-                .overlay(shape.strokeBorder(.white.opacity(0.14)))
-        }
+            .background(shape.fill(Color.primary.opacity(0.05)))
+            .overlay(shape.strokeBorder(.white.opacity(0.12)))
     }
 }
 
@@ -1491,18 +1491,15 @@ extension View {  // 跨文件使用（TempGaugeCard 等），不能 private
 // 带色彩渲染的玻璃卡（用于冲刺中 / 告警等需要强调的状态）
 private struct TintedCard: ViewModifier {
     let tint: Color
-    @ViewBuilder
     func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 17, style: .continuous)
-        let base = content
+        // 与 CardBackground 同代的着色瓦片（冲刺倒计时/警示条/daemon 挂提示）：
+        // 着色填充 + 同色描边，快照与运行时同构
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        content
             .padding(13)
             .frame(maxWidth: .infinity, alignment: .leading)
-        if snapshotPlainCards {
-            base.background(tint.opacity(0.18), in: shape)
-                .overlay(shape.strokeBorder(tint.opacity(0.35)))
-        } else {
-            base.glassEffect(.regular.tint(tint.opacity(0.22)), in: shape)
-        }
+            .background(shape.fill(tint.opacity(0.15)))
+            .overlay(shape.strokeBorder(tint.opacity(0.32)))
     }
 }
 
