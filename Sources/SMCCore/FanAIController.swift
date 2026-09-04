@@ -135,9 +135,10 @@ public enum AIIntent: String, Codable {
 
     public var label: String {
         switch self {
-        case .rising: return "AI 预判升温 · 提前加速"
-        case .falling: return "AI 温度回落 · 收敛降噪"
-        case .holding: return "AI 维持目标温度"
+        // 卡片标题已示"AI"，标签省前缀防窄胶囊行截断（App 面板实测）
+        case .rising: return "预判升温 · 提前加速"
+        case .falling: return "温度回落 · 收敛降噪"
+        case .holding: return "维持目标温度"
         }
     }
 }

@@ -117,12 +117,13 @@ struct ContentView: View {
             if let w = model.systemPower {
                 HStack(spacing: 3) {
                     Image(systemName: "bolt.fill").font(.system(size: 9))
+                        .foregroundStyle(.yellow)   // 色彩只给图标，文字保持主色（苹果式克制）
                     Text("\(Int(w.rounded()))W").font(.caption.monospacedDigit().weight(.medium))
+                        .foregroundStyle(.primary)
                         .lineLimit(1).fixedSize()
                         .contentTransition(.numericText())
                         .animation(.snappy, value: w)
                 }
-                .foregroundStyle(.yellow)
                 .padding(.horizontal, 8).padding(.vertical, 5)
                 .snapshotCapsule()
                 .help("整机实时功耗（发热根源）")
@@ -354,12 +355,10 @@ struct ContentView: View {
     private var monitorCard: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                SnapshotSegmentedPicker(
+                // 统一 PanelSegmentedPicker：可点（上轮误用静态快照占位导致点不动的回归已修）
+                PanelSegmentedPicker(
                     items: [("趋势", 0), ("最热", 1), ("今日", 2), ("占用", 3)],
                     selection: Binding(get: { model.monitorTab }, set: { model.monitorTab = $0 }))
-                .controlSize(.mini)
-                .labelsHidden()
-                .fixedSize()
                 Spacer()
                 if model.monitorTab == 0, let first = model.history.first {
                     let mins = max(1, Int(Date().timeIntervalSince(first.id) / 60))
@@ -571,23 +570,9 @@ struct ContentView: View {
 
     private var controlCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if snapshotPlainCards {
-                SnapshotSegmentedPicker(items: [("自动", FanMode.auto), ("曲线", FanMode.curve),
-                                                ("AI", FanMode.ai), ("手动", FanMode.manual)],
-                                        selection: Binding(get: { model.mode }, set: { model.setMode($0) }))
-            } else {
-                Picker("模式", selection: Binding(
-                    get: { model.mode },
-                    set: { model.setMode($0) }
-                )) {
-                    Text("自动").tag(FanMode.auto)
-                    Text("曲线").tag(FanMode.curve)
-                    Text("AI").tag(FanMode.ai)
-                    Text("手动").tag(FanMode.manual)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-            }
+            PanelSegmentedPicker(items: [("自动", FanMode.auto), ("曲线", FanMode.curve),
+                                         ("AI", FanMode.ai), ("手动", FanMode.manual)],
+                                 selection: Binding(get: { model.mode }, set: { model.setMode($0) }))
 
             // 固定高度容器：各模式内容高度一致，窗口尺寸不变，
             // 避免 MenuBarExtra 面板因尺寸突变而意外收起（bug 修复）
@@ -614,22 +599,8 @@ struct ContentView: View {
 
     private var curveContent: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if snapshotPlainCards {
-                SnapshotSegmentedPicker(items: CurvePreset.allCases.map { ($0.displayName, $0) },
-                                        selection: Binding(get: { model.preset }, set: { model.setPreset($0) }))
-            } else {
-                Picker("预设", selection: Binding(
-                    get: { model.preset },
-                    set: { model.setPreset($0) }
-                )) {
-                    ForEach(CurvePreset.allCases, id: \.self) { p in
-                        Text(p.displayName).tag(p)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.small)
-            }
+            PanelSegmentedPicker(items: CurvePreset.allCases.map { ($0.displayName, $0) },
+                                 selection: Binding(get: { model.preset }, set: { model.setPreset($0) }))
 
             // 自定义档：可拖动控制点；其余预设只读展示。
             // 电池档/夜间档覆盖生效时画对应档位曲线，否则橘色输出点会脱离曲线悬空。
@@ -699,23 +670,12 @@ struct ContentView: View {
                     .help("分析这台机器的历史温度分布，自动生成专属风扇曲线（纯本地分析，不联网）")
                 }
             }
-            // 控制点摘要行：把图上 5 个锚点数值化（温度→转速%），填补曲线卡底部留白，
-            // 也让"预设已个性化"这类抽象文案有具体落点。建议块在场时让位（200pt 槽位）。
+            // 控制点摘要：统一数据条（温度为主值、风量为副值），与 AI 评测条同语言。
+            // 建议块在场时让位（200pt 槽位）。
             if model.pendingAICurve == nil {
-                HStack(spacing: 4) {
-                    ForEach(Array(displayedCurvePoints.enumerated()), id: \.offset) { _, p in
-                        VStack(spacing: 0) {
-                            Text("\(Int(p.temp))°")
-                                .font(.system(size: 10, weight: .semibold, design: .rounded)).monospacedDigit()
-                            Text("\(Int(p.percent))%")
-                                .font(.system(size: 9)).monospacedDigit().foregroundStyle(.blue)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 3)
-                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(Color.blue.opacity(0.06)))
-                    }
-                }
+                statStrip(displayedCurvePoints.map { p in
+                    ("\(Int(p.temp))°", "\(Int(p.percent))% 风量", nil)
+                })
             }
             if let suggestion = model.pendingAICurve {
                 VStack(alignment: .leading, spacing: 6) {
@@ -853,23 +813,12 @@ struct ContentView: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             // 系统调度下的实时转速读数（读 status.json，App 侧不重算控制语义）：
-            // 让"不介入"不再是空态——用户能看到系统此刻把风扇开到多少
+            // 让"不介入"不再是空态——用户能看到系统此刻把风扇开到多少（统一数据条样式）
             if model.daemonAlive && !model.fans.isEmpty {
-                HStack(spacing: 6) {
-                    ForEach(model.fans, id: \.id) { fan in
-                        VStack(spacing: 1) {
-                            Text("\(Int(fan.actualRPM))")
-                                .font(.system(size: 15, weight: .semibold, design: .rounded)).monospacedDigit()
-                                .contentTransition(.numericText())
-                            Text(fan.id == 0 ? "左风扇 RPM" : "右风扇 RPM")
-                                .font(.system(size: 8)).foregroundStyle(.tertiary)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(Color.secondary.opacity(0.07)))
-                    }
-                }
+                statStrip(model.fans.map { fan in
+                    (Self.rpmText(fan.actualRPM),
+                     fan.id == 0 ? "左风扇 RPM" : "右风扇 RPM", nil)
+                })
                 .padding(.top, 2)
             }
             Spacer()
@@ -987,17 +936,8 @@ struct ContentView: View {
                 .transition(.opacity)
             }
             // 目标温度选择：越高越安静、越低越凉
-            if snapshotPlainCards {
-                SnapshotSegmentedPicker(items: [("性能 72°", 72.0), ("均衡 76°", 76.0), ("静音 80°", 80.0)],
-                                        selection: Binding(get: { model.aiTargetTemp }, set: { model.setAITarget($0) }))
-            } else {
-                Picker("", selection: Binding(get: { model.aiTargetTemp }, set: { model.setAITarget($0) })) {
-                    Text("性能 72°").tag(72.0)
-                    Text("均衡 76°").tag(76.0)
-                    Text("静音 80°").tag(80.0)
-                }
-                .pickerStyle(.segmented).controlSize(.small).labelsHidden()
-            }
+            PanelSegmentedPicker(items: [("性能 72°", 72.0), ("均衡 76°", 76.0), ("静音 80°", 80.0)],
+                                 selection: Binding(get: { model.aiTargetTemp }, set: { model.setAITarget($0) }))
             // v7 曲线锚定后 AI 仍在自学习：展示学习状态（学习中/稳定/积累）+ 已掌握温度点覆盖
             learningStatus(points: model.learnedPoints,
                            samples: model.learnedSamples,
@@ -1010,13 +950,14 @@ struct ContentView: View {
                !model.aiHighEffort,
                model.aiRecommendedTarget == nil || abs(model.aiRecommendedTarget! - model.aiTargetTemp) <= 0.5 {
                 let eval = Self.evaluationText(m)
-                HStack(spacing: 4) {
-                    aiMetricTile(value: Self.compactDuration(eval.seconds), label: "评测")
-                    aiMetricTile(value: "\(Int(m.averageTemp.rounded()))°", label: "均温")
-                    aiMetricTile(value: String(format: "%.1f°", m.temperatureStdDev), label: "波动")
-                    aiMetricTile(value: "\(Int(m.averageOutput.rounded()))%", label: "均输出")
-                    aiMetricTile(value: Self.compactDuration(eval.highSeconds), label: "超温")
-                }
+                statStrip([
+                    (Self.compactDuration(eval.seconds), "评测", nil),
+                    ("\(Int(m.averageTemp.rounded()))°", "均温", nil),
+                    (String(format: "%.1f°", m.temperatureStdDev), "波动", nil),
+                    ("\(Int(m.averageOutput.rounded()))%", "均输出", nil),
+                    (Self.compactDuration(eval.highSeconds), "超温",
+                     m.highTempSeconds > 60 ? Color.orange : nil),
+                ])
                 .help(eval.full)
             }
             Spacer(minLength: 0)
@@ -1028,27 +969,46 @@ struct ContentView: View {
     // 一条 0-100% 轨道，紫色填充 = AI 实际输出，灰色刻度线 = 用户曲线基准。
     // 刻度线位置 = "用户期望转速"，填充条到紫色 = "AI 最终输出"，
     // 两者间距 = "AI 自适应修正量"（散热压不住则加码、散热好则放松）。
+    // 千位分隔转速文本（"2,858"），与 FanRow 同风格
+    private static func rpmText(_ rpm: Double) -> String {
+        let n = Int(rpm.rounded())
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: n)) ?? "\(n)"
+    }
+
+    // 统一数据条：单容器 + 发丝分隔线（苹果天气/股市同款语言），
+    // 替代各处独立小盒子——盒群视觉碎，发丝分隔一体感强
+    private func statStrip(_ items: [(value: String, label: String, accent: Color?)]) -> some View {
+        HStack(spacing: 0) {
+            ForEach(Array(items.enumerated()), id: \.offset) { i, m in
+                VStack(spacing: 1) {
+                    Text(m.value)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(m.accent ?? Color(.secondaryLabelColor))
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                    Text(m.label)
+                        .font(.system(size: 8.5))
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .overlay(alignment: .trailing) {
+                    if i < items.count - 1 {
+                        Rectangle().fill(Color.primary.opacity(0.07)).frame(width: 1).frame(height: 22)
+                    }
+                }
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.secondary.opacity(0.06)))
+    }
+
     // 自适应状态胶囊：空间足够显示"图标+文字"，不足时降级为纯图标（悬停仍有完整说明）。
     // ViewThatFits 避免"图标+省略号"的尴尬截断（旧 lineLimit(1) 无降级路径）；
     // 两个变体都 fixedSize——压缩由 ViewThatFits 的选择完成，不由布局挤压完成
-    // AI 评测磁贴：数值/标签两层，等宽数字防跳动，紧凑 31pt 高
-    private func aiMetricTile(value: String, label: String) -> some View {
-        VStack(spacing: 1) {
-            Text(value)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .lineLimit(1).minimumScaleFactor(0.75)
-            Text(label)
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 4)
-        .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
-            .fill(Color.secondary.opacity(0.07)))
-    }
-
     private func adaptiveChip(icon: String, text: String, color: Color, help: String) -> some View {
         ViewThatFits(in: .horizontal) {
             Label(text, systemImage: icon)
@@ -1315,27 +1275,51 @@ final class BreathingDotView: NSView {
 }
 
 
-// v3.4.1：快照专用的纯 SwiftUI 分段选择器。
-// 原因：SwiftUI segmented Picker 桥接 NSSegmentedControl，ImageRenderer 离屏
-// 无法合成 AppKit 控件 → 渲染为系统黄色 🚫 占位。快照下用等尺寸 SwiftUI 实现
-// 忠实反映布局；运行时不受影响（调用方按 snapshotPlainCards 分支）。
-struct SnapshotSegmentedPicker<Item: Hashable>: View {
+// 面板统一分段选择器（纯 SwiftUI）：运行时可点、快照可渲染。
+// 为什么不用系统 segmented Picker：它桥接 NSSegmentedControl，ImageRenderer 离屏
+// 渲染为黄色 🚫；且系统样式与面板玻璃语言不统一。
+// 视觉对齐 macOS 系统设置分段控件：中性轨道 + 白色滑块 + 选中项加粗。
+// 点击安全性：selection 直接赋值（不包 withAnimation），本视图末尾的 .animation
+// 只作用于滑块位移——模式内容交换在该视图子树之外，保持"切模式即时替换"约束，
+// 不会触发 MenuBarExtra 窗口重排（历史跳面板根因）。
+struct PanelSegmentedPicker<Item: Hashable>: View {
     let items: [(label: String, tag: Item)]
     @Binding var selection: Item
 
     var body: some View {
         HStack(spacing: 2) {
             ForEach(items, id: \.1) { item in
-                Text(item.label)
-                    .font(.caption2.weight(selection == item.tag ? .semibold : .regular))
-                    .padding(.horizontal, 10).padding(.vertical, 3)
-                    .background(
-                        Capsule().fill(selection == item.tag ? Color.primary.opacity(0.10) : Color.clear)
-                    )
+                PanelSegmentedItem(label: item.label, isActive: selection == item.tag)
+                    .onTapGesture {
+                        guard selection != item.tag else { return }
+                        selection = item.tag
+                    }
             }
         }
         .padding(2)
         .background(Capsule().fill(Color.secondary.opacity(0.12)))
+        .animation(.snappy(duration: 0.22), value: selection)
+    }
+}
+
+// 分段选择器单项：白色胶囊滑块样式（选中态），与 macOS 系统设置同款语言
+private struct PanelSegmentedItem: View {
+    let label: String
+    let isActive: Bool
+
+    var body: some View {
+        let fill = isActive ? Color(nsColor: .controlBackgroundColor) : Color.clear
+        let shadow = isActive ? Color.black.opacity(0.16) : Color.clear
+        return Text(label)
+            .font(.caption.weight(isActive ? .semibold : .medium))
+            .foregroundStyle(isActive ? Color.primary : Color.secondary)
+            .lineLimit(1).fixedSize()
+            .padding(.horizontal, 11).padding(.vertical, 4)
+            .background(Capsule().fill(fill).shadow(color: shadow, radius: 2.5, y: 1))
+            .contentShape(Capsule())
+            .accessibilityElement()
+            .accessibilityLabel(label)
+            .accessibilityAddTraits(isActive ? [.isSelected, .isButton] : [.isButton])
     }
 }
 
