@@ -233,8 +233,7 @@ func testAmbientValley() {
     smc.set("Tp01", 55)   // CPU 热点（谷值合理性检查用）
     smc.set("TB0t", 30)   // 电池 30
     let clock = FakeClock()
-    let ts = try! TemperatureSensors(smc: smc)
-    ts.clock = { clock.time() }   // TTL 缓存与测试时间轴同步（否则真实时钟下永不过期）
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { clock.time() })
     let t0 = clock.time()
     let rate = 0.5 / 3600.0
 
@@ -290,6 +289,19 @@ final class FakeClock {
     }
     func time() -> Date { now }
     func advance(_ s: Double) { now = now.addingTimeInterval(s) }
+}
+
+// 时钟安全构造（v3.4.5）：TemperatureSensors 的 init 用创建时的 clock()（默认真实时间）
+// 记录 lastScanTime；测试随后注入 FakeClock（基准=本地正午）。当真实时间在正午之前时，
+// 注入时钟与 lastScanTime 的差值 > 300s → checkRescan 每次访问都触发后台重扫——
+// 后台线程与主线程并发写 value-type 缓存字段 → 间歇性 exclusive-access 崩溃（exit 139）。
+// 这就是历史"间歇 trap 133/139"的真根因：下午跑不崩、凌晨崩。构造后立即以注入时钟
+// 重录 lastScanTime 并重建分类，彻底消除该竞态。所有注入 FakeClock 的测试必须走这里。
+func makeTemperatureSensors(smc: SMCIO, clock: @escaping () -> Date) throws -> TemperatureSensors {
+    let ts = try TemperatureSensors(smc: smc)
+    ts.clock = clock
+    ts.rescanAllSensorsBlocking(clockOverride: clock)
+    return ts
 }
 
 // 每个场景独立临时目录：引擎的 ConfigStore 调用全部落在重定向路径，不碰真实安装
@@ -401,6 +413,8 @@ testFamilyScan()
 testFamilyDefense()
 testPowerMetricsGolden()
 testOtherHotspotCache()
+testHotspotTrackingBudget()
+testSMCReadBudget()
 testFanLimitsCache()
 testSMCBytes()
 testEngineWiring()

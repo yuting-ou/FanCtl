@@ -291,12 +291,15 @@ public final class TemperatureSensors {
     private var lastScanTime: Date = .distantPast
     private let scanInterval: TimeInterval = 300  // 5 分钟重扫一次，应对休眠唤醒/动态变化
 
-    // 热点追踪：每拍只读每个分类最热的 2 个键（而非全量遍历），
-    // 当任一追踪键 ≥ hotspotRescanTemp 或距上次全量扫描超过 hotspotRescanInterval 时重扫。
-    // 物理依据：CPU/GPU 核心热时间常数 1-5s，两个最热核心足以覆盖突变；
-    // 高温触发全扫确保负载迁移到其他核心时不遗漏。
+    // 热点追踪：每拍只读每个分类最热的 N 个键（而非全量遍历），
+    // 距上次全量扫描超过重扫间隔时重扫（发现迁移到未追踪键的新热点）。
+    // 物理依据：CPU/GPU 核心热时间常数 1-5s，top-4 足以覆盖突变。
+    // v3.4.5（1B）：删除"追踪键 ≥65° 就全扫"分支——持续负载下该条件每拍恒真，
+    // 54 键整组每拍全扫（~324 读/分），15s 重扫间隔在热态形同虚设。
+    // 热态改为"top-N 追踪 + 5s 短重扫"：热态每拍 4 读，迁移热点 ≤5s 内被发现
+    // （相对 92° 兜底与 1-5s 热时间常数，5s 发现延迟安全）。
     private struct HotspotTrack {
-        var topKeys: [String] = []   // 上轮扫描最热的 1-2 个键（按热度降序）
+        var topKeys: [String] = []   // 上轮扫描最热的至多 N 个键（按热度降序）
         var values: [Double] = []    // 对应的最近读数
         var lastFullScan: Date = .distantPast
         var lastAverage: Double = 0  // 上次全扫所有有效传感器的平均值（全扫时更新，快速路径沿用）
@@ -304,9 +307,10 @@ public final class TemperatureSensors {
     private var cpuTrack = HotspotTrack()
     private var gpuTrack = HotspotTrack()
     private var nandTrack = HotspotTrack()
-    private let hotspotRescanInterval: TimeInterval = 15
+    private let hotspotRescanInterval: TimeInterval = 15      // 冷态全扫间隔
+    private let hotspotHotRescanInterval: TimeInterval = 5    // 热态（追踪键≥65°）全扫间隔
     private let hotspotRescanTemp = 65.0
-    private let hotspotTrackCount = 2
+    private let hotspotTrackCount = 4
 
     // 展示类传感器（掌托/散热片/其他热点）不参与控制决策，缓存 10s 读取一次即可，
     // 避免每拍遍历所有非关键传感器
@@ -455,14 +459,17 @@ public final class TemperatureSensors {
         return results.sorted { $0.1 > $1.1 }
     }
 
-    // 热点追踪读取：常规拍只读 top 2 热键；当追踪键高温或超时时全量重扫
+    // 热点追踪读取：常规拍只读 top-N 热键；按上次全扫时的温度档位选择重扫间隔
+    // （热态 5s / 冷态 15s），确保负载迁移到未追踪键的新热点能被发现。
     // 注意：调用方必须在 inout 激活前调用 checkRescan()
     private func trackedMax(_ keys: [String], track: inout HotspotTrack) -> Double {
         guard !keys.isEmpty else { return 0 }
-        let now = Date()
+        let now = clock()
+        let rescanInterval: TimeInterval =
+            track.values.contains(where: { $0 >= hotspotRescanTemp })
+            ? hotspotHotRescanInterval : hotspotRescanInterval
         let needFullScan = track.topKeys.isEmpty
-            || now.timeIntervalSince(track.lastFullScan) > hotspotRescanInterval
-            || track.values.contains(where: { $0 >= hotspotRescanTemp })
+            || now.timeIntervalSince(track.lastFullScan) > rescanInterval
 
         if needFullScan {
             let sorted = fullScan(keys)
@@ -535,17 +542,13 @@ public final class TemperatureSensors {
     // 全项目最大的 IOKit 乘数浪费（3150 万拍/年 × 110 ≈ 35 亿次调用）。
     // otherHotspotReadings()（明细展示）本来就缓存 10s；max 用于环境谷值候选与
     // envTemp 展示，10s 语义一致。
+    // v3.4.5（1A 合并回归）：两个入口共享同一次扫描——两套 10s 缓存过期时刻错开，
+    // 每 10s 至多 2×110 全扫（~1320 次/分）。现在 max 与明细由同一份读数原子派生，
+    // 时间戳恒等，10s 窗口内至多 1 次全扫。
     public var otherHotspotMax: Double {
         checkRescan()
-        let now = clock()   // 走注入时钟（与其它 TTL 缓存一致，测试可控）
-        if now.timeIntervalSince(cachedOtherMax.1) < displayCacheTTL,
-           cachedOtherMax.1 != .distantPast {
-            return cachedOtherMax.0
-        }
-        let v = maxTemp(otherHotKeys)
-        otherMaxScanCount += 1
-        cachedOtherMax = (v, now)
-        return v
+        refreshOtherHotspotsIfNeeded()
+        return cachedOtherMax.0
     }
 
     // 环境温度代理（环境补偿的输入）——谷值追踪版，语义见 ambientEstimate(now:)。
@@ -591,20 +594,31 @@ public final class TemperatureSensors {
 
     // 其他热点明细（key→temp），只收集高于 45°C 的有意义热点（缓存 10s）
     public func otherHotspotReadings() -> [String: Double] {
-        let now = clock()
-        if now.timeIntervalSince(cachedOtherHotspots.1) < displayCacheTTL,
-           cachedOtherHotspots.1 != .distantPast {
-            return cachedOtherHotspots.0
+        refreshOtherHotspotsIfNeeded()
+        return cachedOtherHotspots.0
+    }
+
+    /// 1A 合并扫描：otherHotspotMax 与 otherHotspotReadings 的唯一数据来源。
+    /// 一次遍历 otherHotKeys 同时派生 max（1..120 有效读数，与 maxTemp 语义一致）
+    /// 与 >45°C 明细字典；两份缓存同时间戳写入，10s 窗口内至多一次全扫。
+    /// 注意：本函数不走 checkRescan()（两个调用方语义不同），由调用方先行调用。
+    private func refreshOtherHotspotsIfNeeded() {
+        let now = clock()   // 注入时钟，与其它 TTL 缓存一致（测试可控）
+        if now.timeIntervalSince(cachedOtherMax.1) < displayCacheTTL,
+           cachedOtherMax.1 != .distantPast {
+            return
         }
-        checkRescan()
-        var result: [String: Double] = [:]
+        smcReadCount += otherHotKeys.count
+        var dict: [String: Double] = [:]
+        var m = 0.0
         for k in otherHotKeys {
-            if let v = try? smc.readDouble(k), v > 45, v < 110 {
-                result[k] = v
-            }
+            guard let v = try? smc.readDouble(k), v > 1, v < 120 else { continue }
+            m = max(m, v)
+            if v > 45, v < 110 { dict[k] = v }
         }
-        cachedOtherHotspots = (result, now)
-        return result
+        otherMaxScanCount += 1
+        cachedOtherMax = (m, now)
+        cachedOtherHotspots = (dict, now)
     }
 
     // 转换为 SMCCore.SensorReadings（供 status.json 写入）

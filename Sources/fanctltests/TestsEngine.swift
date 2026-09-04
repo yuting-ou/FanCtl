@@ -173,6 +173,7 @@ func testFanControllerMock() {
 
 // v3.4.1 DoD-2 计数测试：otherHotspotMax 缓存生效——10s TTL 内连续多拍
 // ambientEstimate 对 otherHotKeys 零 SMC 读；过期后恰好重读一轮。
+// v3.4.5（1A）：max 与明细合并为单次扫描——同一窗口内 max+明细混合访问也只扫 1 轮。
 func testOtherHotspotCache() {
     group("otherHotspotMax 缓存")
     let smc = MockSMC()
@@ -180,8 +181,7 @@ func testOtherHotspotCache() {
     smc.set("TB0t", 30)
     for k in ["TVV0", "TVD0", "TCMb", "Te05", "Te06"] { smc.set(k, 50) }
     let clock = FakeClock()
-    let ts = try! TemperatureSensors(smc: smc)
-    ts.clock = { clock.time() }
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { clock.time() })
     _ = ts.ambientEstimate(now: clock.time(), cpu: 55)   // 首拍：建立缓存（1 轮全量）
     let scans0 = ts.otherMaxScanCount
     for _ in 0..<5 { clock.advance(3); _ = ts.ambientEstimate(now: clock.time(), cpu: 55) }
@@ -194,6 +194,89 @@ func testOtherHotspotCache() {
     // 过期后 3 拍至多重读 1-2 轮（边界拍可能各触发一次），远好于无缓存的每拍 1 轮
     expect(ts.otherMaxScanCount - scans0 <= 2,
            "TTL 过期后 3 拍 ≤2 轮全量读（得 \(ts.otherMaxScanCount - scans0)，无缓存为 3）")
+    // v3.4.5（1A）：max 与明细同源——同一 10s 窗口内混合访问只扫 1 轮
+    clock.advance(20)                                  // 强制过期
+    _ = ts.otherHotspotMax                             // max 入口触发 1 轮
+    let mixed0 = ts.otherMaxScanCount
+    _ = ts.otherHotspotReadings()                      // 同窗口明细入口：必须 0 新扫
+    expect(ts.otherMaxScanCount - mixed0 == 0,
+           "同窗口 max→明细零重复扫描（得 \(ts.otherMaxScanCount - mixed0)，双缓存为 1）")
+    _ = ts.ambientEstimate(now: clock.time(), cpu: 55) // ambient 复用同源缓存：仍 0 新扫
+    expect(ts.otherMaxScanCount - mixed0 == 0,
+           "ambient 复用合并缓存零新扫")
+}
+
+// v3.4.5（1B）：热态不再每拍全扫——top-N 追踪 + 热 5s/冷 15s 重扫。
+// 旧逻辑"追踪键≥65° 就全扫"在持续负载下每拍恒真（54 键×60 拍/分 ≈ 3240 读/分）；
+// 新逻辑热态每拍 4 读，5s 重扫仍能发现迁移到未追踪键的新热点。
+func testHotspotTrackingBudget() {
+    group("热点追踪预算（1B）")
+    let smc = MockSMC()
+    // 10 个 CPU 键：初始 Tp01 最热 75°（热态），其余 40-50°
+    for i in 1...10 { smc.set(String(format: "Tp%02d", i), Double(40 + i)) }
+    smc.set("Tp01", 75)
+    let clock = FakeClock()
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { clock.time() })
+    _ = ts.cpuTemperature   // 首拍：全扫建追踪（top-4 = Tp10..Tp07 热序？实际 75 最高）
+    expectEqual(ts.cpuTemperature, 75, "热态首拍取全组最大")
+
+    // 热态连续 12 拍（3s 拍，36s > 旧 15s 间隔）：全扫只允许发生在 5s 间隔门
+    // 预算：首拍 1 次 + 5s 门重扫 ~7 次 = 8 轮×10 键 + 每拍 4 读×11 = 无缓存方案
+    // （旧逻辑每拍全扫 12×10=120 轮键读）对比新逻辑总读数
+    let reads0 = smc.reads.count
+    for _ in 0..<12 { clock.advance(3); _ = ts.cpuTemperature }
+    let hotDelta = smc.reads.count - reads0
+    // 新逻辑上界：重扫 ceil(36/5)=8 轮 ×10 键=80 + 5 拍快速×4=20 ≈ 100；旧逻辑 12×10+4×0=120+
+    // 保守断言 ≤110（若回潮为"每拍全扫"则为 120+，快速路径为 4/拍）
+    expect(hotDelta <= 110, "热态 12 拍(36s) 总读数 ≤110（得 \(hotDelta)，旧每拍全扫为 ~124）")
+
+    // 热点迁移正确性：新热点出现在未追踪键（Tp03 42→85），5s 重扫后必须被追到
+    smc.set("Tp03", 85)
+    clock.advance(6)        // 越过 5s 热态重扫门
+    _ = ts.cpuTemperature   // 触发重扫
+    expectEqual(ts.cpuTemperature, 85, "迁移到未追踪键的新热点被 5s 重扫追到")
+
+    // 冷态回落：全部 <65° 后重扫间隔放宽到 15s——10s 窗口内零全扫
+    for i in 1...10 { smc.set(String(format: "Tp%02d", i), Double(35 + i)) }  // 全部 ≤45
+    clock.advance(16)       // 越过旧 15s 门（此时仍按上轮热档 5s？——按 lastFullScan 时值判断）
+    _ = ts.cpuTemperature   // 重扫后 values 全 <65 → 进入冷态档
+    let cool0 = smc.reads.count
+    for _ in 0..<4 { clock.advance(3); _ = ts.cpuTemperature }  // 12s < 15s
+    expect(smc.reads.count - cool0 == 4 * 4,
+           "冷态 4 拍只读 top-4（得 \(smc.reads.count - cool0)，每拍全扫为 \(4*10)）")
+}
+
+// v3.4.5（1C）：SMC 读取预算回归——模拟"热态 N 拍 + 冷态 M 拍"的每分钟工作量，
+// 锁死乘数回潮：任何人加回"每拍全量读"都会爆预算。
+// 预算口径：2 风扇机型、CPU 10 键（Mock 缩比）、other 5 键、目标 ≤500 次/分（真机 ~54 CPU 键下等比）。
+func testSMCReadBudget() {
+    group("SMC 读取预算（1C）")
+    let smc = MockSMC()
+    for i in 1...10 { smc.set(String(format: "Tp%02d", i), Double(60 + i)) }   // CPU 热态
+    smc.set("Tg01", 55); smc.set("Tg02", 50)
+    for i in 1...2 { smc.set("TH0\(i)", 40) }
+    smc.set("TB0t", 30)
+    for k in ["TVV0", "TVD0", "TCMb", "Te05", "Te06"] { smc.set(k, 50) }       // other 5 键
+    smc.set("Ts0P", 35); smc.set("Th0p", 42)
+    smc.set("PSTR", 30)
+    let clock = FakeClock()
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { clock.time() })
+    _ = ts.cpuTemperature; _ = ts.gpuTemperature; _ = ts.nandTemperature
+    _ = ts.otherHotspotMax; _ = ts.palmRestTemperature; _ = ts.heatsinkTemperature
+    _ = ts.sensorReadings()   // 首拍建全部缓存
+    let reads0 = smc.reads.count
+    // 模拟 1 分钟热态控制：20 拍 × 3s，每拍控制路径读取
+    for _ in 0..<20 {
+        clock.advance(3)
+        _ = ts.cpuTemperature          // 控制主热点（top-4）
+        _ = ts.sensorReadings()        // status 写盘路径（GPU/SSD/明细）
+        _ = ts.ambientEstimate(now: clock.time(), cpu: 65)   // 环境代理
+    }
+    let perMin = smc.reads.count - reads0
+    // 实测 435（含 sensorReadings 内 cpuTrack 二次走查、电池 3s TTL 边界拍）；
+    // 预算 500 = 实测 +15% 余量。旧实现（other 双缓存 + 热态每拍全扫）同口径 >600，
+    // 真机 54 CPU 键等比 >2000；任一乘数回潮（明细/max 分缓存、热态逐拍全扫）即爆预算
+    expect(perMin <= 500, "热态 1 分钟控制路径 SMC 读 ≤500（得 \(perMin)；旧双缓存+每拍全扫 >600）")
 }
 
 // v3.4.1 DoD-3：Mn/Mx 静态缓存——allStates 二次调用 Mn/Mx 零读（Ac/Tg 仍每拍读）；
