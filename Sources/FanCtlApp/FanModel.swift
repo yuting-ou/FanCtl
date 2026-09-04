@@ -670,7 +670,7 @@ final class FanModel: ObservableObject {
             if Date().timeIntervalSince(lastPanelFileSync) > 30 {
                 lastPanelFileSync = Date()
                 // v3.5.1（R2，P2 合并优先）：history.json（30 天全量，贵的那个）解码一次
-                // 向下传参；旧路径 loadDaysWithToday 每周期被调 3 次。stats 直读保持
+                // 向下传参；旧路径 loadDaysWithToday 每周期被调 2 次。stats 直读保持
                 // "今日零样本显示今日空态"语义（days.last 会退化成昨天数据）。
                 stats = ConfigStore.loadStats()
                 let days = loadDaysWithToday(preloadedStats: stats)
@@ -959,7 +959,7 @@ final class FanModel: ObservableObject {
     }
 
     // v3.5.1（R2，P2 合并优先）：preloadedDays 传入调用方已读的 days 快照，
-    // 避免 30s 同步里 history.json+stats.json 被重复解码（原每周期 3 次 loadDaysWithToday）
+    // 避免 30s 同步里 history.json 被重复解码（原每周期 2 次 loadDaysWithToday）
     private func reoptimizeState(preloadedDays: [DailyStats]? = nil) -> (afterDays: Int, effect: AIEffect?) {
         guard let b = loadBaseline() else { return (0, nil) }
         let after = (preloadedDays ?? loadDaysWithToday()).filter { $0.date > b.date }
