@@ -9,11 +9,10 @@ DIST="$ROOT/dist"
 echo "==> 运行回归测试（失败则中断构建）..."
 swift run -c release --disable-sandbox fanctltests
 
-echo "==> 编译 release 版本..."
-swift build -c release --disable-sandbox
-
 # 版本单一来源（4B）：根目录 VERSION 文件 = "主版本 build号"。
 # App（Info.plist）与 daemon（fanctld -v）都从这里读，消除 README/脚本/二进制三处硬编码漂移。
+# v3.6 修正顺序：必须先重生成 Version.generated.swift 再编译——原顺序（先编译后生成）
+# 导致 daemon 二进制永远带着上一轮的版本号（fanctld -v 滞后一班）。
 read -r APP_VERSION BUILD_NUMBER < "$ROOT/VERSION"
 export FANCTL_VERSION="$APP_VERSION"
 export FANCTL_BUILD="$BUILD_NUMBER"
@@ -27,6 +26,9 @@ import Foundation
 
 let fanctldVersion = "$APP_VERSION ($BUILD_NUMBER)"
 EOF
+
+echo "==> 编译 release 版本..."
+swift build -c release --disable-sandbox
 
 BIN="$ROOT/.build/release"
 rm -rf "$DIST"
