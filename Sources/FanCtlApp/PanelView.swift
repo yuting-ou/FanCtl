@@ -165,6 +165,15 @@ struct ContentView: View {
             } else {
             Menu {
                 Text("清风 \(Self.appVersion)")
+                // v3.6（方向一）：新版本提示——只在查到更新且未被跳过时出现，
+                // 点击打开 Releases 下载页（不自动安装：常驻不添乱原则）
+                if let tag = model.updateAvailable {
+                    Button("⬆️ 新版本 \(tag) 可用…") {
+                        NSWorkspace.shared.open(FanModel.releasesURL)
+                    }
+                    Button("跳过此版本") { model.skipUpdateVersion() }
+                    Divider()
+                }
                 Divider()
                 statsSection
                 Divider()

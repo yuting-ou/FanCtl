@@ -257,6 +257,21 @@ func testDateChain() {
     expect("2026-08-01" > "2026-07-31" && "2027-01-01" > "2026-12-31", "字典序=时间序")
 }
 
+// MARK: - v3.6 版本语义比较（更新检查的地基，纯函数）
+
+func testVersionCheck() {
+    group("版本比较")
+    expect(VersionCheck.isNewer("v3.6.0", than: "3.5.0"), "tag 带 v 前缀可解析")
+    expect(VersionCheck.isNewer("3.10.0", than: "3.9.9"), "数值比较非字典序（10>9）")
+    expect(VersionCheck.isNewer("3.6", than: "3.5.9"), "缺段补 0（3.6 == 3.6.0 > 3.5.9）")
+    expect(!VersionCheck.isNewer("3.6.0", than: "3.6.0"), "相等不算新")
+    expect(!VersionCheck.isNewer("3.5.0", than: "3.6.0"), "倒退不算新")
+    expect(VersionCheck.isNewer("4.0", than: "3.99.99"), "主版本越级")
+    expect(!VersionCheck.isNewer("", than: "3.5.0"), "空串当 0.0.0 不算新")
+    expect(!VersionCheck.isNewer("beta-2026", than: "3.5.0"), "无数字段全 0 不算新")
+    expect(VersionCheck.isNewer("3.6.0-beta.1", than: "3.5.0"), "带后缀 tag 取数字段比较")
+    expect(!VersionCheck.isNewer("3.5.0", than: "3.5"), "等价版本（缺段补 0 后相等）")
+}
 
 func testPowerHistogram() {
     group("功耗直方图")

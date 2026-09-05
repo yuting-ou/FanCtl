@@ -226,6 +226,14 @@ final class FanModel: ObservableObject {
     private static let envCompensationKey = "envCompensation"
     private static let quietHoursKey = "quietHours"
     private static let palmCompensationKey = "palmCompensation"
+    // v3.6 版本自检（方向一·进化传播链）：改进送达运行实例
+    static let updateLastCheckKey = "updateLastCheckAt"
+    static let updateSkippedKey = "updateSkippedVersion"
+    static let releasesURL = URL(string: "https://github.com/yuting-ou/FanCtl/releases")!
+
+    /// 新版本 tag（如 "v3.6.0"）；nil = 无更新或从未查到。UI 菜单行据此显隐。
+    @Published var updateAvailable: String? = nil
+    @MainActor private var updateCheckInFlight = false
 
     var config: FanConfig {
         let offsets = fanOffsets.allSatisfy { $0 == 0 } ? nil : fanOffsets
@@ -383,6 +391,68 @@ final class FanModel: ObservableObject {
             }
         }
         fallback.tolerance = 3.0
+
+        // v3.6 版本自检（方向一）：启动后 60s 首查（避开启动高峰），此后每 24h。
+        // 静默失败不重试不提醒——常驻不添乱原则；失败只影响"这次没查到"，下次到点再查。
+        let updateTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.checkForUpdate() }
+        }
+        updateTimer.tolerance = 30.0
+        // 24h 周期：首查后由 checkForUpdate 内部按 lastCheck 门控复用同一 one-shot 模式
+        // （此处用 24h repeating 兜底长驻会话）
+        let updateDaily = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkForUpdate() }
+        }
+        updateDaily.tolerance = 6 * 3600
+    }
+
+    // MARK: - 版本自检（v3.6 方向一）
+
+    /// 查询 GitHub Releases latest 并与本地版本比较。24h 内已查过则跳过；
+    /// 失败（无网/限流/超时）全静默。命中"跳过此版本"不提示。
+    @MainActor func checkForUpdate(force: Bool = false) {
+        if updateCheckInFlight { return }
+        if !force,
+           let last = UserDefaults.standard.object(forKey: Self.updateLastCheckKey) as? Date,
+           Date().timeIntervalSince(last) < 24 * 3600 {
+            return
+        }
+        updateCheckInFlight = true
+        UserDefaults.standard.set(Date(), forKey: Self.updateLastCheckKey)
+        let owner = self
+        Task.detached(priority: .utility) {
+            // GitHub API 只解 tag_name 一个字段；匿名限额 60 次/h，24h 一次远低于此
+            struct Release: Decodable {
+                let tagName: String
+                enum CodingKeys: String, CodingKey { case tagName = "tag_name" }
+            }
+            var tag: String? = nil
+            if let url = URL(string: "https://api.github.com/repos/yuting-ou/FanCtl/releases/latest") {
+                var req = URLRequest(url: url)
+                req.timeoutInterval = 15
+                req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+                if let (data, _) = try? await URLSession.shared.data(for: req) {
+                    tag = (try? JSONDecoder().decode(Release.self, from: data))?.tagName
+                }
+            }
+            await MainActor.run {
+                owner.updateCheckInFlight = false
+                guard let tag else { return }   // 失败静默，下次到点再查
+                let local = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+                if VersionCheck.isNewer(tag, than: local),
+                   UserDefaults.standard.string(forKey: Self.updateSkippedKey) != tag {
+                    owner.updateAvailable = tag
+                }
+            }
+        }
+    }
+
+    /// 用户点"跳过此版本"：该 tag 不再提示（更新版本号时自然恢复提示）
+    @MainActor func skipUpdateVersion() {
+        if let tag = updateAvailable {
+            UserDefaults.standard.set(tag, forKey: Self.updateSkippedKey)
+        }
+        updateAvailable = nil
     }
 
     // MARK: - 文件监控（DispatchSource 事件驱动）
