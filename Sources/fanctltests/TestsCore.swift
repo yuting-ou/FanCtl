@@ -77,6 +77,34 @@ func testHistogram() {
     d2.addTempSample(70, seconds: 3)
     expectEqual(d2.tempHistogram!.count, TempHistogram.bucketCount, "错误长度重建")
     expectClose(d2.tempHistogram!.reduce(0, +), 3, 1e-9, "重建后仅新样本")
+
+    // v3.5.1（对抗审查第 5 点）：天数合并/评估窗语义从 App 提取为纯函数后的契约锁定
+    // ——此前这三条规则是 FanModel private inline，App target 结构上零测试覆盖
+    do {
+        var yst = DailyStats(date: "2026-09-03"); yst.tempCount = 100; yst.tempSum = 6000
+        var today = DailyStats(date: "2026-09-05"); today.tempCount = 10; today.tempSum = 550
+        let hist = [yst, today]   // 归档文件里昨日条目 + 今日条目并存（daemon 未重写 history 时）
+
+        // 同日替换：today 赢（实时值覆盖当日归档值）
+        let merged = [DailyStats].mergingToday(hist, today: DailyStats(date: "2026-09-05"))
+        expectEqual(merged.count, 2, "同日合并不增条目")
+        expectEqual(merged.last!.date, "2026-09-05", "同日替换后仍在末位")
+
+        // 新一天零样本（tempCount==0）：不追加——保留历史末位（昨日），防止空态显示昨天数据
+        let emptyToday = DailyStats(date: "2026-09-06")   // tempCount == 0
+        let merged2 = [DailyStats].mergingToday([yst], today: emptyToday)
+        expectEqual(merged2.count, 1, "零样本不追加")
+        expectEqual(merged2[0].date, "2026-09-03", "昨日条目原样保留")
+
+        // today == nil：等价于无操作
+        expectEqual([DailyStats].mergingToday(hist, today: nil).count, 2, "nil 今日原样返回")
+
+        // 评估窗：严格大于基线日（基线当天 = 改前快照，必须排除）
+        let window = hist.after(baselineDate: "2026-09-03")
+        expectEqual(window.count, 1, "基线日当天被排除")
+        expectEqual(window[0].date, "2026-09-05", "评估窗只含晚于基线日的天")
+        expect([DailyStats]().after(baselineDate: "2026-09-01").isEmpty, "空序列→空窗")
+    }
 }
 
 

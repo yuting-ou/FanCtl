@@ -928,12 +928,9 @@ final class FanModel: ObservableObject {
     // MARK: AI 效果与基准快照
 
     private func loadDaysWithToday(preloadedStats: DailyStats? = nil) -> [DailyStats] {
-        var days = ConfigStore.loadHistory()
-        if let s = preloadedStats ?? ConfigStore.loadStats(), s.tempCount > 0 {
-            days.removeAll { $0.date == s.date }
-            days.append(s)
-        }
-        return days
+        // v3.5.1：合并语义在 SMCCore（[DailyStats].mergingToday），App/测试同源
+        [DailyStats].mergingToday(ConfigStore.loadHistory(),
+                                  today: preloadedStats ?? ConfigStore.loadStats())
     }
 
     private static func aggregate(_ days: [DailyStats]) -> (avg: Double, hot: Double)? {
@@ -962,7 +959,7 @@ final class FanModel: ObservableObject {
     // 避免 30s 同步里 history.json 被重复解码（原每周期 2 次 loadDaysWithToday）
     private func reoptimizeState(preloadedDays: [DailyStats]? = nil) -> (afterDays: Int, effect: AIEffect?) {
         guard let b = loadBaseline() else { return (0, nil) }
-        let after = (preloadedDays ?? loadDaysWithToday()).filter { $0.date > b.date }
+        let after = (preloadedDays ?? loadDaysWithToday()).after(baselineDate: b.date)
         guard let ag = Self.aggregate(after) else { return (after.count, nil) }
         return (after.count, AIEffect(days: after.count, beforeAvg: b.avgTemp,
                                       afterAvg: ag.avg, beforeHot: b.hotRatio, afterHot: ag.hot))

@@ -753,6 +753,29 @@ public struct DailyStats: Codable {
     }
 }
 
+// v3.5.1：天数序列的纯函数语义（从 FanModel 提取，App 与测试共用同一实现——
+// 此前合并/过滤逻辑是 App private inline，"今日零样本保留历史末位"等关键语义
+// 无测试覆盖且 App target 结构上不可测）。
+public extension Array where Element == DailyStats {
+    /// 把"今日实时统计"合并进历史天数序列：同日替换（today 赢，实时值覆盖当日归档值）；
+    /// today 为 nil 或 tempCount == 0（新一天尚无样本）时原样保留历史（含末位=昨日），
+    /// 避免"新一天零样本显示昨天数据"的语义漂移。
+    static func mergingToday(_ history: [DailyStats], today: DailyStats?) -> [DailyStats] {
+        var days = history
+        if let s = today, s.tempCount > 0 {
+            days.removeAll { $0.date == s.date }
+            days.append(s)
+        }
+        return days
+    }
+
+    /// AI 效果评估窗：严格晚于基线日的天数（基线日当天是"改前"快照，必须排除——
+    /// 同日既算 before 又算 after 会把改动前的数据算进效果，稀释/伪造改善）。
+    func after(baselineDate: String) -> [DailyStats] {
+        filter { $0.date > baselineDate }
+    }
+}
+
 // MARK: - 文件存取
 
 public enum FanCtlPaths {
