@@ -1028,6 +1028,23 @@ func testThermalLearn() {
         expectClose(q.percent(for: 50)!, 25, 1e-9, "50°C 合理桶保留")
     }
 
+    // v3.6（方向二）：包络健康度仪表——gap = 高温段 max(更低采信桶 − 本桶 EMA)
+    do {
+        var g = ThermalLearn()
+        for _ in 0..<3 { g.record(temp: 82, percent: 85) }   // 82° 采信
+        for _ in 0..<3 { g.record(temp: 88, percent: 62) }   // 88° 采信（非单调）
+        expectClose(g.envelopeGap()!, 23, 1e-9, "88° 桶包络差 = 85-62 = 23")
+        var h = ThermalLearn()
+        for _ in 0..<3 { h.record(temp: 82, percent: 60) }
+        for _ in 0..<3 { h.record(temp: 88, percent: 85) }   // 已单调
+        expectClose(h.envelopeGap()!, 0, 1e-9, "单调学习图 gap = 0")
+        expect(ThermalLearn().envelopeGap() == nil, "无数据返回 nil")
+        var lo = ThermalLearn()
+        for _ in 0..<3 { lo.record(temp: 60, percent: 30) }
+        for _ in 0..<3 { lo.record(temp: 70, percent: 10) }  // 低温非单调不在 ≥75° 统计域
+        expect(lo.envelopeGap() == nil, "仅 <75° 数据 → nil（高温段域外）")
+    }
+
     // v3.4.5（3B）：高温段单调化——非单调先验在 ≥75° 查询时向上取包络
     do {
         var nm = ThermalLearn()

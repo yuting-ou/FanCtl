@@ -98,6 +98,29 @@ public struct ThermalLearn: Equatable {
         percent(for: temp, output: outputByBucket, samples: samplesByBucket)
     }
 
+    /// v3.6（方向二·数据裁判）：单调包络健康度——高温段最大"包络值 − 原始 EMA 值"。
+    /// >0 表示该桶的原始学习值仍低于更低温桶（3B 查表层在兜底修正），旧非单调数据
+    /// 尚未被新样本洗净；→0 表示学习图已自愈。观察协议见 EVOLUTION.md（2-3 周收敛，
+    /// 不收敛则做一次性数据修正——学习数据修正，不碰控制律）。
+    /// 只统计 ≥monotonicFloorTemp 且有采信样本的桶；无数据返回 nil（App/fanprobe 隐藏）。
+    public func envelopeGap() -> Double? {
+        var worst: Double? = nil
+        for b in 0..<outputByBucket.count where
+            TempHistogram.midTemp(of: b) >= Self.monotonicFloorTemp && samplesByBucket[b] >= Self.minSamples {
+            var lowerMax: Double = 0
+            var hasLower = false
+            for i in 0..<b where samplesByBucket[i] >= Self.minSamples {
+                lowerMax = max(lowerMax, outputByBucket[i])
+                hasLower = true
+            }
+            if hasLower {
+                let gap = max(0, lowerMax - outputByBucket[b])
+                worst = max(worst ?? 0, gap)
+            }
+        }
+        return worst
+    }
+
     /// 场景经验优先；一个场景尚未积累到采信样本数时回退为跨场景全局经验。
     public mutating func percent(for temp: Double, onBattery: Bool, powerWatts: Double?) -> Double? {
         if let buckets = scenarioBuckets[currentScenarioKey(onBattery: onBattery, powerWatts: powerWatts)],

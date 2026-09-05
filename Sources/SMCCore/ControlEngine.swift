@@ -969,7 +969,10 @@ public final class ControlEngine {
                             && !decision.failsafeActive) ? true : nil,
             envTemp: envTemp,
             aiTargetEffective: effectiveConfig.mode == .ai ? aiTargetEff : nil,
-            palmComp: palmComp > 0.5 ? palmComp : nil
+            palmComp: palmComp > 0.5 ? palmComp : nil,
+            // v3.6（方向二·数据裁判）：高温段包络健康度——AI 模式在当前温度下报告
+            // （88° 等过冲区旧数据被新样本洗净后 →0；观察协议见 EVOLUTION.md）
+            learnEnvelopeGap: (effectiveConfig.mode == .ai) ? thermalLearn.envelopeGap() : nil
         )
 
         let summary = statusChangeSummary(status)

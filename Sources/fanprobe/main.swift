@@ -43,6 +43,11 @@ do {
     } else {
         print("AI 热经验: 尚无数据")
     }
+    // v3.6 学习图包络健康度（方向二·数据裁判）：>0 = 高温段旧非单调数据未被新样本
+    // 洗净（查询层单调包络在兜底修正，控制不受影响）；→0 = 已自愈。观察协议见 EVOLUTION.md
+    if let s = ConfigStore.loadStatus(), s.learnEnvelopeGap != nil {
+        print(String(format: "学习图包络健康度: %.1f°（→0 = 高温段已自愈）", s.learnEnvelopeGap!))
+    }
     // 今日战报摘要（调速次数 = |输出Δ|≥3% 的拍数，风扇寿命代理指标）
     if let s = ConfigStore.loadStats(), s.date == DailyStats.today(), s.tempCount > 0 {
         print("今日: 最高 \(String(format: "%.1f", s.maxTemp))°C · 调速 \(Int(s.speedChanges)) 次 · 启停抑制 \(Int(s.aiCyclingGuards)) 次\(s.overshootPeak >= 3 ? " · 过冲峰值 +\(Int(s.overshootPeak.rounded()))°" : "") · 静音/安静 \(Int(s.quietSeconds / 60)) 分钟")

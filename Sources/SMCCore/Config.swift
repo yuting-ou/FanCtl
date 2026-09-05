@@ -350,6 +350,8 @@ public struct DaemonStatus: Codable {
                                           // App 的"全力散热"等判定须用它而非用户原始目标。旧版无此字段为 nil
     public var palmComp: Double?         // 体感补偿量（°C，v3.3）：掌托 >40° 时的目标收紧量，
                                           // App 展示“体感补偿 −N°”胶囊；无/未启用为 nil
+    public var learnEnvelopeGap: Double? // v3.6 学习图单调包络健康度（°C 差值，仅展示/观察）：
+                                         // 高温段 max(更低采信桶 − 本桶 EMA)；→0=已自愈。旧版无此字段为 nil
     public var cpuTemp: Double { sensors.cpuDie }
     public var gpuTemp: Double { sensors.gpuDie }
 
@@ -371,7 +373,8 @@ public struct DaemonStatus: Codable {
                 nightOverride: Bool? = nil,
                 envTemp: Double? = nil,
                 aiTargetEffective: Double? = nil,
-                palmComp: Double? = nil) {
+                palmComp: Double? = nil,
+                learnEnvelopeGap: Double? = nil) {
         self.sensors = sensors
         self.mode = mode
         self.appliedPercent = appliedPercent
@@ -430,8 +433,7 @@ public struct DaemonStatus: Codable {
         case learningRecently, learnedPoints, learnedSamples
         case targetUnreachable, powerWatts, nightOverride, envTemp
         case aiTargetEffective
-        case palmComp
-        // 旧字段
+                case palmComp, learnEnvelopeGap // 旧字段
         case cpuTemp, gpuTemp
     }
 
@@ -475,6 +477,7 @@ public struct DaemonStatus: Codable {
         self.envTemp = try container.decodeIfPresent(Double.self, forKey: .envTemp)
         self.aiTargetEffective = try container.decodeIfPresent(Double.self, forKey: .aiTargetEffective)
         self.palmComp = try container.decodeIfPresent(Double.self, forKey: .palmComp)
+        self.learnEnvelopeGap = try container.decodeIfPresent(Double.self, forKey: .learnEnvelopeGap)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -504,6 +507,7 @@ public struct DaemonStatus: Codable {
         try container.encodeIfPresent(envTemp, forKey: .envTemp)
         try container.encodeIfPresent(aiTargetEffective, forKey: .aiTargetEffective)
         try container.encodeIfPresent(palmComp, forKey: .palmComp)
+        try container.encodeIfPresent(learnEnvelopeGap, forKey: .learnEnvelopeGap)
         // 同时写旧字段，保证回滚到旧版本 App/daemon 时也能读
         try container.encode(sensors.cpuDie, forKey: .cpuTemp)
         try container.encode(sensors.gpuDie, forKey: .gpuTemp)
