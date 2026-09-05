@@ -25,12 +25,16 @@ jobs:
         run: swift run -c release --disable-sandbox fanctltests
 
       # 断言数提取 + 契约下限：再跑一次（全绿状态下很快，增量缓存），
-      # 断言数低于下限 = 有测试被删/跳过 → 红灯，徽章不发 success
+      # 断言数低于下限 = 有测试被删/跳过 → 红灯，徽章不发 success。
+      # v3.6.1 修复：此步骤原无 pipefail（v3.4.1 的假绿修复漏掉了这里），
+      # 且正则会匹配失败行 "❌ X/Y 项断言失败" 里的 Y——重跑 flaky 失败时
+      # 吞掉退出码还能提取出达标数字发绿徽章。现 pipefail + 锚定成功行。
       - name: 提取断言数（契约下限校验）
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
-          swift run -c release --disable-sandbox fanctltests 2>&1 | tee test-output.txt && \
-          N=$(grep -oE '[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1) || exit 1
+          set -o pipefail
+          swift run -c release --disable-sandbox fanctltests 2>&1 | tee test-output.txt
+          N=$(grep -oE '全部通过：[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1)
           echo "断言数: $N"
           if [ -z "$N" ] || [ "$N" -lt 2499 ]; then
             echo "::error::断言数 $N 低于契约下限 2499（测试被删/跳过？）"

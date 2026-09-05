@@ -12,6 +12,10 @@ PLIST=/Library/LaunchDaemons/com.fanctl.daemon.plist
 echo "==> 停止守护进程（退出时会自动恢复系统风扇调度）..."
 launchctl bootout system "$PLIST" 2>/dev/null || true
 sleep 1
+# v3.6.1：bootout 失败被吞时 fanctld 带着强制转速存活且二进制即将被删——
+# 无人能再恢复。pkill 兜底确保 SIGTERM 送达（fanctld 信号处理会 restoreAutoAll）
+pkill -x fanctld 2>/dev/null || true
+sleep 1
 
 echo "==> 关闭菜单栏 App（先注销登录项，再停进程，避免删文件时它还在回写配置）..."
 # v3.4.5（4D）：SMAppService 登录项必须在 App 被删除前由 App 自身注销

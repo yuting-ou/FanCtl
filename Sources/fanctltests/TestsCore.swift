@@ -1,5 +1,5 @@
 // 测试按模块拆分（v3.3.1）：本文件为各模块共享的 harness 与主入口。
-// 断言/共享构造见 TestSupport.swift，各模块用例见 Tests*.swift。
+// 断言 harness 见 main.swift，共享构造（MockSMC/FakeClock/makeEngine）见 TestsEngine.swift 头部。
 import Foundation
 import SMCCore
 
@@ -414,7 +414,10 @@ func testPowerMetricsGolden() {
     expectClose(PowerMetricsParser.watts(in: m26, key: "CPU Power:")!, 3.890, 1e-6,
                 "macOS26 CPU：多样本取最后（3890 mW）")
     expectClose(PowerMetricsParser.watts(in: m26, key: "GPU Power:")!, 0.012, 1e-6,
-                "macOS26 GPU：第二样本 12 mW")
+                "macOS26 GPU：0 mW 被范围门拒绝 → 保留最后有效样本 12 mW（陈旧滞留由 PowerCompositionSampler 单侧过期兜底）")
+    // v3.6.1：显式锁定"0 mW 拒绝后回退最后有效样本"语义（此前隐式契约被错误标签掩盖）
+    expectClose(PowerMetricsParser.watts(in: "CPU Power: 100 mW\nCPU Power: 0 mW", key: "CPU Power:")!, 0.1, 1e-6,
+                "0 mW 范围门拒绝 → 回退上一有效样本")
     // E-Cluster 行不得被误认为 CPU Power
     expect(PowerMetricsParser.watts(in: m26, key: "Cluster Power:") != 0.812,
            "Cluster 干扰行不误匹配（子串 key 的边界）")

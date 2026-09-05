@@ -168,8 +168,8 @@ public final class ControlEngine {
             hooks.log("热经验学习: 清洗 \(cleanedBuckets) 个污染桶"
                 + (startupEnv.map { String(format: "（环境 %.0f°C，阈值已随环境修正）", $0) } ?? "（低温<75°C 但学到>80%输出，疑似手动模式残留）"))
         }
-        // 启动时时间衰减：超过 14 天未更新的桶样本数减半
-        let decayedBuckets = thermalLearn.decayStaleBuckets()
+        // 启动时时间衰减：超过 14 天未更新的桶样本数减半（时钟走注入单一来源，P7）
+        let decayedBuckets = thermalLearn.decayStaleBuckets(now: hooks.now())
         if decayedBuckets > 0 {
             learnDirty = true
             hooks.log("热经验学习: 衰减 \(decayedBuckets) 个过时桶（>14天未更新，样本数减半）")
@@ -276,10 +276,16 @@ public final class ControlEngine {
 
         // AI 热经验重置请求
         if FileManager.default.fileExists(atPath: FanCtlPaths.resetLearnFlag.path) {
-            thermalLearn = ThermalLearn()
-            learnDirty = true
-            try? FileManager.default.removeItem(at: FanCtlPaths.resetLearnFlag)
-            hooks.log("AI 热经验已重置，将从零重新积累")
+            do {
+                try FileManager.default.removeItem(at: FanCtlPaths.resetLearnFlag)
+                thermalLearn = ThermalLearn()
+                learnDirty = true
+                hooks.log("AI 热经验已重置，将从零重新积累")
+            } catch {
+                // v3.6.1：删除失败必须中止本拍重置——`try?` 吞掉后标志永存，
+                // 每拍重置学习 + 每 60s 落盘空表，学习永久无法积累
+                hooks.log("AI 热经验重置标志删除失败（\(error)），下拍重试")
+            }
         }
 
         // 1. 热加载配置
@@ -723,7 +729,7 @@ public final class ControlEngine {
                !decision.ssdGuard, !decision.batteryGuard, !decision.failsafeActive,
                !writeHealth.faulted, !feedbackHealth.faulted, !fanStates.isEmpty {
                 thermalLearn.record(temp: temp, percent: baseTarget, onBattery: onBattery,
-                                    powerWatts: powerWatts)
+                                    powerWatts: powerWatts, now: hooks.now())
                 // v8 散热参数辨识：同一稳态样本喂线性模型（环境 + a·功耗 − b·风量 ≈ 温度）。
                 // 环境代理不可用时模型无法学习（跳过，不影响查表学习）
                 if let env = envTemp, let pw = powerWatts {
@@ -796,7 +802,8 @@ public final class ControlEngine {
                     }
                     writeHealth.record(loopSuccess: probeOK)
                     if probeOK {
-                        probeVerifyLoops = 3   // 验证期：保持强制模式，让风扇爬升并接受 record 检查
+                        // 设 4：本拍末尾 -=1 后剩 3，保证注释承诺的完整 3 拍严格验证窗
+                        probeVerifyLoops = 4
                         hooks.log("故障试探写入成功，进入跟随验证（3 拍）…")
                     }
                 }
@@ -845,6 +852,10 @@ public final class ControlEngine {
                 // 避免 daemon"以为在控制"而风扇实际无人管的静默故障
                 writeHealth.record(loopSuccess: !loopWriteFailed)
                 forcedModeActive = true
+                // v3.6.1：恢复正常写路径时清掉残留的验证计数——故障在验证期内自愈
+                //（controlBlocked 转 false）时计数器无人复位，会残留 1-2 拍，
+                // 下次故障期先空耗拍数做"伪验证"再走交还分支
+                probeVerifyLoops = 0
             }
 
             // AI 评测只记录真实接管、无安全覆盖、无静音封顶、反馈健康的样本。
@@ -866,8 +877,13 @@ public final class ControlEngine {
             }
             // v3.2 过冲观察：与 aiMetrics 同一排除集（静音封顶是用户意图而非控制失效，
             // 安全覆盖/闭环故障期的温度不反映 AI 控制质量——混入会让 τ 自适应的
-            // 数据门槛被会议日/故障日误触发）；空闲交还拍 max(0, …) = 0 自然无贡献
-            if !quietActive, !writeHealth.faulted, !feedbackHealth.faulted, !fanStates.isEmpty {
+            // 数据门槛被会议日/故障日误触发）；空闲交还拍 max(0, …) = 0 自然无贡献。
+            // v3.6.1 修复：补齐 mode==.ai 与 ssd/battery/failsafe 排除——原实现缺这三项，
+            // curve 模式下 80-85° 负载被记成"AI 过冲 +N°"，failsafe 期更记入 +16°，
+            // 过冲账目被非 AI 控制的温度污染，τ 自适应数据门槛失真
+            if effectiveConfig.mode == .ai, !quietActive, !decision.ssdGuard,
+               !decision.batteryGuard, !decision.failsafeActive,
+               !writeHealth.faulted, !feedbackHealth.faulted, !fanStates.isEmpty {
                 overshootNow = max(0, temp - aiTargetEff)
             }
         } else {
@@ -925,11 +941,9 @@ public final class ControlEngine {
                 ConfigStore.saveAIMetrics(aiMetrics)
             }
         }
-        // 无条件更新 prevRawTemp：fastConfigApply 期间温度也在变化，
-        // 不更新会导致下次正常循环 tempChange=|raw-prevRaw| 偏大（包含 fastConfigApply 期间变化），
-        // 被 computeNextInterval 误判为"温度快速变化"，强制使用 LOOP_INTERVAL_MIN（1s），
-        // 增加能耗和 SMC 访问。更新后 tempChange 只反映两次循环间的真实变化。
-        prevRawTemp = rawTemp
+        // v3.6.1 修复：prevRawTemp 的赋值已移至步骤 6 computeNextInterval 之后。
+        // 原实现先覆盖后使用（beat 内 :932 先赋值、:1029 才读），tempChange 恒为 0，
+        // "温度快速变化 → 1s 轮询"分支自 v2.6 起即为死代码。
 
         // 5. 写完整状态（含所有传感器数据，App 无需直读 SMC）
         //    变化感知：稳态时温度/RPM 可能仅微小波动，无实质变化时跳过磁盘写入，
@@ -1017,6 +1031,11 @@ public final class ControlEngine {
             // 而不是等下一个正常循环（稳态时可能 5-20s 后）。
             scheduleNext(interval: 2.0)
         }
+        // 无条件更新 prevRawTemp（在 computeNextInterval 读取之后）：fastConfigApply
+        // 期间温度也在变化，不更新会导致下次正常循环 tempChange=|raw-prevRaw| 偏大
+        //（包含 fastConfigApply 期间变化），被 computeNextInterval 误判为"温度快速变化"，
+        // 强制使用 LOOP_INTERVAL_MIN（1s）。更新后 tempChange 只反映两次循环间的真实变化。
+        prevRawTemp = rawTemp
     }
 
     // MARK: - 自适应循环间隔计算（原 main.swift 顶层函数迁入）

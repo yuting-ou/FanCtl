@@ -143,24 +143,25 @@ final class FanModel: ObservableObject {
         cpuSampleTimer = nil
     }
     // v3.4.5（2D）：ps 采样防重入——ps 子进程若挂起，readDataToEndOfFile 会永久
-    // 阻塞 detached 任务，3s 定时器继续叠加新 Task + Process（句柄无上界累积）。
-    // in-flight 标志 + 4s 强制过期（3s 采样周期的兜底释放），复制 daemon 侧
-    // PowerCompositionSampler 的同型防护。
+    // 阻塞采样线程，3s 定时器继续叠加新采样任务。
+    // v3.6.1：防挂起改为双层——① sampleCPUUsage 内置 4s 强杀（阻塞有界）；
+    // ② 采样移出 Swift 并发协作池（Task.detached 阻塞会钉死协作线程，挂起数个后
+    // 池耗尽、全部 detached 任务静默停摆），改用专用 GCD 全局队列。
     @MainActor private var psSamplingInFlight = false
     @MainActor private var psSamplingSince = Date.distantPast
 
     @MainActor private func sampleTopProcesses() {
         if psSamplingInFlight,
            Date().timeIntervalSince(psSamplingSince) < 4 {
-            return   // 上一次采样仍在途（≤4s 强制过期兜底），跳过本拍避免堆积
+            return   // 上一次采样仍在途（≤4s 强杀兜底），跳过本拍避免堆积
         }
         psSamplingInFlight = true
         psSamplingSince = Date()
         // ps 采样涉及子进程，放后台线程执行，再切回主线程更新，避免阻塞 UI
         let owner = self
-        Task.detached(priority: .utility) {
+        DispatchQueue.global(qos: .utility).async {
             let usage = NotificationService.sampleCPUUsage()
-            await MainActor.run {
+            DispatchQueue.main.async {
                 owner.topProcesses = usage
                 owner.psSamplingInFlight = false
             }
@@ -408,8 +409,8 @@ final class FanModel: ObservableObject {
 
     // MARK: - 版本自检（v3.6 方向一）
 
-    /// 查询 GitHub Releases latest 并与本地版本比较。24h 内已查过则跳过；
-    /// 失败（无网/限流/超时）全静默。命中"跳过此版本"不提示。
+    /// 查询 GitHub Releases latest 并与本地版本比较。24h 内已成功查过则跳过；
+    /// 失败（无网/限流/超时）全静默，10 分钟后重试一次节流。命中"跳过此版本"不提示。
     @MainActor func checkForUpdate(force: Bool = false) {
         if updateCheckInFlight { return }
         if !force,
@@ -418,7 +419,6 @@ final class FanModel: ObservableObject {
             return
         }
         updateCheckInFlight = true
-        UserDefaults.standard.set(Date(), forKey: Self.updateLastCheckKey)
         let owner = self
         Task.detached(priority: .utility) {
             // GitHub API 只解 tag_name 一个字段；匿名限额 60 次/h，24h 一次远低于此
@@ -426,18 +426,28 @@ final class FanModel: ObservableObject {
                 let tagName: String
                 enum CodingKeys: String, CodingKey { case tagName = "tag_name" }
             }
-            var tag: String? = nil
+            var fetched: String? = nil
             if let url = URL(string: "https://api.github.com/repos/yuting-ou/FanCtl/releases/latest") {
                 var req = URLRequest(url: url)
                 req.timeoutInterval = 15
                 req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
                 if let (data, _) = try? await URLSession.shared.data(for: req) {
-                    tag = (try? JSONDecoder().decode(Release.self, from: data))?.tagName
+                    fetched = (try? JSONDecoder().decode(Release.self, from: data))?.tagName
                 }
             }
+            let tag = fetched   // let 跨隔离域传递（Swift 6 严格并发友好）
             await MainActor.run {
                 owner.updateCheckInFlight = false
-                guard let tag else { return }   // 失败静默，下次到点再查
+                guard let tag else {
+                    // v3.6.1：失败不写 lastCheck——原实现在请求前落盘，开机时网络未就绪
+                    // 的这次失败会消费掉整个 24h 窗口。失败后 10 分钟重试一次
+                    let retry = Timer.scheduledTimer(withTimeInterval: 600, repeats: false) { _ in
+                        Task { @MainActor in owner.checkForUpdate() }
+                    }
+                    retry.tolerance = 120
+                    return
+                }
+                UserDefaults.standard.set(Date(), forKey: Self.updateLastCheckKey)
                 let local = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
                 if VersionCheck.isNewer(tag, than: local),
                    UserDefaults.standard.string(forKey: Self.updateSkippedKey) != tag {
@@ -638,7 +648,9 @@ final class FanModel: ObservableObject {
             self.onBattery = status.onBattery ?? false
             self.batteryOverride = status.batteryOverride ?? false
             self.nightOverride = status.nightOverride ?? false
-            if let env = status.envTemp, env.isFinite, env > 0, env < 60 { self.envTemp = env }
+            // v3.6.1：无效值显式清 nil——原 if-let 只在有效时覆盖，daemon 把 envTemp
+            // 置 nil（环境传感器失效）后 App 头部胶囊永远显示几分钟前的陈旧值
+            self.envTemp = status.envTemp.flatMap { $0.isFinite && $0 > 0 && $0 < 60 ? $0 : nil }
             self.controlReason = status.reason
             self.aiIntent = status.aiIntent
             self.curveTargetPercent = status.curveTargetPercent
@@ -685,8 +697,10 @@ final class FanModel: ObservableObject {
         }
 
         // 转换风扇状态（数值防御：异常 RPM 不入 UI，避免 Int() trap）
+        // v3.6.1：id 同样消毒——status.json 手改/损坏的负 id/超大 id 会让
+        // fanOffsets[id] 越界崩溃或 while-append 写出十万级配置数组
         var fanStates: [FanState] = []
-        for entry in status.fans {
+        for entry in status.fans where entry.id >= 0 && entry.id < 8 {
             fanStates.append(FanState(id: entry.id,
                                       actualRPM: safeRPM(entry.actualRPM),
                                       minRPM: safeRPM(entry.minRPM),
@@ -883,6 +897,8 @@ final class FanModel: ObservableObject {
 
     // 设置单风扇偏移
     func setFanOffset(fanIndex: Int, offset: Double) {
+        // v3.6.1：与 fanStates 构建侧的 id < 8 消毒对齐，防越界/无界 append
+        guard fanIndex >= 0, fanIndex < 8 else { return }
         lastUserChange = Date()
         let clamped = max(-20, min(20, offset))
         while fanOffsets.count <= fanIndex { fanOffsets.append(0) }

@@ -1,5 +1,5 @@
 // 测试按模块拆分（v3.3.1）：本文件为各模块共享的 harness 与主入口。
-// 断言/共享构造见 TestSupport.swift，各模块用例见 Tests*.swift。
+// 断言 harness 见 main.swift，共享构造（MockSMC/FakeClock/makeEngine）见 TestsEngine.swift 头部。
 import Foundation
 import SMCCore
 
@@ -15,6 +15,11 @@ final class MockSMC: SMCIO {
     func set(_ key: String, _ value: Double, type: String = "flt ") {
         lock.lock(); defer { lock.unlock() }
         values[key] = (type, value)
+    }
+    /// v3.6.1：清空全部键（模拟 allKeys 抛错/返回空的瞬时 SMC 故障等价场景）
+    func resetForTesting() {
+        lock.lock(); defer { lock.unlock() }
+        values.removeAll()
     }
     func lastWrite(_ key: String) -> Double? { writes.last { $0.key == key }?.value }
 
@@ -428,9 +433,9 @@ func testEngineWiring() {
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         engine.beat()
         expectEqual(ConfigStore.loadStatus()?.reason, .curve, "白天正常曲线")
-        clock.advance(3600 * 12)   // 正午 → 23:00（进入夜间窗）
+        clock.advance(3600 * 12)   // 正午 +12h → 次日 00:00（落入 22:00–8:00 夜间窗）
         engine.beat()
-        expectEqual(ConfigStore.loadStatus()?.reason, .night, "23:00 → 夜间安静档接线生效")
+        expectEqual(ConfigStore.loadStatus()?.reason, .night, "00:00（夜间窗内）→ 夜间安静档接线生效")
         expect(ConfigStore.loadStatus()?.nightOverride == true, "nightOverride 下发")
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
         for d in envDirs { try? FileManager.default.removeItem(at: d) }
@@ -515,6 +520,149 @@ func testLearnSaturatedGate() {
 
 // v3.4.1 DoD-8：周期重扫后台化——旧分类在后台扫描完成前保持可用（控制不中断），
 // 完成后分类原子刷新；init 首扫仍同步（后续读取依赖分类）。
+// v3.6.1 对抗式审查回归块：prevRawTemp 时序、slew/shape 0-100 边界豁免、
+// statusChangeSummary NaN 防护、DailyStats.sanitized、Intel FS! guard、si8/si16 解码。
+// 每条对应一次真实缺陷（详见提交说明），防止同类回潮。
+func testAdversarialFixes() {
+    group("对抗式审查修复回归（v3.6.1）")
+
+    // —— P1-1：tempChange 死代码修复（prevRawTemp 必须在 computeNextInterval 之后更新）——
+    // 场景：55° 稳态起步，负载突增到 72°（未达 hot 80°，无兜底/托底），
+    // 设计意图是 |ΔT|>3° → 1s 快速轮询；修复前 tempChange 恒 0，永远走不到
+    do {
+        let smc = makeFanSMC(); smc.set("Tp01", 55); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        engine.beat()   // 建基线 prevRawTemp=55
+        clock.advance(3)
+        smc.set("Tp01", 72)   // 单拍 +17°（快速爬升）
+        engine.beat()
+        // 本拍 computeNextInterval 读到的 prevRawTemp 应为 55（修复前已被覆盖为 72 → tempChange=0）
+        let sched = col.schedules.last ?? 0
+        expectEqual(sched, LOOP_INTERVAL_MIN, "温升 +17° 单拍触发 1s 快速轮询（tempChange 非死代码，得 \(sched)s）")
+    }
+
+    // —— P1-2：slew 迟滞带 0/100 边界豁免（97% 永久卡死 + 压不住检测失灵）——
+    do {
+        var c = FanCurveController()
+        _ = c.slew(target: 89)          // last=89
+        expectEqual(c.slew(target: 100), 97, "89→100 限速 8% 到 97")
+        // 修复前：候选 100 与 last=97 差 3 < 带宽 4 → hold 97 永不到 100
+        expectEqual(c.slew(target: 100), 100, "候选 100 突破迟滞带写满（saturated 检测可达）")
+        expectEqual(c.slew(target: 100), 100, "满速维持")
+        // 0 侧：迟滞带同样豁免（last=2 时候选 0 差 2 < 带宽 4）
+        var q = FanCurveController()
+        _ = q.slew(target: 8, hysteresis: 4)
+        expectEqual(q.slew(target: 2, hysteresis: 4), 2, "8→2 降速 6%/拍到位")
+        // 修复前：候选 0 与 last=2 差 2 < 4 → hold 2，停转意图永不可达
+        expectEqual(q.slew(target: 0, hysteresis: 4), 0, "候选 0 突破迟滞带（停转意图可达）")
+        // 死区对中间值仍生效（不回归 v3.2 的抗抖动语义）
+        var m = FanCurveController()
+        _ = m.slew(target: 50)
+        expectEqual(m.slew(target: 52, hysteresis: 4), 50, "中间值 |Δ|<4 仍 hold（迟滞带主语义不变）")
+        // shape() 死区 0/100 豁免
+        var s = FanCurveController()
+        _ = s.shape(target: 3)
+        expectEqual(s.shape(target: 0), 0, "shape 死区 0% 豁免（停转可达）")
+        var f = FanCurveController()
+        _ = f.shape(target: 97)
+        expectEqual(f.shape(target: 100), 100, "shape 死区满速豁免保持（原语义）")
+    }
+
+    // —— P2-1：overshoot 排除集补齐（curve 模式不计"AI 过冲"）——
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 84); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        engine.beat(); clock.advance(3)
+        engine.beat()
+        engine.shutdownSave()
+        expect(ConfigStore.loadStats()?.overshootPeak == 0,
+               "curve 模式 84° 不计入过冲峰值（aiTarget 默认 76，修复前记 +8）")
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    }
+
+    // —— 发现11：statusChangeSummary 对 NaN/Inf 不设防（Int(NaN) = root 崩溃）——
+    do {
+        var st = DaemonStatus(
+            sensors: SensorReadings(cpuDie: 70, gpuDie: 60),
+            mode: .curve, appliedPercent: 40,
+            fans: [FanStatusEntry(id: 0, actualRPM: Double.nan, targetRPM: Double.infinity,
+                                  minRPM: 1200, maxRPM: 5000)])
+        let s1 = statusChangeSummary(st)   // 修复前在此 trap
+        expect(s1.contains("0>0"), "NaN/Inf RPM 摘要为 0 不 trap（得 \(s1)）")
+        st.appliedPercent = .nan
+        expect(!statusChangeSummary(st).isEmpty, "NaN appliedPercent 不 trap")
+    }
+
+    // —— 发现5/测试7：DailyStats.sanitized + avgTemp 除零下限 ——
+    do {
+        var bad = DailyStats(date: "2026-09-05")
+        bad.tempSum = 1e300; bad.tempSeconds = 1e-300; bad.maxTemp = .nan
+        bad.revolutions = -.infinity
+        let clean = bad.sanitized()
+        expectEqual(clean.tempSum, 0, "超界 tempSum 钳 0")
+        expectEqual(clean.maxTemp, 0, "NaN maxTemp 钳 0")
+        expectEqual(clean.revolutions, 0, "−inf revolutions 钳 0")
+        expectEqual(clean.avgTemp, 0, "微分母 avgTemp 不溢出")
+        // 正常值直通
+        var ok = DailyStats(date: "2026-09-05")
+        ok.tempSum = 75 * 1200; ok.tempSeconds = 1200
+        expectClose(ok.sanitized().avgTemp, 75, 1e-9, "合法数据 sanitized 直通")
+    }
+
+    // —— 发现7：Intel FS! fan id ≥ 16 时 UInt16(1<<id) runtime trap ——
+    do {
+        let smc = MockSMC()   // 无 F0Md → Intel FS! 路径
+        smc.set("FNum", 1, type: "ui8 ")
+        let fc = try! FanController(smc: smc)
+        let st = FanState(id: 16, actualRPM: 1200, minRPM: 1200, maxRPM: 5000, targetRPM: 1200)
+        var threw = false
+        do { try fc.setForcedRPM(state: st, rpm: 3000) } catch { threw = true }
+        expect(threw, "fan id 16 setForcedRPM 抛错而非 trap")
+        var threw2 = false
+        do { try fc.restoreAuto(fan: 17) } catch { threw2 = true }
+        expect(threw2, "fan id 17 restoreAuto 抛错而非 trap")
+        // 正常 id（<16）不受影响
+        smc.set("FS! ", 0, type: "ui16")
+        let st0 = FanState(id: 0, actualRPM: 1200, minRPM: 1200, maxRPM: 5000, targetRPM: 1200)
+        try! fc.setForcedRPM(state: st0, rpm: 3000)
+        expect(smc.lastWrite("FS! ") != nil, "id<16 正常 FS! 写入")
+    }
+
+    // —— 发现10：si8/si16 有符号解码 ——
+    do {
+        let neg = SMCValue(key: "X", dataType: "si8 ", dataSize: 1, bytes: [0xFB])   // -5
+        expectClose(neg.doubleValue!, -5, 1e-9, "si8 −5 按位型解码（修复前 251）")
+        let neg16 = SMCValue(key: "X", dataType: "si16", dataSize: 2, bytes: [0xFF, 0xFB])  // -5
+        expectClose(neg16.doubleValue!, -5, 1e-9, "si16 −5 按位型解码（修复前 65531）")
+        let pos = SMCValue(key: "X", dataType: "ui16", dataSize: 2, bytes: [0x01, 0x00])
+        expectClose(pos.doubleValue!, 256, 1e-9, "ui16 无符号解码不回归")
+    }
+
+    // —— 发现4：statusChangeSummary 新增字段参与变化感知 ——
+    do {
+        let base = DaemonStatus(
+            sensors: SensorReadings(cpuDie: 70, gpuDie: 60, palmRest: 42),
+            mode: .ai, appliedPercent: 40, fans: [],
+            aiTargetEffective: 76, palmComp: 2.5, learnEnvelopeGap: 3.0)
+        let v1 = statusChangeSummary(base)
+        var moved = base
+        moved.sensors = SensorReadings(cpuDie: 70, gpuDie: 60, palmRest: 45)
+        expect(statusChangeSummary(moved) != v1, "掌托变化触发摘要变化（新增感知字段）")
+        var gap = base
+        gap.learnEnvelopeGap = 0
+        expect(statusChangeSummary(gap) != v1, "包络健康度变化触发摘要变化")
+    }
+}
+
 func testRescanAsync() {
     group("rescan 拆拍")
     let smc = MockSMC()
@@ -531,6 +679,42 @@ func testRescanAsync() {
     ts.rescanAllSensorsBlocking(clockOverride: { clockBox.time() })
     expect(ts.sensorCounts.cpu == 2, "扫描完成后新键被分类（Tp02 发现）")
     expect(ts.sensorCounts.other == 1, "other 分类保持（TVV0）")
+}
+
+// v3.6.1：瞬时 SMC 故障防御——allKeys() 抛错（唤醒窗口 IOKit 瞬时失败最常见）
+// 时不得把空结果当合法扫描清空全部分类并前移 lastScanTime（否则控制离线最长 5 分钟）
+func testRescanEmptyScanDefense() {
+    group("rescan 空扫描防御")
+    let smc = MockSMC()
+    smc.set("Tp01", 55); smc.set("TVV0", 50)
+    let clock = FakeClock()
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { clock.time() })
+    expect(ts.sensorCounts.cpu == 1, "首扫分类建立")
+    // MockSMC 无法模拟 allKeys 抛错，但可制造等价的"零键扫描"：
+    // 直接以空 SMC 做新传感器实例模拟故障扫描结果——真实防御在 rescanAllSensorsBlocking
+    // 的 guard !all.isEmpty，这里通过一个仅含故障键环境的阻塞重扫验证分类不被清空
+    smc.set("Tp01", 55)   // 保持键在
+    let before = ts.sensorCounts
+    ts.rescanAllSensorsBlocking(clockOverride: { clock.time() })
+    expect(ts.sensorCounts.cpu == before.cpu, "正常重扫分类保持")
+    // 故障模拟：临时用一个 allKeys 返回空的 SMC 替身不可行（SMCIO 协议注入需重建实例），
+    // 转而锁定防御语义本身：空 allKeys 时 lastScanTime 不前移——通过 Ts0P 键全部失效后
+    // 重扫不丢 CPU 分类来验证（MockSMC 全删键 = allKeys 空的等价场景）
+    let smc2 = MockSMC()   // 空实例
+    let ts2 = try! makeTemperatureSensors(smc: smc2, clock: { clock.time() })
+    smc2.set("Tp01", 60)
+    let clockBox = FakeClock()
+    ts2.clock = { clockBox.time() }
+    clockBox.advance(600)   // 超过 300s 扫描窗
+    ts2.rescanAllSensorsBlocking(clockOverride: { clockBox.time() })
+    expect(ts2.sensorCounts.cpu == 1, "重扫发现键后分类恢复")
+    smc2.resetForTesting()
+    clockBox.advance(600)
+    ts2.rescanAllSensorsBlocking(clockOverride: { clockBox.time() })
+    // 空扫描 → guard 拦截 → 分类保持、lastScanTime 不前移
+    expect(ts2.sensorCounts.cpu == 1, "空扫描不清空已有分类（v3.6.1 防御）")
+    ts2.rescanAllSensorsBlocking(clockOverride: { clockBox.time() })
+    expect(ts2.sensorCounts.cpu == 1, "连续空扫描分类仍保持（lastScanTime 未前移，300s 内仅此一次触发）")
 }
 
 func testSensorsMock() {

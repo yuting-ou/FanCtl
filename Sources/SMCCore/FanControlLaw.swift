@@ -87,7 +87,7 @@ public struct FanCurveController {
         if let last = lastAppliedPercent {
             if pct > last { pct = min(pct, last + tuning.maxStepUp) }     // 升速限速（缓慢上升）
             if pct < last { pct = max(pct, last - tuning.maxStepDown) }   // 降速限速（缓慢下降）
-            if pct != 100 && abs(pct - last) < tuning.pctDeadband { pct = last }  // 死区（满速不受限）
+            if pct != 100 && pct != 0 && abs(pct - last) < tuning.pctDeadband { pct = last }  // 死区（0%/满速边界不受限：0%=停转意图、100%=满速兜底，卡在 1-4% 或 97-99% 都违背目标语义）
         }
         lastAppliedPercent = pct
         return pct
@@ -117,7 +117,11 @@ public struct FanCurveController {
         if let last = lastAppliedPercent {
             if pct > last { pct = min(pct, last + tuning.maxStepUp) }
             if pct < last { pct = max(pct, last - tuning.maxStepDown) }
-            if hysteresis > 0, abs(pct - last) < hysteresis { pct = last }
+            // v3.6.1 迟滞带边界豁免（与 shape() 死区对齐）：候选 100 时必须写满——
+            // 否则 AI 积分钳顶后 last 可能滞留在 97-99（如爬坡步进恰好落在 97），
+            // |100-last| < 带宽永远 hold，风扇钉在 97% 且 saturated(≥98) 检测失灵，
+            // "AI 目标压不住"状态永不触发。0 侧同理（AI 输出趋 0 时滞留 1-3%）。
+            if hysteresis > 0, pct != 100, pct != 0, abs(pct - last) < hysteresis { pct = last }
         }
         lastAppliedPercent = pct
         return pct

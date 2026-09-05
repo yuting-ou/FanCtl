@@ -4,10 +4,13 @@
 // 对每个成员跑 AI 闭环，输出 极限环/过冲/启停/稳态误差 矩阵，找出当前标定的失效边界。
 // 断言（验收标准）：
 //   1. 极限环：全族在轻载窗口内"交还尝试"≤ 4 次（循环抑制 + 退避全族有效）
-//   2. 传感器鲁棒：周期性丢读不产生任何"故障交还系统"（坏读剔除正确工作）
+//   2. 传感器鲁棒：5 连丢读触发"故障交还系统"是设计行为（坏读剔除正确工作），
+//      要锁的是恢复速度——丢读结束后 ≤2 拍重新接管（droppedRestoredTicks，DoD-4a）
+//      与丢读窗口温度上界（dropWindowMaxTemp ≤ 被动平衡+5，DoD-4b）
 //   3. 安全：全族全程温度 < 105°C（硬件红线之内的物理合理域）
 //   4. 稳态：可达目标的成员（被动平衡 ≤ 84°）hold 期最大误差 ≤ 8°C
 //   5. 反馈健康：风扇一阶滞后 + 噪声下不误报故障；真停转 6 拍内捕获、恢复后解除
+//   6. 族完整性：成员数恒为 3×3×3×3 = 81（网格被改小时红灯，CI 契约盲区的补丁）
 // 输出：逐成员一行矩阵 + 最坏成员汇总。
 
 import Foundation
@@ -89,7 +92,7 @@ func runFamilyMember(_ m: FamilyMember,
     var time = 0.0
     var tick = 0
     var badStreak = 0
-    var stallTicks = 0
+    var restoredWaiting = false   // v3.6.1：丢读恢复后等待首次重新接管
 
     for phase in profile {
         for _ in 0..<phase.ticks {
@@ -111,15 +114,25 @@ func runFamilyMember(_ m: FamilyMember,
                 continue
             }
             if badStreak > 0 {
-                // 读数恢复：从坏读状态回到控制的拍数（1 = 下一拍立即恢复）
-                metrics.droppedRestoredTicks = badStreak > 0 ? 0 : -1
+                // v3.6.1 修复：真实计量恢复接管拍数——原实现 `badStreak > 0 ? 0 : -1`
+                // 恒等于 0，">2 拍"违例分支结构性不可达（DoD-4(a) 从未被验证过）。
+                // 丢读结束 → 开始计数；首个非 nil 决策（重新接管）→ 封口
                 if metrics.droppedRestoredTicks < 0 { metrics.droppedRestoredTicks = 0 }
+                restoredWaiting = true
             }
             badStreak = 0
 
             let o = ai.step(temp: sampled, powerWatts: phase.power, dt: familyDT)
             let applied = ctrl.slew(target: o ?? 0, force: false, hysteresis: 4)
             let pct = (o == nil) ? 0 : applied   // 交还态 = 系统接管（近似停转/最低）
+            if restoredWaiting {
+                // "恢复接管"只对需要控温的场景有意义：温度仍高于目标附近时，
+                // AI 必须在 ≤2 拍内重新给出决策；温度已低于目标 → AI 保持交还
+                // 是正确节能行为，不计违例（对齐 daemon 的 aiIdle 语义）
+                metrics.droppedRestoredTicks += 1
+                let needsCooling = sampled > familyTarget - 2
+                if o != nil || !needsCooling { restoredWaiting = false }
+            }
 
             // 反馈健康（B 项）：一阶风扇滞后 + 真停转注入
             let rpmCmd = 1200.0 + (5349.0 - 1200.0) * applied / 100.0
@@ -172,11 +185,9 @@ func runFamilyMember(_ m: FamilyMember,
             if phase.power >= 70 {
                 metrics.spikePeakExcess = max(metrics.spikePeakExcess, vm.temp - familyTarget)
             }
-            _ = stallTicks
         }
         if metrics.nan { break }
     }
-    _ = stallTicks
     return metrics
 }
 
@@ -201,7 +212,6 @@ func testFamilyScan() {
     var memberCount = 0
     var memberLines: [String] = []
     var cycleViolations: [String] = []
-    var sensorViolations: [String] = []
     var safetyViolations: [String] = []
     var holdViolations: [String] = []
 
@@ -264,7 +274,10 @@ func testFamilyScan() {
     }
 
     // for l in memberLines { print(l) }  // DoD-9 实验：禁打印定位 trap
-    print("  [族汇总] 成员 \(memberCount) | 极限环违例 \(cycleViolations.count) | 传感器违例 \(sensorViolations.count) | 安全违例 \(safetyViolations.count) | hold 违例 \(holdViolations.count)")
+    // v3.6.1：memberCount 真断言——此前仅打印。网格被改小（如删一个 authority 档
+    // → 54 成员）时测试依旧全绿，CI 的 2499 契约下限对此完全失明
+    expectEqual(memberCount, 81, "族网格 3×3×3×3 = 81 成员完整")
+    print("  [族汇总] 成员 \(memberCount) | 极限环违例 \(cycleViolations.count) | 安全违例 \(safetyViolations.count) | hold 违例 \(holdViolations.count)")
     // DoD-9：过冲按 τ/权限 分组（τ 自适应决策的数据）。直接在成员循环里带元数据
     // 记录（避免从名字字符串反解析——τ 是多字节字符，字符串解析脆弱）。
     var byTau: [Int: (sum: Double, max: Double, n: Int)] = [:]
@@ -295,7 +308,6 @@ func testFamilyScan() {
     if familyMinCycle < 90 {
         expect(false, "存在 <90s 的交还循环（\(String(format: "%.0f", familyMinCycle))s）——极限环复发")
     }
-    expect(sensorViolations.isEmpty, "无传感器违例")
     expect(safetyViolations.isEmpty, "全族温度 <105°C")
     expect(holdViolations.isEmpty, "可达成员 hold 误差 ≤8°")
 }
@@ -335,7 +347,7 @@ func testFamilyDefense() {
         expect(clean.maxTemp < 105 && !clean.nan,
                "\(m.name) 分项功耗不可用时闭环仍安全")
         // 语义分叉（v3.4 锁定）：反馈健康的 1350 启查线 = "命令转速低到停转无害则不管"。
-        // 热角（被动平衡 119°）：命令 RPM 高，停转必须被捕获——真保护。
+        // 热角（75W 被动平衡 33+1.3×75 = 130.5°）：命令 RPM 高，停转必须被捕获——真保护。
         // 凉角（被动平衡 74.5° < 目标）：命令 RPM 低，门控跳过 = 停转无害不报警——正确省心。
         if m.env > 30 {
             if !stall.stallCaught { allCaught = false }

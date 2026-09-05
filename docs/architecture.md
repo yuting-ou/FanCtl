@@ -56,4 +56,4 @@
 1. 本文件 + 对应文件头注释（踩坑史）
 2. `TestsFamily.swift`：81 成员参数化 HIL 扫描——调参前先重跑，确认不破全族鲁棒性
 3. `TestsAI.swift` VirtualMachine：单点闭环（防极限环/过冲）
-4. `fanctltests` 全绿是合并底线（当前 2488 断言）
+4. `fanctltests` 全绿是合并底线（断言数 ≥ 契约下限，实际数以 tests 徽章为准）

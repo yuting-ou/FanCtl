@@ -1,5 +1,5 @@
 // 测试按模块拆分（v3.3.1）：本文件为各模块共享的 harness 与主入口。
-// 断言/共享构造见 TestSupport.swift，各模块用例见 Tests*.swift。
+// 断言 harness 见 main.swift，共享构造（MockSMC/FakeClock/makeEngine）见 TestsEngine.swift 头部。
 import Foundation
 import SMCCore
 
@@ -1107,9 +1107,26 @@ func testThermalLearn() {
         q.setLastUpdated(bucket: TempHistogram.bucketIndex(for: 70), date: Date().addingTimeInterval(-20 * 86400))
         let decayed = q.decayStaleBuckets()
         expectEqual(decayed, 1, "衰减 1 个桶")
-        // 3/2=1（整数除法），1 < minSamples=3 → output 清零
-        expectEqual(q.samplesByBucket[TempHistogram.bucketIndex(for: 70)], 1, "样本 3→1")
+        // v3.6.1：3/2=1（整数除法），1 < minSamples=3 → output 与 samples 双清
+        //（原实现清 output 留 samples=1，复学首样本走 (0×1+p)/2 的幽灵 0 平均）
+        expectEqual(q.samplesByBucket[TempHistogram.bucketIndex(for: 70)], 0, "样本 3→0（双清）")
         expect(q.percent(for: 70) == nil, "样本 <3 时 percent 返回 nil（output 已清零）")
+    }
+
+    // v3.6.1: 幽灵 0 回归——过期桶双清后复学，首个新样本不得被"幽灵 0"拉低
+    do {
+        var q = ThermalLearn()
+        for _ in 0..<4 { q.record(temp: 85, percent: 85) }   // samples=4, output=85
+        q.setLastUpdated(bucket: TempHistogram.bucketIndex(for: 85), date: Date().addingTimeInterval(-20 * 86400))
+        _ = q.decayStaleBuckets()
+        // 旧行为：samples=2 保留、output=0 → 首样本 (0×2+85)/3 ≈ 28.3，1 样本即达 minSamples
+        // 采信伪低值 28%，系统性欠冷。新行为：双清 → 首样本即 85
+        q.record(temp: 85, percent: 85)
+        let v = q.outputByBucket[TempHistogram.bucketIndex(for: 85)]
+        expectClose(v, 85, 1e-9, "双清后复学首样本 = 85（无幽灵 0 拉低，得 \(v)）")
+        // 衰减后 updated 已推进：同一时间轴再次衰减不得重复减半
+        let second = q.decayStaleBuckets(now: Date().addingTimeInterval(86400))
+        expectEqual(second, 0, "衰减已标记 updated，14 天窗口内不重复衰减")
     }
 
     // v8: 场景桶同样衰减——旧场景经验（含手动污染/旧 target 数据）不再永存

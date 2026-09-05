@@ -100,6 +100,11 @@ public final class FanController {
         } else {
             // Intel: 置 FS! 对应位后写 F{n}Tg
             // 读取失败时不能默认 0，否则会清除其他风扇的强制位
+            // v3.6.1：id ≥ 16 时 1 << id 溢出 UInt16——强制位静默写丢（set）或
+            // UInt16(65536) runtime trap（restore，root 崩溃循环）。SMC FS! 只有 16 位
+            guard st.id < 16 else {
+                throw SMCError.smcResult("FS! ", 0xFE)
+            }
             guard let raw = try? smc.readDouble("FS! ") else {
                 throw SMCError.keyNotFound("FS! ")
             }
@@ -116,6 +121,10 @@ public final class FanController {
         if hasModeKey {
             try smc.writeDouble("F\(fan)Md", value: 0)
         } else {
+            // v3.6.1：同 setForcedRPM——fan ≥ 16 时 UInt16(1 << fan) runtime trap
+            guard fan < 16 else {
+                throw SMCError.smcResult("FS! ", 0xFE)
+            }
             guard let raw = try? smc.readDouble("FS! ") else {
                 throw SMCError.keyNotFound("FS! ")
             }
@@ -383,6 +392,11 @@ public final class TemperatureSensors {
     public func rescanAllSensorsBlocking(clockOverride: (() -> Date)? = nil) {
         let now = clockOverride?() ?? clock()
         let all = (try? smc.allKeys()) ?? []
+        // v3.6.1：瞬时 SMC 故障防御——allKeys() 抛错时 `?? []` 会把空结果当合法扫描，
+        // 把全部分类替换为空且 lastScanTime 前移 300s：唤醒窗口 IOKit 瞬时失败一次
+        // 即控制离线最长 5 分钟（所有温度读 0 → sensorUnavailable 交还系统）。
+        // 空扫描直接放弃，保留旧分类与旧时间戳，下次重扫自然重试
+        guard !all.isEmpty else { return }
         // 按前缀分类的辅助函数
         func floatKeys(prefixes: [String]) -> [String] {
             all.filter { k in

@@ -25,8 +25,13 @@ import SMCCore
 // 轮转：超过 512KB 时保留后半段重写（24小时守护长期运行，防日志无界增长）
 let LOG_PATH = FanCtlPaths.logFile.path
 let LOG_MAX_BYTES: UInt64 = 512 * 1024
-let logTimestampFormatter = ISO8601DateFormatter()   // 复用：每次新建开销不小（主队列串行，无竞争）
+let logTimestampFormatter = ISO8601DateFormatter()
+// v3.6.1：log 被 3 个队列并发调用（主控制拍 / 看门狗队列 / powermetrics 后台队列），
+// 轮转的读-改-写与并发 append 会互相覆盖丢行——整函数加锁
+let logLock = NSLock()
 func log(_ msg: String) {
+    logLock.lock()
+    defer { logLock.unlock() }
     let ts = logTimestampFormatter.string(from: Date())
     guard let data = "[\(ts)] \(msg)\n".data(using: .utf8) else { return }
     if let attrs = try? FileManager.default.attributesOfItem(atPath: LOG_PATH),

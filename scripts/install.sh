@@ -76,6 +76,10 @@ chmod 644 "$PLIST"
 launchctl bootstrap system "$PLIST"
 
 echo "==> 安装菜单栏 App..."
+# v3.6.1：升级时先停旧实例——不杀则旧进程持有已删除的 bundle 继续运行，
+# 出现双菜单栏图标且新旧实例互踩 config.json
+pkill -x FanCtl 2>/dev/null || true
+sleep 1
 rm -rf "/Applications/清风.app" /Applications/FanCtl.app
 cp -R "$DIST/FanCtl.app" "/Applications/清风.app"
 # 把 App bundle 属主改回实际登录用户（非 root）：此后仅改 UI 时可用 ./scripts/deploy.sh 免密替换，

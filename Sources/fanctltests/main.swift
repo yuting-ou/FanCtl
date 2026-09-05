@@ -224,8 +224,8 @@ func testOffsetsAndReadings() {
 // MARK: - v8 散热参数辨识模型（线性回归收敛）
 
 // MARK: - v2.7 环境温度谷值追踪（抗热浸泡内生性）
-// 注意：掌托/散热片读数带 10s TTL 展示缓存（内部用真实时钟，测试注入不了），
-// 快节奏测试下缓存值永不过期——本测试只用电池键（每拍新鲜读）驱动，语义等价。
+// 注：掌托/散热片读数带 10s TTL 展示缓存——cachedMax 走注入时钟（Fans.swift），
+// FakeClock 下缓存按测试时间轴正常过期；本测试为聚焦谷值语义只用电池键（每拍新鲜读）驱动。
 
 func testAmbientValley() {
     group("环境谷值估计")
@@ -422,6 +422,8 @@ testSMCBytes()
 testEngineWiring()
 testLearnSaturatedGate()
 testRescanAsync()
+testRescanEmptyScanDefense()
+testAdversarialFixes()
 print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
 let minAssertions = 2499

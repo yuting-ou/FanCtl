@@ -643,10 +643,12 @@ public struct DailyStats: Codable {
     // 数据底座（打破闭环自指）与未来“按负载个性化”的基础
     public var powerHistogram: [Double]?
 
+    // v3.6.1：分母加 1e-6 下限——手改 JSON 里 tempSeconds=1e-300 会让比值溢出为
+    // 巨数，下游 Int(avgTemp.rounded()) runtime trap（合法数据分母 ≥ 1s，下限无影响）
     public var avgTemp: Double {
-        tempSeconds > 0 ? tempSum / tempSeconds : (tempCount > 0 ? tempSum / tempCount : 0)
+        tempSeconds > 1e-6 ? tempSum / tempSeconds : (tempCount > 1e-6 ? tempSum / tempCount : 0)
     }
-    public var avgPower: Double { powerCount > 0 ? powerSum / powerCount : 0 }
+    public var avgPower: Double { powerCount > 1e-6 ? powerSum / powerCount : 0 }
 
     public init(date: String) {
         self.date = date
@@ -754,6 +756,30 @@ public struct DailyStats: Codable {
         try c.encode(aiCyclingGuards, forKey: .aiCyclingGuards)
         try c.encode(overshootPeak, forKey: .overshootPeak)
         try c.encodeIfPresent(powerHistogram, forKey: .powerHistogram)
+    }
+
+    // v3.6.1：从磁盘加载后的数值消毒（纯函数，daemon/App/测试同源）。
+    // 手改/损坏的 stats/history JSON 可携带 1e300 级有限值——avgTemp 计算后进
+    // Int(x.rounded()) 是 runtime trap（App 崩溃类，与 TempHistogram 的 NaN 防御同源）。
+    // 负值/非有限/超 1e7 均钳为 0；日期字段不处理（Formatter 对越界日期安全返回 nil）。
+    public func sanitized() -> DailyStats {
+        var s = self
+        func fin(_ v: Double) -> Double { v.isFinite && v >= 0 && v < 1e7 ? v : 0 }
+        s.maxTemp = fin(s.maxTemp)
+        s.highTempSeconds = fin(s.highTempSeconds)
+        s.tempSum = fin(s.tempSum)
+        s.tempCount = fin(s.tempCount)
+        s.revolutions = fin(s.revolutions)
+        s.powerSum = fin(s.powerSum)
+        s.powerCount = fin(s.powerCount)
+        s.tempSeconds = fin(s.tempSeconds)
+        s.quietSeconds = fin(s.quietSeconds)
+        s.speedChanges = fin(s.speedChanges)
+        s.aiCyclingGuards = fin(s.aiCyclingGuards)
+        s.overshootPeak = fin(s.overshootPeak)
+        s.tempHistogram = s.tempHistogram?.map(fin)
+        s.powerHistogram = s.powerHistogram?.map(fin)
+        return s
     }
 }
 
@@ -897,19 +923,17 @@ public enum ConfigStore {
     }
 
     public static func loadStats() -> DailyStats? {
-        guard let data = try? Data(contentsOf: FanCtlPaths.statsFile) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(DailyStats.self, from: data)
+        return loadCorruptionAware(DailyStats.self, from: FanCtlPaths.statsFile, name: "stats", decoder: decoder)?.sanitized()
     }
 
     // MARK: 历史战报（按天归档，保留 30 天）
 
     public static func loadHistory() -> [DailyStats] {
-        guard let data = try? Data(contentsOf: FanCtlPaths.historyFile) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode([DailyStats].self, from: data)) ?? []
+        return (loadCorruptionAware([DailyStats].self, from: FanCtlPaths.historyFile, name: "history", decoder: decoder) ?? []).map { $0.sanitized() }
     }
 
     @discardableResult
@@ -952,7 +976,9 @@ public enum ConfigStore {
 // MARK: - Status 变化摘要（纯函数，daemon 与测试共用）
 // 将传感器噪声级别的波动量化取整，仅当有实质变化时才触发磁盘写入。
 public func statusChangeSummary(_ s: DaemonStatus) -> String {
-    let r: (Double) -> Int = { Int($0.rounded()) }
+    // v3.6.1：NaN/Inf → 0。Int(NaN) 是 runtime trap（root 守护进程崩溃），
+    // actualRPM/targetRPM 来自 SMC flt 解码，固件垃圾数据可产生 NaN
+    let r: (Double) -> Int = { $0.isFinite ? Int($0.rounded()) : 0 }
     let fanParts = s.fans.map { "\($0.id):\(r($0.actualRPM/100)*100)>\(r($0.targetRPM/100)*100)" }
     let fanStr = fanParts.joined(separator: ",")
     let pctStr: String
@@ -975,6 +1001,13 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
     let learnStr = (s.learningRecently == true ? "L" : "-") + ":\(s.learnedPoints ?? 0)"
     let powerStr = s.powerWatts.map { String(r($0)) } ?? "-"
     let aiTargetStr = s.aiTargetEffective.map { String(r($0)) } ?? "-"
+    // v3.6.1：补齐此前遗漏的变化感知字段——掌托补偿/包络健康度单独变化时
+    // 此前不触发写盘，App/fanprobe 只能等 10s 心跳（learnEnvelopeGap 是 v3.6
+    // 观察指标，陈旧显示会误导自愈判断）。palmRest/heatsink 取整后噪声不敏感
+    let palmRestStr = s.sensors.palmRest.map { String(r($0)) } ?? "-"
+    let heatsinkStr = s.sensors.heatsink.map { String(r($0)) } ?? "-"
+    let palmCompStr = s.palmComp.map { String(r($0 * 10)) } ?? "-"
+    let envGapStr = s.learnEnvelopeGap.map { String(r($0)) } ?? "-"
     return [
         String(r(s.sensors.cpuDie)),
         String(r(s.sensors.gpuDie)),
@@ -994,6 +1027,10 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
         unreachStr,
         learnStr,
         powerStr,
-        aiTargetStr
+        aiTargetStr,
+        palmRestStr,
+        heatsinkStr,
+        palmCompStr,
+        envGapStr
     ].joined(separator: "|")
 }

@@ -123,6 +123,11 @@ final class NotificationService {
         let pipe = Pipe()
         p.standardOutput = pipe
         do { try p.run() } catch { return [] }
+        // v3.6.1：4s 强杀兜底——readDataToEndOfFile 无超时，ps 挂起时永久阻塞
+        //（上层 in-flight 标志的"4s 过期"只是允许新任务进来，线程本身从未被释放）
+        let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 4, execute: killer)
+        defer { killer.cancel() }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         guard let out = String(data: data, encoding: .utf8) else { return [] }

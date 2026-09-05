@@ -105,6 +105,11 @@ final class PowerCompositionSampler {
         // 不再 waitUntilExit 无限期阻塞后台线程
         if sema.wait(timeout: .now() + 5) == .timedOut {
             p.terminate()
+            // v3.6.1：SIGTERM 被忽略（D 状态/管道满）时升级 SIGKILL——否则
+            // waitUntilExit 永久阻塞后台线程，samplingInFlight 永不复位，采样静默停摆
+            if sema.wait(timeout: .now() + 2) == .timedOut {
+                kill(p.processIdentifier, SIGKILL)
+            }
             p.waitUntilExit()
             return (nil, nil)
         }

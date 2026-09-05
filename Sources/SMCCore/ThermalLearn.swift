@@ -55,7 +55,7 @@ public struct ThermalLearn: Equatable {
         scenarioBuckets = [:]
     }
 
-    public mutating func record(temp: Double, percent: Double) {
+    public mutating func record(temp: Double, percent: Double, now: Date = Date()) {
         let b = TempHistogram.bucketIndex(for: temp)
         // 防御 NaN/Inf：min(max(NaN, 0), 100) 在 Swift 中因 NaN 比较返回 false 而得到 0，
         // 但显式检查更清晰且不依赖隐式行为；理论上游调用方（controller.shape）已钳位，
@@ -69,12 +69,14 @@ public struct ThermalLearn: Equatable {
             outputByBucket[b] += Self.emaAlpha * (p - outputByBucket[b])
         }
         samplesByBucket[b] += 1
-        lastUpdatedByBucket[b] = Date()
+        lastUpdatedByBucket[b] = now
     }
 
     /// 按供电状态与功耗档记录经验；同时保留全局样本，以便新场景在样本不足时自然回退。
-    public mutating func record(temp: Double, percent: Double, onBattery: Bool, powerWatts: Double?) {
-        record(temp: temp, percent: percent)
+    /// now 走注入时钟（P7 单一来源），引擎传 hooks.now()，测试可注入 FakeClock。
+    public mutating func record(temp: Double, percent: Double, onBattery: Bool,
+                                powerWatts: Double?, now: Date = Date()) {
+        record(temp: temp, percent: percent, now: now)
         let key = currentScenarioKey(onBattery: onBattery, powerWatts: powerWatts)
         var buckets = scenarioBuckets[key] ?? ScenarioBuckets()
         let b = TempHistogram.bucketIndex(for: temp)
@@ -85,7 +87,7 @@ public struct ThermalLearn: Equatable {
             buckets.output[b] += Self.emaAlpha * (p - buckets.output[b])
         }
         buckets.samples[b] += 1
-        buckets.updated[b] = Date()
+        buckets.updated[b] = now
         scenarioBuckets[key] = buckets
     }
 
@@ -231,18 +233,18 @@ public struct ThermalLearn: Equatable {
     /// 只要样本 ≥3 就优先于全局经验，持续带偏 AI 前馈。
     public mutating func decayStaleBuckets(now: Date = Date()) -> Int {
         var decayed = decay(global: &outputByBucket, samples: &samplesByBucket,
-                            updated: lastUpdatedByBucket, now: now)
+                            updated: &lastUpdatedByBucket, now: now)
         for (key, var buckets) in scenarioBuckets {
             guard buckets.isValid else { continue }
             decayed += decay(global: &buckets.output, samples: &buckets.samples,
-                             updated: buckets.updated, now: now)
+                             updated: &buckets.updated, now: now)
             scenarioBuckets[key] = buckets
         }
         return decayed
     }
 
     private func decay(global output: inout [Double], samples: inout [Int],
-                       updated: [Date], now: Date) -> Int {
+                       updated: inout [Date], now: Date) -> Int {
         var decayed = 0
         let staleInterval = Self.staleDays * 86400
         for b in 0..<samples.count {
@@ -251,7 +253,12 @@ public struct ThermalLearn: Equatable {
                 samples[b] /= 2
                 if samples[b] < Self.minSamples {
                     output[b] = 0
+                    // v3.6.1 修复：与 sanitize 双清语义对齐——原实现清 output 留 samples，
+                    // 复学首样本走早期平均 (0×n+p)/(n+1)，被"幽灵 0"拉低 ~2/3，
+                    // 且 samples 已达 minSamples 直接采信伪低值，系统性欠冷
+                    samples[b] = 0
                 }
+                updated[b] = now   // v3.6.1：衰减即"已处理"，每 14 天窗口只衰减一次（重启不重复减半）
                 decayed += 1
             }
         }
@@ -356,9 +363,24 @@ extension ThermalLearn: Codable {
 // MARK: - 持久化（与 config/status 同目录，卸载随目录一并清理）
 
 extension ConfigStore {
+    /// v3.6.1：解码失败可观测协议——备份坏文件 + NSLog（与 loadConfig 同模式）。
+    /// 此前 `try?` 静默吞掉，数周学习数据损坏后无提示清零，用户无从察觉。
+    static func loadCorruptionAware<T: Decodable>(_ type: T.Type, from url: URL,
+                                                  name: String, decoder: JSONDecoder = JSONDecoder()) -> T? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        do {
+            return try decoder.decode(type, from: data)
+        } catch {
+            let backupPath = FanCtlPaths.supportDir
+                .appendingPathComponent("\(name).corrupted.\(Int(Date().timeIntervalSince1970)).json")
+            try? data.write(to: backupPath)
+            NSLog("fanctld: \(name) 损坏，已备份到 \(backupPath.path)（\(error.localizedDescription)）")
+            return nil
+        }
+    }
+
     public static func loadLearn() -> ThermalLearn? {
-        guard let data = try? Data(contentsOf: FanCtlPaths.learnFile) else { return nil }
-        return try? JSONDecoder().decode(ThermalLearn.self, from: data)
+        loadCorruptionAware(ThermalLearn.self, from: FanCtlPaths.learnFile, name: "learn")
     }
 
     @discardableResult
@@ -371,8 +393,7 @@ extension ConfigStore {
     }
 
     public static func loadAIMetrics() -> AIControlMetrics? {
-        guard let data = try? Data(contentsOf: FanCtlPaths.aiMetricsFile) else { return nil }
-        return try? JSONDecoder().decode(AIControlMetrics.self, from: data)
+        loadCorruptionAware(AIControlMetrics.self, from: FanCtlPaths.aiMetricsFile, name: "ai-metrics")
     }
 
     @discardableResult

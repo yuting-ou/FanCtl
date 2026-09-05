@@ -124,11 +124,19 @@ public struct SMCValue {
             guard bytes.count >= 2 else { return nil }
             let raw = Int16(bitPattern: UInt16(bytes[0]) << 8 | UInt16(bytes[1]))
             return Double(raw) / 256.0
-        case "ui8 ", "ui16", "ui32", "ui64", "si8 ", "si16":
+        case "ui8 ", "ui16", "ui32", "ui64":
             // SMC 整型约定为大端
             var v: UInt64 = 0
             for b in bytes.prefix(dataSize) { v = (v << 8) | UInt64(b) }
             return Double(v)
+        case "si8 ", "si16":
+            // v3.6.1：有符号类型按位型解码——此前并入无符号分支，负值变巨正值
+            var v: UInt64 = 0
+            for b in bytes.prefix(dataSize) { v = (v << 8) | UInt64(b) }
+            switch dataSize {
+            case 1: return Double(Int8(bitPattern: UInt8(truncatingIfNeeded: v)))
+            default: return Double(Int16(bitPattern: UInt16(truncatingIfNeeded: v)))
+            }
         default:
             return nil
         }
@@ -171,6 +179,12 @@ public final class SMCConnection: SMCIO {
     }
 
     private func call(_ input: inout SMCParamStruct) throws -> SMCParamStruct {
+        // v3.6.1：重扫后台队列（rescanQueue）与主队列控制拍共用同一 io_connect_t，
+        // IOConnectCallStructMethod 并发调用未定义（main.swift 看门狗注释自述"call 无锁
+        // 并发未定义"）。用既有 lock 串行化全部调用；keyInfo 的缓存段与 call 不嵌套，无死锁。
+        // 代价：全量重扫期间主拍读数最多等待单次 SMC 调用时长（亚毫秒级），可忽略。
+        lock.lock()
+        defer { lock.unlock() }
         var output = SMCParamStruct()
         var outputSize = MemoryLayout<SMCParamStruct>.stride
         let kr = IOConnectCallStructMethod(connection,

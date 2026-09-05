@@ -1,5 +1,5 @@
 // 测试按模块拆分（v3.3.1）：本文件为各模块共享的 harness 与主入口。
-// 断言/共享构造见 TestSupport.swift，各模块用例见 Tests*.swift。
+// 断言 harness 见 main.swift，共享构造（MockSMC/FakeClock/makeEngine）见 TestsEngine.swift 头部。
 import Foundation
 import SMCCore
 
