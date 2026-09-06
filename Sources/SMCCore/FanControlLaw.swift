@@ -78,7 +78,9 @@ public struct FanCurveController {
     // 入口统一钳位 [0,100]（与 slew 对齐）：损坏配置（sanitized 前的坏点）可能插值出越界值，
     // 透传会污染 lastAppliedPercent 导致风扇被钉满速
     public mutating func shape(target: Double, force: Bool = false) -> Double {
-        let t = max(0, min(100, target))
+        // v3.6.3：NaN 目标防御——min/max 对 NaN 的比较穿透会得到 100（满速），
+        // 显式钳 0（安全方向：不动风扇，由兜底接管）。上游决策已滤 NaN，双保险。
+        let t = target.isFinite ? max(0, min(100, target)) : 0
         if force {
             lastAppliedPercent = t
             return t
@@ -108,7 +110,7 @@ public struct FanCurveController {
     // 演化不受影响——温度误差持续存在时输出终将越过带缘，精度损失 ≤ 带宽×b。
     // force（安全事件）跳过一切限速/迟滞，瞬时写满。
     public mutating func slew(target: Double, force: Bool = false, hysteresis: Double = 0) -> Double {
-        var pct = max(0, min(100, target))   // 入口钳位（含 force 分支，与 shape 对齐）
+        var pct = target.isFinite ? max(0, min(100, target)) : 0   // 入口钳位（NaN→0，与 shape 对齐）
         if force {
             lastAppliedPercent = pct
             return pct

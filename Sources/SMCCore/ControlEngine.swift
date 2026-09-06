@@ -981,6 +981,10 @@ public final class ControlEngine {
             appliedPercent: appliedPercent,
             appliedPercents: appliedPercents.isEmpty ? nil : appliedPercents,
             fans: fanEntries,
+            // v3.6.3（模糊测试抓到的 F8）：timestamp 必须走注入时钟——默认参数
+            // Date() 是真实时钟，违反 hooks.now 单一来源（P7）；生产中 App 的
+            // 存活判定以 timestamp 对墙钟，拍内偏差无害，但仿真/测试时间轴全失真
+            timestamp: hooks.now(),
             onBattery: onBattery,
             batteryOverride: decision.batteryOverride,
             reason: faultActive ? nil : reason,

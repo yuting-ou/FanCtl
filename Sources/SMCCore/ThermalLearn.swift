@@ -167,6 +167,11 @@ public struct ThermalLearn: Equatable {
             }
             result = envelope
         }
+        // v3.6.3：读出侧钳位——record 双钳 [0,100]，但垃圾解码的持久化文件可携带
+        // 越界 output；先验外泄会绕过调用方 min(80) 前馈帽（夺回种子直接吃满）
+        if let r = result {
+            result = min(max(r, 0), 100)
+        }
         return result
     }
 

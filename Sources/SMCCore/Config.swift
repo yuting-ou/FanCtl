@@ -985,8 +985,10 @@ public enum ConfigStore {
 // 将传感器噪声级别的波动量化取整，仅当有实质变化时才触发磁盘写入。
 public func statusChangeSummary(_ s: DaemonStatus) -> String {
     // v3.6.1：NaN/Inf → 0。Int(NaN) 是 runtime trap（root 守护进程崩溃），
-    // actualRPM/targetRPM 来自 SMC flt 解码，固件垃圾数据可产生 NaN
-    let r: (Double) -> Int = { $0.isFinite ? Int($0.rounded()) : 0 }
+    // actualRPM/targetRPM 来自 SMC flt 解码，固件垃圾数据可产生 NaN。
+    // v3.6.3（模糊测试抓到）：1e308.isFinite == true，仍会 Int() 溢出 trap——
+    // 有限但超 Int.max 的值同样必须钳 0（TempHistogram 同型教训的第三例）
+    let r: (Double) -> Int = { $0.isFinite && $0 >= -9e18 && $0 <= 9e18 ? Int($0.rounded()) : 0 }
     let fanParts = s.fans.map { "\($0.id):\(r($0.actualRPM/100)*100)>\(r($0.targetRPM/100)*100)" }
     let fanStr = fanParts.joined(separator: ",")
     let pctStr: String

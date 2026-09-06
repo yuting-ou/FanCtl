@@ -237,8 +237,10 @@ func testPipeline() {
                 let tag = "s\(Int(smoothed))/n\(Int(nand))/r\(Int(raw))"
                 if raw >= FanPipeline.failsafeTemp {
                     expectEqual(r.targetPercent, 100, "扫描·兜底必全速 \(tag)")
-                } else if nand >= FanPipeline.ssdGuardTemp {
-                    let floor = nand >= FanPipeline.ssdCriticalTemp ? 100.0 : 60.0
+                } else if nand >= 70 {
+                    // v3.6.3：期望值用字面量（78/100/60），禁止从实现常量反推——
+                    // 原写法在 ssdCriticalTemp 被变异时期望值同步变化，变异体存活（循环论证）
+                    let floor = nand >= 78 ? 100.0 : 60.0
                     expect((r.targetPercent ?? -1) >= floor, "扫描·SSD 托底必保住 \(tag)")
                 }
             }

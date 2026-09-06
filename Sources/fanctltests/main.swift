@@ -424,6 +424,10 @@ testLearnSaturatedGate()
 testRescanAsync()
 testRescanEmptyScanDefense()
 testAdversarialFixes()
+testSafetyThresholdBoundaries()
+testMetamorphicProperties()
+testGarbageCodable()
+testChaosTimelines()
 print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
 let minAssertions = 2499
