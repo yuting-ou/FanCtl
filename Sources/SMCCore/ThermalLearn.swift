@@ -222,6 +222,84 @@ public struct ThermalLearn: Equatable {
 
     public var sampleTotal: Int { samplesByBucket.reduce(0, +) }
 
+    /// 采信桶快照结构（v3.7 学习地图 / 冻结曲线共用）
+    public struct LearnedPoint: Codable, Equatable, Identifiable {
+        public var temp: Double      // 桶中值温度 °C（同时是图表 Identifiable 的 id）
+        public var percent: Double   // 学习输出（单调包络修正后，实际生效值）
+        public var samples: Int      // 置信度（桶内累计样本数）
+        public var id: Double { temp }
+        public init(temp: Double, percent: Double, samples: Int) {
+            self.temp = temp; self.percent = percent; self.samples = samples
+        }
+    }
+
+    /// v3.7（P1 冻结曲线）：把采信桶快照转成 5 点用户曲线（CurvePoint 数组）。
+    /// 语义：AI 稳态经验的快照——不含 PD 微调/前馈/压不住检测，冻结后表现可能
+    /// 与 AI 有差异（文案必须写"快照"，不承诺效果）。
+    /// 边界锚点从 baseCurve 继承（用户已接受的曲线两端语义），内部点按温度升序
+    /// 从采信桶采样（≥5 桶均匀采 3 个中间点；<5 桶全取）；输出钳 [0,100]；
+    /// 相邻点间隔 <1.5° 时丢弃后者（曲线编辑器最小间距约束）。
+    /// baseCurve 少于 2 点或 points 少于 2 个采信桶 → nil（调用方禁用按钮）。
+    public static func freezeCurve(from points: [LearnedPoint],
+                                   baseCurve: [CurvePoint]) -> [CurvePoint]? {
+        let trusted = points.filter { $0.samples >= minSamples && $0.percent.isFinite }
+        guard trusted.count >= 2 else { return nil }
+        var sortedBase = baseCurve.sorted { $0.temp < $1.temp }
+        guard let lowAnchor = sortedBase.first, let highAnchor = sortedBase.last,
+              highAnchor.temp > lowAnchor.temp else { return nil }
+
+        // 内部点：温度升序、钳到锚点区间内
+        var inner = trusted
+            .map { CurvePoint(temp: max(lowAnchor.temp, min(highAnchor.temp, $0.temp)),
+                              percent: max(0, min(100, $0.percent))) }
+            .sorted { $0.temp < $1.temp }
+        // 均匀采 ≤3 个内部点
+        if inner.count > 3 {
+            let step = Double(inner.count - 1) / 3.0
+            inner = (0...3).map { i in inner[min(inner.count - 1, Int((Double(i) * step).rounded()))] }
+        }
+        // 最小间距过滤（丢弃与前一保留点 <1.5° 的点），含锚点在内统一处理
+        var all = [lowAnchor] + inner + [highAnchor]
+        var result: [CurvePoint] = []
+        for p in all {
+            if let last = result.last, p.temp - last.temp < 1.5 { continue }
+            result.append(p)
+        }
+        // 过滤后若不足 2 点（极端拥挤），回退两端锚点
+        if result.count < 2 {
+            result = [lowAnchor, highAnchor]
+        }
+        // 曲线编辑器域约束 [46, 90]（与 CurveOptimizer.shape 一致）+ 0.5° 步进
+        return result.map { CurvePoint(temp: max(46, min(90, ($0.temp * 2).rounded() / 2)),
+                                       percent: max(0, min(100, $0.percent))) }
+    }
+
+    /// v3.7（P3 学习地图 / P1 冻结曲线）：全部采信桶的快照，按温度升序。
+    /// percent 取单调包络修正后的实际生效值（与 percent(for:) 查表语义一致），
+    /// 不是原始 EMA——用户看到的必须是控制器真正在用的数。
+    /// 纯函数，无副作用；空表返回 []。
+    public func learnedPoints() -> [LearnedPoint] {
+        var points: [LearnedPoint] = []
+        for b in 0..<samplesByBucket.count where samplesByBucket[b] >= Self.minSamples {
+            // 包络修正复用 percent(for:) 的逻辑（只对本桶查即可：桶本身已采信，
+            // 但 ≥75° 段需应用运行最大值修正才是实际生效值）
+            var effective = outputByBucket[b]
+            if TempHistogram.midTemp(of: b) >= Self.monotonicFloorTemp {
+                var i = b - 1
+                while i >= 0 {
+                    if samplesByBucket[i] >= Self.minSamples {
+                        effective = max(effective, outputByBucket[i])
+                    }
+                    i -= 1
+                }
+            }
+            points.append(LearnedPoint(temp: TempHistogram.midTemp(of: b),
+                                       percent: min(max(effective, 0), 100),
+                                       samples: samplesByBucket[b]))
+        }
+        return points
+    }
+
     // 已"学会"的温度桶数（样本达到采信阈值）——UI"已学 N 个温度点"展示此值；
     // sampleTotal 是样本总数（一个桶可攒几百条），不适合当"温度点"展示
     public var learnedBucketCount: Int {

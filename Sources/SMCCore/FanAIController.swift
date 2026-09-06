@@ -178,6 +178,8 @@ public struct AIController {
     private var cyclingGuardRemaining: Double = 0       // 抑制期倒计时
     private var cyclingBackoffMul: Double = 1           // v3.1 退避倍率（连续循环翻倍，可持续释放归位）
     public private(set) var cyclingGuardArmed = false   // 抑制是否武装中（引擎边沿日志用）
+    /// v3.7 决策透镜：抑制期剩余秒数（0 = 未抑制）。只读视图，不改变状态语义
+    public var cyclingGuardRemainingSeconds: Double { cyclingGuardRemaining }
     public private(set) var currentGuardSeconds: Double = 0 // 最近一次武装的抑制时长（日志/测试用）
 
     public init(tuning: AITuning = AITuning()) { self.tuning = tuning }

@@ -320,6 +320,23 @@ public struct FanStatusEntry: Codable {
     }
 }
 
+/// v3.7 决策透镜：AI 模式的可解释性快照。全部是引擎每拍已有状态的转述——
+/// 纯展示数据，零控制语义。字段随版本可增（Optional 前向兼容）。
+public struct DecisionTrace: Codable, Equatable {
+    public var target: Double?        // AI 有效目标温度（环境/夜间/电池叠加后）
+    public var temp: Double?          // 平滑后温度（决策输入）
+    public var error: Double?         // temp − target（正=偏热）
+    public var learned: Double?       // 当前温度学习查表值（nil=无数据/未采信）
+    public var idle: Bool?            // 空闲交还中（风扇归系统调度）
+    public var hysteresisHold: Bool?  // 输出在迟滞带内保持（写入延迟而非不动）
+    public var guardSeconds: Double?  // 启停循环抑制剩余秒数（>0 = 抑制中）
+    public init(target: Double?, temp: Double?, error: Double?, learned: Double?,
+                idle: Bool?, hysteresisHold: Bool?, guardSeconds: Double?) {
+        self.target = target; self.temp = temp; self.error = error; self.learned = learned
+        self.idle = idle; self.hysteresisHold = hysteresisHold; self.guardSeconds = guardSeconds
+    }
+}
+
 public struct DaemonStatus: Codable {
     public var sensors: SensorReadings
     public var mode: FanMode
@@ -352,6 +369,11 @@ public struct DaemonStatus: Codable {
                                           // App 展示“体感补偿 −N°”胶囊；无/未启用为 nil
     public var learnEnvelopeGap: Double? // v3.6 学习图单调包络健康度（°C 差值，仅展示/观察）：
                                          // 高温段 max(更低采信桶 − 本桶 EMA)；→0=已自愈。旧版无此字段为 nil
+    // v3.7 学习地图/冻结曲线：采信桶快照（升序；仅 AI 模式且学习样本变化时更新——引擎节流）。
+    // Optional：旧 daemon 无此字段，App 显示空态
+    public var learnMap: [ThermalLearn.LearnedPoint]?
+    // v3.7 决策透镜：AI 模式"为什么是这个转速"的可解释快照（全 Optional，旧版兼容）
+    public var decisionTrace: DecisionTrace?
     public var cpuTemp: Double { sensors.cpuDie }
     public var gpuTemp: Double { sensors.gpuDie }
 
@@ -374,7 +396,9 @@ public struct DaemonStatus: Codable {
                 envTemp: Double? = nil,
                 aiTargetEffective: Double? = nil,
                 palmComp: Double? = nil,
-                learnEnvelopeGap: Double? = nil) {
+                learnEnvelopeGap: Double? = nil,
+                learnMap: [ThermalLearn.LearnedPoint]? = nil,
+                decisionTrace: DecisionTrace? = nil) {
         self.sensors = sensors
         self.mode = mode
         self.appliedPercent = appliedPercent
@@ -400,6 +424,13 @@ public struct DaemonStatus: Codable {
         self.envTemp = envTemp
         self.aiTargetEffective = aiTargetEffective
         self.palmComp = palmComp
+        // v3.6.3 审查发现（F9）：此处曾漏掉 learnEnvelopeGap 的成员赋值——Optional
+        // 存储属性默认 nil，init 参数被静默吞掉，v3.6.0 起包络健康度在 status.json
+        // 里从未出现过（fanprobe/App 仪表整版静默失效）。Optional 字段同样必须在
+        // init 里显式赋值——"没赋值"与"值为 nil"语义不同。
+        self.learnEnvelopeGap = learnEnvelopeGap
+        self.learnMap = learnMap
+        self.decisionTrace = decisionTrace
     }
 
     // 旧版便利初始化（保持源码兼容）
@@ -434,6 +465,7 @@ public struct DaemonStatus: Codable {
         case targetUnreachable, powerWatts, nightOverride, envTemp
         case aiTargetEffective
                 case palmComp, learnEnvelopeGap // 旧字段
+        case learnMap, decisionTrace
         case cpuTemp, gpuTemp
     }
 
@@ -478,6 +510,8 @@ public struct DaemonStatus: Codable {
         self.aiTargetEffective = try container.decodeIfPresent(Double.self, forKey: .aiTargetEffective)
         self.palmComp = try container.decodeIfPresent(Double.self, forKey: .palmComp)
         self.learnEnvelopeGap = try container.decodeIfPresent(Double.self, forKey: .learnEnvelopeGap)
+        self.learnMap = try container.decodeIfPresent([ThermalLearn.LearnedPoint].self, forKey: .learnMap)
+        self.decisionTrace = try container.decodeIfPresent(DecisionTrace.self, forKey: .decisionTrace)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -508,6 +542,8 @@ public struct DaemonStatus: Codable {
         try container.encodeIfPresent(aiTargetEffective, forKey: .aiTargetEffective)
         try container.encodeIfPresent(palmComp, forKey: .palmComp)
         try container.encodeIfPresent(learnEnvelopeGap, forKey: .learnEnvelopeGap)
+        try container.encodeIfPresent(learnMap, forKey: .learnMap)
+        try container.encodeIfPresent(decisionTrace, forKey: .decisionTrace)
         // 同时写旧字段，保证回滚到旧版本 App/daemon 时也能读
         try container.encode(sensors.cpuDie, forKey: .cpuTemp)
         try container.encode(sensors.gpuDie, forKey: .gpuTemp)
