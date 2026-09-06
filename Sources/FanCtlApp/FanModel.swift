@@ -693,6 +693,9 @@ final class FanModel: ObservableObject {
             if Date().timeIntervalSince(entered) >= 30 && !aiBaselineTemps.isEmpty {
                 let avg = aiBaselineTemps.reduce(0, +) / Double(aiBaselineTemps.count)
                 aiRecommendedTarget = avg <= 68 ? 72 : (avg < 73 ? 76 : 80)
+                // v3.6.2（F3）：推荐已产出即停止采样——原实现 learnedPoints==0 期间
+                // 每 12s 无限追加（学习停滞/daemon 离线时 O(n²) 增长）
+                aiModeEnteredAt = nil
             }
         }
 

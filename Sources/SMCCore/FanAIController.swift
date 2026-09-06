@@ -69,10 +69,12 @@ public struct AITuning: Equatable {
     public var anchorStepPercent: Double = 1.5   // %：每步最大幅度
     public var anchorProbeSeconds: Double = 25   // s：探测间隔（≈热时间常数，让每步效果显现）
     public var anchorInnerMargin: Double = 1.0   // °C：带内安全区半宽（|error| ≥ band−margin 停步）
-    // 锚定保持时间：温度离开舒适区后保持 N 拍不执行锚定，防 PD 收敛耦合振荡。
-    // 物理依据：5 拍 × 3s = 15s 冷却窗口，PD kP=1.5 在 2° 误差下每拍推动 ~3%，
+    // 锚定保持时间：温度离开舒适区后保持一段时间不执行锚定，防 PD 收敛耦合振荡。
+    // 物理依据：15s 冷却窗口（=旧 5 拍 × 3s），PD kP=1.5 在 2° 误差下每拍推动 ~3%，
     // 15s 足以让 PD 独立收敛到舒适区而不被锚定拉回。
-    public var anchorHoldTicks: Int = 5
+    // v3.6.2（F4）：拍数→秒基——1s 快拍下 5 拍只有 5s，冷却窗缩水 3 倍；
+    // 秒基在自适应间隔下语义恒定，dt=3 时与旧行为严格等价。
+    public var anchorHoldSeconds: Double = 15
     // 双通路功耗前馈：信号（真实负载 30W 突增）与噪声（PSTR/PDTR ±2W）幅度差 15 倍，
     // 单一 EMA 必然顾此失彼——EMA(α=0.4) 单拍只捕获 40% 增量，30W 突增被压到 12W。
     // 分两路并行处理：
@@ -102,8 +104,10 @@ public struct AITuning: Equatable {
                                                // 语义：被动升温不破目标 = 风扇不该转；只有被动散热
                                                // 压不住目标才接管。实测停转被动平衡温度可达 74-75°，
                                                // 夺回线若低于目标（如 target−3）在该机器上必然极限环
-    public var idleReclaimHold: Int = 2        // 夺回条件需连续 2 拍成立（滤单拍毛刺；交还期间
-                                               // 系统调度兜着，夺回晚几秒无安全风险）
+    // v3.6.2（F4）：2 拍确认→5s 秒基（=旧 2 拍 × 3s 标称）。滤单拍毛刺的本意是
+    // "过线须持续一段真实时长"；1s 快拍下 2 拍只有 2s，确认窗缩水。交还期间
+    // 系统调度兜着，夺回晚几秒无安全风险。
+    public var reclaimConfirmSeconds: Double = 5.0
     public var idleReclaimSlopePerSec: Double = 0.27  // 或涨幅 ≥0.27°/s → 负载突增夺回
     public var idleReclaimGraceSeconds: Double = 60   // 释放后 60s 宽限：斜率夺回暂停——停转瞬态
                                                // 升温（冲向被动平衡温度）与负载 onset 同形，不宽限则
@@ -164,10 +168,10 @@ public struct AIController {
     private var smoothedPowerWatts: Double?  // 功耗 EMA 平滑值（抑制 PSTR 传感器 ±2W 噪声）
     private var lastSlopeRate: Double = 0        // 最近一拍的温度变化率（°C/s），供 intent() 使用
     private var idleSeconds: Double = 0
-    private var reclaimTicks = 0          // 夺回条件连续成立拍数
+    private var overSeconds: Double = 0   // v3.6.2（F4）：夺回条件持续成立秒数（原拍数）
     private var secondsSinceReclaim = Double.infinity   // 距上次夺回（振荡冷却用）
     private var graceSeconds = Double.infinity          // 距释放（斜率夺回宽限用）
-    private var ticksSinceComfortExit: Int = 0  // 距上次离开舒适区的拍数（锚定保持用）
+    private var secondsSinceComfortExit: Double = 0  // 距上次离开舒适区的秒数（锚定保持用）
     private var secondsSinceAnchorStep: Double = .infinity  // 距上次锚定步进（探测节奏用；infinity=从未步进，允许立即首步）
     // v2.9.2 启停循环抑制状态
     private var secondsSinceRelease: Double = .infinity // 距上次释放（循环判定用）
@@ -249,13 +253,13 @@ public struct AIController {
             let over = temp >= tuning.targetTemp - tuning.idleReclaimAbove
             let inGrace = graceSeconds <= tuning.idleReclaimGraceSeconds
             let surging = slopeRate >= tuning.idleReclaimSlopePerSec && !inGrace
-            reclaimTicks = over ? reclaimTicks + 1 : 0
+            overSeconds = over ? overSeconds + dt : 0
             // 斜率夺回单拍生效但避开释放宽限期（停转瞬态与负载同形）；
             // 温度过线仍需连续 2 拍（慢爬升可能是停转后的平衡温升，要确认）
-            if !allowRelease || surging || reclaimTicks >= tuning.idleReclaimHold {
+            if !allowRelease || surging || overSeconds >= tuning.reclaimConfirmSeconds {
                 idleReleased = false
                 idleSeconds = 0
-                reclaimTicks = 0
+                overSeconds = 0
                 secondsSinceReclaim = 0
                 // v2.9.2/v3.1 循环判定：释放后短时间内即被夺回 = 停转不可持续（被动热浸泡
                 // 平衡高于夺回线）→ 武装抑制期（指数退避），期间保持最低转速不交还。
@@ -298,9 +302,9 @@ public struct AIController {
         let clampedError = abs(error) <= tuning.comfortBand ? 0 : error
         // 锚定保持计数：离开舒适区时重置，进入后逐拍递增
         if abs(error) > tuning.comfortBand {
-            ticksSinceComfortExit = 0
+            secondsSinceComfortExit = 0
         } else {
-            ticksSinceComfortExit += 1
+            secondsSinceComfortExit += dt
         }
 
         // anti-windup：output 饱和时跳过同向 P 项（不继续向上推已饱和的 output）。
@@ -328,7 +332,7 @@ public struct AIController {
         // 落点都能向曲线方向修正，只以"不把温度拉出舒适带"为界（两个设定点不再抢执行器）。
         // 曲线差距 ≤ 带宽容忍（innerEdge/b）→ 完整收敛到曲线；差距更大 → 停在带内沿。
         if clampedError == 0 && clampedSlope == 0
-           && ticksSinceComfortExit >= tuning.anchorHoldTicks, let cp = curvePercent {
+           && secondsSinceComfortExit >= tuning.anchorHoldSeconds, let cp = curvePercent {
             let diff = cp - output
             let innerEdge = tuning.comfortBand - tuning.anchorInnerMargin
             let safeUp = error > -innerEdge    // 拉向上（降温）：温度会向带底走，需留裕量
@@ -451,10 +455,10 @@ public struct AIController {
         lastSlopeRate = 0
         idleReleased = false
         idleSeconds = 0
-        reclaimTicks = 0
+        overSeconds = 0
         secondsSinceReclaim = .infinity
         graceSeconds = .infinity
-        ticksSinceComfortExit = 0
+        secondsSinceComfortExit = 0
         secondsSinceAnchorStep = .infinity
         secondsSinceRelease = .infinity
         cyclingGuardRemaining = 0

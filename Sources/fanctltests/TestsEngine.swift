@@ -530,10 +530,15 @@ func testAdversarialFixes() {
     // 场景：55° 稳态起步，负载突增到 72°（未达 hot 80°，无兜底/托底），
     // 设计意图是 |ΔT|>3° → 1s 快速轮询；修复前 tempChange 恒 0，永远走不到
     do {
+        // v3.6.2 事故修复：本块曾漏建测试环境，saveConfig 把默认配置写进了真实
+        // /Library config.json（daemon 热加载后用户从 AI 模式被切到 curve）。
+        // 引擎级测试凡触碰 ConfigStore 必须先 engineTestEnv——此教训入 EVOLUTION
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
         let smc = makeFanSMC(); smc.set("Tp01", 55); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
-        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         engine.beat()   // 建基线 prevRawTemp=55
         clock.advance(3)
@@ -542,6 +547,8 @@ func testAdversarialFixes() {
         // 本拍 computeNextInterval 读到的 prevRawTemp 应为 55（修复前已被覆盖为 72 → tempChange=0）
         let sched = col.schedules.last ?? 0
         expectEqual(sched, LOOP_INTERVAL_MIN, "温升 +17° 单拍触发 1s 快速轮询（tempChange 非死代码，得 \(sched)s）")
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
     }
 
     // —— P1-2：slew 迟滞带 0/100 边界豁免（97% 永久卡死 + 压不住检测失灵）——
@@ -660,6 +667,88 @@ func testAdversarialFixes() {
         var gap = base
         gap.learnEnvelopeGap = 0
         expect(statusChangeSummary(gap) != v1, "包络健康度变化触发摘要变化")
+    }
+
+    // —— F1/F7：loadModel 损坏可观测 + 备份保留上限 ——
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        FanCtlPaths.ensureDirectories()   // 引擎测试不经过 loadConfig 时目录尚未创建
+        try? "{\"broken\": true}".write(to: FanCtlPaths.modelFile, atomically: true, encoding: .utf8)
+        expect(ConfigStore.loadModel() == nil, "损坏模型文件返回 nil（修复前静默同效但无备份）")
+        var backups = ((try? FileManager.default.contentsOfDirectory(atPath: FanCtlPaths.supportDir.path)) ?? [])
+            .filter { $0.hasPrefix("thermal-model.corrupted.") }
+        expectEqual(backups.count, 1, "损坏模型文件已备份（可观测协议）")
+        for i in 0..<6 {
+            try? "{\"broken\": \(i)}".write(to: FanCtlPaths.modelFile, atomically: true, encoding: .utf8)
+            _ = ConfigStore.loadModel()
+            usleep(2_000)   // 毫秒级文件名去重：保证每次备份时间戳唯一
+        }
+        backups = ((try? FileManager.default.contentsOfDirectory(atPath: FanCtlPaths.supportDir.path)) ?? [])
+            .filter { $0.hasPrefix("thermal-model.corrupted.") }.sorted()
+        expectEqual(backups.count, 5, "备份保留上限 5 个（实际 \(backups.count)）")
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    }
+
+    // —— F4：reclaim 确认窗秒基（dt=3 与旧 2 拍等价；dt=1 不缩水）——
+    do {
+        // dt=3：过线第 1 拍（3s < 5s）不夺回，第 2 拍（6s ≥ 5s）夺回 = 旧行为
+        var a = AIController()
+        a.tuning.targetTemp = 76
+        for _ in 0..<41 { _ = a.step(temp: 67, dt: 3) }   // 123s 常规释放（≤68 且输出低位）
+        expect(a.step(temp: 67, dt: 3) == nil, "常温释放已交还（nil）")
+        // 缓升 0.7°/拍（0.233°/s < 0.27 斜率夺回线）到过线，避免触发 surging 旁路
+        var t = 67.0
+        var reclaimedAt: Int? = nil
+        for i in 1...30 {
+            t = min(80, t + 0.7)
+            if a.step(temp: t, dt: 3) != nil { reclaimedAt = i; break }
+        }
+        expect(reclaimedAt != nil, "过线后最终夺回")
+        // 76−67=9° / 0.7 ≈ 13 拍爬升 + 过线 2 拍夺回 ≈ 15 拍内
+        expect((reclaimedAt ?? 99) <= 16, "dt=3 过线 2 拍确认夺回（得第 \(reclaimedAt ?? -1) 拍）")
+
+        // dt=1：确认窗仍为 5s（旧拍数语义会缩水成 2s = 2 拍）
+        var b = AIController()
+        b.tuning.targetTemp = 76
+        for _ in 0..<121 { _ = b.step(temp: 67, dt: 1) }   // 121s 常规释放
+        expect(b.step(temp: 67, dt: 1) == nil, "dt=1 释放已交还")
+        t = 67.0
+        var overBeats = 0
+        var reclaimed1s = false
+        for _ in 1...60 {
+            t = min(80, t + 0.2)   // 0.2°/s < 0.27 斜率线
+            if b.step(temp: t, dt: 1) != nil { reclaimed1s = true; break }
+            if t >= 76 { overBeats += 1 }
+        }
+        expect(reclaimed1s, "dt=1 过线后夺回")
+        expect(overBeats >= 4, "dt=1 确认窗 ≥5 拍（秒基不缩水，过线拍数 \(overBeats)）")
+    }
+
+    // —— F5：超远 horizon 忽略（静音不封顶 + 冲刺恢复 auto）——
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        let farFuture = Date().addingTimeInterval(400 * 86400)
+        // 静音：curve 模式 80° 目标远超 cap 30 → 修复前 reason=.quiet，修复后 .curve
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced,
+                                         quietUntil: farFuture, quietCapPercent: 30,
+                                         envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 80); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.reason, .curve, "400 天后过期的静音承诺不封顶")
+        // 冲刺：manual 100% + 远期 boostUntil → 视为已过期，交还 auto
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 100,
+                                         boostUntil: farFuture,
+                                         envCompensation: false))
+        engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.reason, .auto, "异常久远的冲刺截止视为过期（交还系统）")
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
     }
 }
 

@@ -104,6 +104,7 @@ public final class ControlEngine {
     var targetUnreachableSince: Date? = nil
     var targetUnreachableLogged = false
     var boostExpiredLogged = false
+    var horizonWarned: Set<String> = []   // v3.6.2（F5）：异常久远截止时间只告警一次
     var lastProbeTime = Date.distantPast
     var probeVerifyLoops = 0
     var stuckDetector = StuckSensorDetector()       // v2.8 传感器卡死一致性门
@@ -251,6 +252,21 @@ public final class ControlEngine {
 
     // MARK: - 每拍主逻辑（原 runControlLoop 逐行迁入）
 
+    /// v3.6.2（F5）：截止时间卫生。App 正常只写 15/30 分钟；超过 24h 的 horizon
+    /// 只可能来自手改/损坏的 config.json——不忽略会把静音封顶/冲刺全速钉死数年。
+    /// 冲刺侧由调用方把"异常"并入过期路径（恢复 auto），静音侧视为未设置。
+    private func saneHorizon(_ date: Date?, label: String) -> Date? {
+        guard let d = date else { return nil }
+        if d.timeIntervalSince(hooks.now()) > 24 * 3600 {
+            if !horizonWarned.contains(label) {
+                horizonWarned.insert(label)
+                hooks.log("\(label)截止时间异常久远（\(d)），已忽略——正常写入 ≤30 分钟")
+            }
+            return nil
+        }
+        return d
+    }
+
     public func beat(fastConfigApply: Bool = false) {
         touchHeartbeat()   // 看门狗心跳：主队列仍在处理事件即为存活信号
         if isSuspendedForSleep { return }
@@ -329,7 +345,10 @@ public final class ControlEngine {
         // boostUntil 过期 → 本拍起视为 auto 交还系统，直到 App 恢复并写入新配置。
         // 不修改 config 本身：App 重启后 init 仍能按 UserDefaults 恢复冲刺前状态。
         var effectiveConfig = config
-        if let until = config.boostUntil, hooks.now() >= until, config.mode == .manual {
+        let saneBoostUntil = saneHorizon(config.boostUntil, label: "冲刺")
+        let boostExpired = config.boostUntil != nil
+            && (saneBoostUntil == nil || hooks.now() >= saneBoostUntil!)
+        if boostExpired, config.mode == .manual {
             effectiveConfig.mode = .auto
             if !boostExpiredLogged {
                 hooks.log("冲刺超时已过，交还系统调度（等待 App 恢复）")
@@ -503,9 +522,14 @@ public final class ControlEngine {
                     + (nightActive && config.quietHours ? 4 : 0)
                     - palmComp))
             : (config.aiTargetTemp ?? 76)
-        // 静音承诺生效判定（hoist：AI 空闲交还抑制与评测排除共用同一判定）
-        let quietActive = config.quietUntil != nil && config.quietCapPercent != nil
-            && hooks.now() < config.quietUntil!
+        // 静音承诺生效判定（hoist：AI 空闲交还抑制与评测排除共用同一判定）。
+        // v3.6.2（F5）：异常久远的 quietUntil 视为未设置
+        let saneQuietUntil = saneHorizon(config.quietUntil, label: "静音承诺")
+        let quietActive = saneQuietUntil != nil && config.quietCapPercent != nil
+            && hooks.now() < saneQuietUntil!
+        // 管线 decide() 内部有独立的 quiet 判定——把消毒后的 horizon 下传，
+        // 否则引擎判无效而管线仍按原值封顶（两条判定路径必须同源）
+        effectiveConfig.quietUntil = saneQuietUntil
         if effectiveConfig.mode == .ai {
             aiController.tuning.targetTemp = aiTargetEff
             // 曲线插值：AI 的期望转速基准（v9 曲线锚定/种子/前馈共用）。fastConfigApply 也计算，

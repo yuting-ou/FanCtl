@@ -365,15 +365,25 @@ extension ThermalLearn: Codable {
 extension ConfigStore {
     /// v3.6.1：解码失败可观测协议——备份坏文件 + NSLog（与 loadConfig 同模式）。
     /// 此前 `try?` 静默吞掉，数周学习数据损坏后无提示清零，用户无从察觉。
+    /// v3.6.2：备份保留最近 5 个——损坏+重启循环下时间戳备份无限累积（F7）
     static func loadCorruptionAware<T: Decodable>(_ type: T.Type, from url: URL,
                                                   name: String, decoder: JSONDecoder = JSONDecoder()) -> T? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         do {
             return try decoder.decode(type, from: data)
         } catch {
+            // 毫秒精度：秒级时间戳在同秒内多次损坏时互相覆盖（测试也会因此不稳定）
             let backupPath = FanCtlPaths.supportDir
-                .appendingPathComponent("\(name).corrupted.\(Int(Date().timeIntervalSince1970)).json")
+                .appendingPathComponent("\(name).corrupted.\(Int(Date().timeIntervalSince1970 * 1000)).json")
             try? data.write(to: backupPath)
+            // 只保留同前缀最新 5 个备份（文件名含 epoch 秒，字典序=时间序）
+            let prefix = "\(name).corrupted."
+            if let entries = try? FileManager.default.contentsOfDirectory(atPath: FanCtlPaths.supportDir.path) {
+                let olds = entries.filter { $0.hasPrefix(prefix) }.sorted().dropLast(5)
+                for old in olds {
+                    try? FileManager.default.removeItem(at: FanCtlPaths.supportDir.appendingPathComponent(old))
+                }
+            }
             NSLog("fanctld: \(name) 损坏，已备份到 \(backupPath.path)（\(error.localizedDescription)）")
             return nil
         }

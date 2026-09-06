@@ -163,8 +163,8 @@ sigintSource.resume()
 // 无人兜底，而 KeepAlive 只管进程退出不管挂起——这是唯一让全部防线同时失效的故障。
 // 独立队列看门狗：>60s 无心跳即写 exit-reason 后 exit(9)，由 launchd KeepAlive 重启，
 // 启动清理逻辑接管 SMC。心跳用单调时钟（DispatchTime，睡眠期冻结，NTP 阶跃不触发）。
-// 故意不在 watchdog 线程摸 SMC（SMCConnection.call 无锁，并发调用未定义）；
-// exit 是唯一线程安全的动作。
+// 故意不在 watchdog 线程摸 SMC（v3.6.1 起 call 已加锁串行化，但看门狗的职责
+// 是"只读心跳、出事就退"，摸硬件只会延长故障窗口）；exit 是唯一线程安全的动作。
 let watchdogSource = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "fanctld.watchdog", qos: .utility))
 watchdogSource.schedule(deadline: .now() + 60, repeating: 15.0, leeway: .seconds(1))
 watchdogSource.setEventHandler {

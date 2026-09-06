@@ -886,10 +886,18 @@ public enum ConfigStore {
         guard let data = try? encoder.encode(sanitized) else { return false }
         do {
             try data.write(to: FanCtlPaths.configFile, options: .atomic)
-            // 原子写（临时文件+rename）会重置权限为 644，
-            // 必须补回组写：daemon(root) 与 App(staff 组) 双方都要能写这个文件
+            // 原子写（临时文件+rename）会重置权限为 644 且属主变为写入者，
+            // 必须补回组写：daemon(root) 与 App(staff/admin 组) 双方都要能写这个文件。
+            // v3.6.2：root 写入时再把组归 admin——此前只改权限不改属主，config.json
+            // 损坏后 daemon 自愈重写会把文件变成 root:wheel 664，App 用户从此静默
+            // 失去写配置能力（直到重跑 install.sh）。App（非 root）写入时 chown
+            // 必然失败，跳过无害。
             try? FileManager.default.setAttributes(
                 [.posixPermissions: 0o664], ofItemAtPath: FanCtlPaths.configFile.path)
+            if getuid() == 0 {
+                try? FileManager.default.setAttributes(
+                    [.groupOwnerAccountName: "admin"], ofItemAtPath: FanCtlPaths.configFile.path)
+            }
             return true
         } catch {
             return false
