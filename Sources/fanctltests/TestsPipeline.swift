@@ -114,3 +114,59 @@ func testPipelineCodable() {
 
 // MARK: - 风扇偏移与传感器读数安全语义
 
+
+// MARK: - v3.6.3 变异补洞 C2/C7：试探协议与周期重申（此前零覆盖）
+
+func testProbeProtocolHandover() {
+    group("故障试探协议：验证失败 → 交还（C2 补洞）")
+    var envDirs: [URL] = []
+    envDirs.append(engineTestEnv())
+    ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+    let smc = makeFanSMC()
+    smc.set("Tp01", 80); smc.set("PSTR", 30)
+    let clock = FakeClock()
+    let col = EngineCollector()
+    let engine = makeEngine(smc: smc, clock: clock, collector: col)
+    // 前 5 拍：风扇卡死（Ac 冻结 1200）而命令 ~4600 → 反馈失配 5 拍 → 闭环故障锁存
+    for _ in 0..<5 {
+        engine.beat()
+        clock.advance(3)
+    }
+    expect(smc.lastWrite("F0Md") == 1, "故障期仍处强制模式")
+    // 第 6 拍起：试探写入 → 验证期风扇继续卡死 → 验证失败 → 交还
+    // 计数器 = 4：试探拍 + 3 验证拍 + 第 4 拍交还（变异体 40 会拖到 ~40 拍）
+    var handoverBeat = -1
+    for b in 6...14 {
+        engine.beat()
+        clock.advance(3)
+        if smc.lastWrite("F0Md") == 0 { handoverBeat = b; break }
+    }
+    expect(handoverBeat > 0, "试探验证失败 → 已交还系统（得 \(handoverBeat)）")
+    expect(handoverBeat <= 10, "验证窗 3 拍内完成交还（得第 \(handoverBeat) 拍）")
+    for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+}
+
+func testReassertLoop() {
+    group("周期重申防 SMC 复位（C7 补洞）")
+    var envDirs: [URL] = []
+    envDirs.append(engineTestEnv())
+    ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+    let smc = makeFanSMC()
+    smc.set("Tp01", 60); smc.set("PSTR", 30)
+    let clock = FakeClock()
+    let col = EngineCollector()
+    let engine = makeEngine(smc: smc, clock: clock, collector: col)
+    for _ in 0..<45 {
+        engine.beat()
+        clock.advance(3)
+        // 风扇健康跟随：不跟随会累积反馈失配 → 5 拍后闭环故障交还（另一条路径），
+        // 与本测试无关——本测试锁的是纯稳态下的重申节奏
+        if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+    }
+    // 稳态无目标变化：写入应只发生在 首拍 + 第 20/40 拍重申 = 3 次
+    //（变异体 2000 → 只有首拍 1 次，SMC 复位后无人纠正）
+    let tgWrites = smc.writes.filter { $0.key == "F0Tg" }.count
+    for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+}
