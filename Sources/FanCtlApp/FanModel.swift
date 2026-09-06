@@ -79,6 +79,10 @@ final class FanModel: ObservableObject {
     @Published var learnedNow: Double? = nil   // 当前温度的经验稳态输出（学习具象化）
     @Published var learningRecently: Bool = false  // 最近 120s 内是否记录过热经验样本
     @Published var learnedSamples: Int = 0        // 累计学习样本总数
+    // v3.7 学习地图（daemon 节流下发：样本变化才更新）与 决策透镜（AI 模式每拍）
+    @Published var learnMap: [ThermalLearn.LearnedPoint] = []
+    @Published var decisionTrace: DecisionTrace? = nil
+    @Published var freezeHint: String? = nil   // 冻结结果反馈（成功/不可用原因）
     @Published var targetUnreachable = false       // AI 目标温度压不住（持续满速+温度高于目标窗口）
     @Published var components: [ComponentTempDisplay] = []
     @Published var currentLoopInterval: Double? = nil
@@ -555,6 +559,8 @@ final class FanModel: ObservableObject {
                 curveTargetPercent = nil
                 components = []
                 learnedNow = nil
+                learnMap = []
+                decisionTrace = nil
                 daemonMode = nil
                 configMismatch = false
                 envTemp = nil
@@ -573,6 +579,8 @@ final class FanModel: ObservableObject {
                 curveTargetPercent = nil
                 components = []
                 learnedNow = nil
+                learnMap = []
+                decisionTrace = nil
                 daemonMode = nil
                 configMismatch = false
                 envTemp = nil
@@ -656,6 +664,13 @@ final class FanModel: ObservableObject {
             self.curveTargetPercent = status.curveTargetPercent
             self.learningRecently = status.learningRecently ?? false
             self.learnedSamples = status.learnedSamples ?? 0
+            // v3.7：学习地图只在 daemon 侧样本变化时才变（节流），直接透传；
+            // 数值防御（isFinite/范围）在 LearnedPoint 生成侧已保证，此处仅过滤坏点
+            self.learnMap = (status.learnMap ?? []).filter {
+                $0.temp.isFinite && $0.percent.isFinite && $0.percent >= 0 && $0.percent <= 100
+                    && $0.samples > 0
+            }
+            self.decisionTrace = status.decisionTrace
             self.targetUnreachable = status.targetUnreachable ?? false
             if let pts = status.learnedPoints { self.learnedPoints = pts }
             self.currentLoopInterval = status.loopInterval
@@ -896,6 +911,36 @@ final class FanModel: ObservableObject {
         }
         withAnimation(.snappy) { preset = newPreset }
         saveConfig()
+    }
+
+    // MARK: v3.7 P1 冻结 AI 经验为曲线
+    // 语义：AI 稳态经验的快照（非"最优解"承诺）——把学习查表的采信桶转成
+    // 用户曲线，边界锚点继承当前曲线两端。之后 AI 继续学习，快照不跟进。
+
+    /// 采信桶数 ≥2 才可冻结（单点无法成曲线）
+    var canFreezeCurve: Bool {
+        learnMap.filter { $0.samples >= ThermalLearn.minSamples }.count >= 2
+    }
+
+    func freezeCurveFromLearn() {
+        guard canFreezeCurve else {
+            freezeHint = "采信温度点不足（需 ≥2）"
+            return
+        }
+        guard let curve = ThermalLearn.freezeCurve(from: learnMap,
+                                                   baseCurve: points(for: preset)) else {
+            freezeHint = "无法生成曲线（数据异常）"
+            return
+        }
+        lastUserChange = Date()
+        aiSummary = nil
+        aiDetail = nil
+        pendingAICurve = nil
+        customPoints = curve
+        preset = .custom
+        persistCustomPoints()
+        saveConfig()
+        freezeHint = "已冻结 \(learnMap.filter { $0.samples >= ThermalLearn.minSamples }.count) 个温度点为曲线快照"
     }
 
     // 设置单风扇偏移

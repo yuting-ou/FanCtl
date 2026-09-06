@@ -55,6 +55,16 @@ struct FanCtlApp: App {
             let lastArg = CommandLine.arguments.last
             // 排版实测用：--snapshot warn <mode> 强制最长警示条在场，量最坏情况总高
             if CommandLine.arguments.contains("warn") { model.configWriteFailed = true }
+            // 排版实测：--snapshot lens 预览决策透镜行与学习地图有数据态（布局最坏情况）
+            if CommandLine.arguments.contains("lens") {
+                model.decisionTrace = DecisionTrace(target: 72, temp: 78, error: 6,
+                                                    learned: 63, idle: false,
+                                                    hysteresisHold: true, guardSeconds: 900)
+                model.learnMap = stride(from: 50, through: 90, by: 5).map {
+                    ThermalLearn.LearnedPoint(temp: Double($0), percent: min(95, Double($0) - 20),
+                                              samples: 3 + $0 % 4)
+                }
+            }
             // 排版实测用：--snapshot boost <mode> 预览冲刺倒计时态（boostBar 最高态）
             if CommandLine.arguments.contains("boost") { model.boostEndDate = now.addingTimeInterval(900) }
             // 排版实测用：--snapshot dead <mode> 预览 daemon 挂态（双标签同现最坏情况）

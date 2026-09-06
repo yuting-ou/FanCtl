@@ -1217,3 +1217,133 @@ func testControlEngine() {
         expect(engine.aiMetrics.sampleCount >= 1, "解除静音后恢复评测")
     }
 }
+
+// MARK: - v3.7 信任三角：学习地图 / 冻结曲线 / 决策透镜
+
+func testTrustTriangle() {
+    group("v3.7 学习地图 + 冻结曲线 + 决策透镜")
+
+    // —— learnedPoints()：只含采信桶、升序、包络修正生效 ——
+    do {
+        var q = ThermalLearn()
+        // 60°=40%（5 样本采信）、70°=60%（5 样本）、85°=50%（5 样本，低于低温桶 → 包络抬到 60%）
+        for _ in 0..<5 { q.record(temp: 60, percent: 40) }
+        for _ in 0..<5 { q.record(temp: 70, percent: 60) }
+        for _ in 0..<5 { q.record(temp: 85, percent: 50) }
+        let pts = q.learnedPoints()
+        expectEqual(pts.count, 3, "3 个采信桶")
+        expect(pts.map(\.temp) == pts.map(\.temp).sorted(), "温度升序")
+        // 桶中值语义：temp=60 落桶 10（中值 61）、temp=70 落桶 15（中值 71）、temp=85 落桶 22（中值 85）
+        let p85 = pts.first { Int($0.temp) == 85 }
+        expect(p85 != nil && p85!.percent == 60, "85° 桶经包络修正 = 60（实际生效值，得 \(p85?.percent ?? -1)）")
+        let p60 = pts.first { Int($0.temp) == 61 }
+        // 5 样本早期平均恰为 40；percent 经 L1 钳位后应等于 40
+        expect(p60 != nil && abs(p60!.percent - 40) < 0.01, "61° 桶（record 60°）原值（得 \(p60?.percent ?? -1)）")
+        expect(p60 != nil && p60!.samples == 5, "61° 桶置信度 = 5（得 \(p60?.samples ?? -1)）")
+    }
+
+    // —— freezeCurve：边界锚点继承 + 均匀采样 + 最小间距 + 域约束 ——
+    do {
+        // 7 个采信桶 → 内部点采 3 个
+        var q = ThermalLearn()
+        for t in stride(from: 55.0, through: 85.0, by: 5.0) {
+            for _ in 0..<4 { q.record(temp: t, percent: t - 20) }
+        }
+        // minSamples=3 → 4 样本全采信
+        let pts = q.learnedPoints()
+        expectEqual(pts.count, 7, "7 个采信桶")
+        let base = CurvePreset.balanced.points   // 52/62/70/78/85
+        let curve = ThermalLearn.freezeCurve(from: pts, baseCurve: base)
+        expect(curve != nil, "冻结成功")
+        if let c = curve {
+            expect(c.count >= 2 && c.count <= 5, "冻结曲线 2-5 点（得 \(c.count)）")
+            expect(c.first!.temp == base.map(\.temp).min()!, "低温锚点继承用户曲线")
+            expect(c.last!.temp == base.map(\.temp).max()!, "高温锚点继承用户曲线")
+            for i in 1..<c.count {
+                expect(c[i].temp - c[i-1].temp >= 1.5, "相邻间距 ≥1.5°")
+            }
+            for p in c {
+                expect(p.temp >= 46 && p.temp <= 90, "编辑器域约束 [46,90]")
+                expect(p.percent >= 0 && p.percent <= 100, "百分比钳位")
+                expect(p.temp.truncatingRemainder(dividingBy: 0.5) == 0, "0.5° 步进")
+            }
+        }
+        // 1 个采信桶 → nil（按钮禁用语义）
+        var q1 = ThermalLearn()
+        for _ in 0..<5 { q1.record(temp: 70, percent: 50) }
+        expect(ThermalLearn.freezeCurve(from: q1.learnedPoints(), baseCurve: base) == nil,
+               "单采信桶不可冻结")
+        // 0 个 → nil
+        expect(ThermalLearn.freezeCurve(from: [], baseCurve: base) == nil, "空表不可冻结")
+    }
+
+    // —— decisionTrace 下发：AI 模式有值、非 AI 模式 nil ——
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 76, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 78); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        engine.beat()
+        var st = ConfigStore.loadStatus()
+        expect(st?.decisionTrace != nil, "AI 模式透镜在场")
+        if let t = st?.decisionTrace {
+            expect(t.target == 76 && t.temp == 78, "目标/温度 \(String(describing: t.target))/\(String(describing: t.temp))")
+            expect(t.error == 2, "误差 = temp−target")
+        }
+        // learnMap 在场（学习未发生时可为空数组或 nil——看节流初值：首拍样本 0 != -1 → 快照生成）
+        expect(st?.learnMap != nil, "learnMap 字段在场（AI 模式）")
+        // 非亮 AI 模式 → 两字段 nil
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+        clock.advance(3)
+        engine.beat()
+        st = ConfigStore.loadStatus()
+        expect(st?.decisionTrace == nil, "curve 模式透镜 nil")
+        expect(st?.learnMap == nil, "curve 模式 learnMap nil")
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    }
+
+    // —— learnMap 节流：样本不变时快照复用（同一实例、不重复生成）——
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 76, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 78); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        // F8 修复后 timestamp 走注入时钟——status.json 写盘节流语义可被直接观察
+        var snapshots: [[Double]?] = []
+        for _ in 0..<6 {
+            engine.beat()
+            clock.advance(3)
+            if let st = ConfigStore.loadStatus(), let m = st.learnMap {
+                snapshots.append(m.map(\.percent))
+            } else {
+                snapshots.append(nil)
+            }
+        }
+        // 节流语义：快照内容只随样本总数变化。恒定温度 78° 是稳态 → 学习门通过、
+        // 样本逐拍增长（[0,0,0,1,1,1]：前 3 拍是 prevTemp==nil 等门未开），快照正确跟进；
+        // 锁的是"无新样本的拍不重算"——把最后一拍的 map 内容与首拍之后到样本变化前的一致性对比
+        expect(snapshots.first ?? nil != nil, "首拍生成快照")
+        // 前缀稳定性：连续相同样本数区段内，快照内容必须逐字节相同（复用而非重算）
+        var ok = true
+        var i = 0
+        let seq = snapshots.map { $0 ?? [] }
+        while i < seq.count {
+            var j = i
+            while j + 1 < seq.count, seq[j + 1].count == seq[i].count, !seq[i].isEmpty { j += 1 }
+            if j > i, Set(seq[i...j]).count > 1 { ok = false }
+            i = j + 1
+        }
+        expect(ok, "相同样本数区段内快照逐拍复用（不重算）")
+        // 快照最终反映学习进展：样本增长后非空
+        expect(seq.last?.isEmpty == false, "学习发生后 learnMap 非空")
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    }
+}

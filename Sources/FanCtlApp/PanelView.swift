@@ -1,10 +1,14 @@
 // PanelView —— 面板布局与玻璃卡片样式。
 import SwiftUI
+import Charts
 import SMCCore
 
 // MARK: - 面板
 
 struct ContentView: View {
+    // v3.7 学习地图展开态：展开时 AI 卡显式长高（用户主动 ≠ 模式切换动画，
+    // "窗口恒定"守的是切模式；无约束 Charts 会溢出 216pt 卡画到卡外）
+    @State private var learnMapExpanded = CommandLine.arguments.contains("lens")
     @ObservedObject var model: FanModel
     @AppStorage("menuBarStyle") private var menuBarStyle = "both"
     // v3.4.1：model.monitorTab 由 FanModel 持有（DoD-5a：ps 采样仅在"占用"tab 采样）
@@ -597,7 +601,10 @@ struct ContentView: View {
             // 固定高度：各模式内容高度统一，窗口尺寸恒定。
             // 注意：切模式时内容必须即时替换（不加 implicit animation），
             // 否则 MenuBarExtra 窗口在动画期间会重排/抖动（"切模式面板跳"根因）。
-            .frame(height: 200, alignment: .top)
+            // v3.7：AI 卡新增透镜行+地图折叠区（~36pt），槽位 200→216pt；
+            // 地图展开时再长高 ~110pt（图表+冻结按钮），动画平滑
+            .frame(height: learnMapExpanded ? 326 : 216, alignment: .top)
+            .animation(.smooth(duration: 0.3), value: learnMapExpanded)
         }
         .cardStyle()
     }
@@ -949,13 +956,20 @@ struct ContentView: View {
             learningStatus(points: model.learnedPoints,
                            samples: model.learnedSamples,
                            learning: model.learningRecently)
+            // v3.7 决策透镜：为什么是这个转速（一行摘要，悬停看全量）
+            if let t = model.decisionTrace {
+                decisionTraceRow(t)
+            }
+            // v3.7 学习地图 + 冻结按钮（可折叠；≥2 采信点才可冻结）
+            learnMapDisclosure(model, expanded: $learnMapExpanded)
             // 评测摘要：仅在无事件级提示时显示（有提示时优先让位，保证 200pt 内不裁剪）。
             // v3.4.1：单行 run-on（"评测 130 小时 · 均温 55° · …"）拆为 5 个紧凑磁贴——
             // 一行连读 5 指标难扫视；磁贴各占一格、数值/标签分层，悬停仍看完整账本。
             // 磁贴仅 31pt，替换原 14pt 行 +17pt，评测在场时事件行必缺席，槽位余量足够。
             if let m = model.aiMetrics, m.sampleCount > 0, !model.targetUnreachable,
                !model.aiHighEffort,
-               model.aiRecommendedTarget == nil || abs(model.aiRecommendedTarget! - model.aiTargetTemp) <= 0.5 {
+               model.aiRecommendedTarget == nil || abs(model.aiRecommendedTarget! - model.aiTargetTemp) <= 0.5,
+               model.decisionTrace == nil {   // v3.7：透镜行在场时让位（同为解释性内容，互斥防 216pt 裁剪）
                 let eval = Self.evaluationText(m)
                 statStrip([
                     (Self.compactDuration(eval.seconds), "评测", nil),
@@ -1167,6 +1181,141 @@ private enum AILearnState {
 // v2.6.1 性能修复：SwiftUI .animation(repeatForever) 与 TimelineView 一样会驱动
 // NSHostingView 每帧 SwiftUI 渲染循环（面板高 CPU 的组成部分），
 // 改为 NSViewRepresentable + CAShapeLayer 动画（渲染服务器驱动，零 SwiftUI 成本）。
+// MARK: - v3.7 决策透镜 + 学习地图 + 冻结曲线
+
+extension ContentView {
+
+    // 决策透镜：一行"为什么是这个转速"——目标/误差/学习值/保持原因。
+    // 悬停 .help 给全量解释；不新增 tab、不展开新卡片，高度预算内
+    fileprivate func decisionTraceRow(_ t: DecisionTrace) -> some View {
+        let errText: String
+        if let e = t.error {
+            errText = e > 0.5 ? "+\(Int(e.rounded()))°" : (e < -0.5 ? "\(Int(e.rounded()))°" : "±0")
+        } else { errText = "-" }
+        var reasons: [String] = []
+        if t.idle == true { reasons.append("空闲交还中") }
+        if t.hysteresisHold == true { reasons.append("迟滞保持") }
+        if let g = t.guardSeconds, g > 0 { reasons.append("循环抑制 \(Int(g / 60)) 分钟") }
+        let reasonText = reasons.isEmpty ? "" : " · " + reasons.joined(separator: "、")
+        return HStack(spacing: 5) {
+            Image(systemName: "scope")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text("目标 \(t.target.map { Int($0.rounded()).description } ?? "-")° · 当前 \(t.temp.map { Int($0.rounded()).description } ?? "-")° · 误差 \(errText) · 学到 \(t.learned.map { Int($0.rounded()).description + "%" } ?? "无")\(reasonText)")
+                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Spacer(minLength: 0)
+        }
+        .help(t.explanation)
+    }
+
+    // 学习地图（可折叠）：采信桶温度→风量折线 + 冻结按钮
+    fileprivate func learnMapDisclosure(_ model: FanModel,
+                                        expanded: Binding<Bool>) -> some View {
+        DisclosureGroup(isExpanded: expanded) {
+            if model.learnMap.isEmpty {
+                Text("暂无采信数据——AI 在稳态时记录温度与风量的对应关系，正常使用数小时后出现")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+            } else {
+                // v3.7：展开内容整体限高——无约束时 Charts 自适应高度会溢出 216pt 卡
+                //（快照 lens 实测溢出盖住底部按钮）；88pt 图 + 20pt 按钮 + hint 均在预算内
+                VStack(spacing: 6) {
+                    LearnMapView(points: model.learnMap)
+                        .frame(height: 72)
+                        .padding(.top, 2)   // Y 轴顶标"100"不被裁（快照 lens 实测裁半）
+                    if let hint = model.freezeHint {
+                        Text(hint)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                    Button {
+                        model.freezeCurveFromLearn()
+                    } label: {
+                        Label("冻结为曲线快照", systemImage: "camera.on.rectangle")
+                            .font(.system(size: 11, weight: .semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(PressableButtonStyle())
+                    .controlSize(.small)
+                    .disabled(!model.canFreezeCurve)
+                    .help(model.canFreezeCurve
+                          ? "把 AI 学到的稳态经验转成普通曲线（快照）。之后 AI 继续学习，快照不跟进；安全兜底不变。"
+                          : "至少需要 2 个采信温度点（正常使用几小时后达成）")
+                }
+                .frame(height: 100, alignment: .top)
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "map")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text("学习地图（\(model.learnMap.count) 点）")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+        }
+        .font(.system(size: 10))
+        .padding(.top, 2)
+    }
+}
+
+// 学习地图图：温度→风量散点+折线，点径=置信度（样本数归一）
+struct LearnMapView: View {
+    let points: [ThermalLearn.LearnedPoint]
+
+    var body: some View {
+        let valid = points.filter { $0.samples > 0 && $0.percent.isFinite && $0.temp.isFinite }
+                          .sorted { $0.temp < $1.temp }
+        let maxSamples = max(valid.map(\.samples).max() ?? 1, 1)
+        Chart(valid) { p in
+            LineMark(x: .value("温度", p.temp), y: .value("风量", p.percent))
+                .foregroundStyle(.secondary.opacity(0.5))
+                .interpolationMethod(.catmullRom)
+            PointMark(x: .value("温度", p.temp), y: .value("风量", p.percent))
+                .symbolSize(p.samples >= ThermalLearn.minSamples
+                            ? 40 + 90 * Double(p.samples) / Double(maxSamples) : 30)
+                .foregroundStyle(Color.accentColor.opacity(0.9))
+        }
+        .chartXAxis {
+            AxisMarks(values: [50, 60, 70, 80, 90]) { v in
+                AxisValueLabel { if let x = v.as(Int.self) { Text("\(x)°").font(.system(size: 8)) } }
+            }
+        }
+        .chartYAxis {
+            AxisMarks(values: [0, 50, 100]) { v in
+                AxisValueLabel { if let y = v.as(Int.self) { Text("\(y)").font(.system(size: 8)) } }
+            }
+        }
+        .chartYScale(domain: 0...100)
+        .help("每个点是 AI 采信的一个温度档：位置=该温度下的稳态风量，点越大=样本越多越可信。虚线期的非单调包络修正已计入。")
+    }
+}
+
+private extension DecisionTrace {
+    // 透镜完整解释（悬停文案）——与引擎语义一一对应，不引入新语义
+    var explanation: String {
+        var lines: [String] = []
+        if let t = target, let cur = temp {
+            lines.append("AI 目标 \(Int(t.rounded()))°C（环境/夜间/电池叠加后的有效目标），当前芯片 \(Int(cur.rounded()))°C")
+        }
+        if let l = learned {
+            lines.append("经验查表：这台机器稳住当前温度需要约 \(Int(l.rounded()))% 风量")
+        } else {
+            lines.append("当前温度尚无采信经验（AI 正用曲线基准与积分控制）")
+        }
+        if idle == true { lines.append("空闲交还：温度持续低于目标，风扇交还系统调度（可能停转）") }
+        if hysteresisHold == true { lines.append("迟滞保持：微小波动被带宽吸收，本拍未写入新转速（决策在演化）") }
+        if let g = guardSeconds, g > 0 { lines.append("启停抑制：\(Int(g / 60)) 分钟内不交还，防止停转-启转循环磨损轴承") }
+        return lines.joined(separator: "\n")
+    }
+}
+
 private struct LearningDot: View {
     let state: AILearnState
 

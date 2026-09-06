@@ -81,6 +81,7 @@ public struct FanCurveController {
         // v3.6.3：NaN 目标防御——min/max 对 NaN 的比较穿透会得到 100（满速），
         // 显式钳 0（安全方向：不动风扇，由兜底接管）。上游决策已滤 NaN，双保险。
         let t = target.isFinite ? max(0, min(100, target)) : 0
+        lastWriteHeld = false
         if force {
             lastAppliedPercent = t
             return t
@@ -89,7 +90,10 @@ public struct FanCurveController {
         if let last = lastAppliedPercent {
             if pct > last { pct = min(pct, last + tuning.maxStepUp) }     // 升速限速（缓慢上升）
             if pct < last { pct = max(pct, last - tuning.maxStepDown) }   // 降速限速（缓慢下降）
-            if pct != 100 && pct != 0 && abs(pct - last) < tuning.pctDeadband { pct = last }  // 死区（0%/满速边界不受限：0%=停转意图、100%=满速兜底，卡在 1-4% 或 97-99% 都违背目标语义）
+            if pct != 100 && pct != 0 && abs(pct - last) < tuning.pctDeadband {
+                pct = last   // 死区（0%/满速边界不受限：0%=停转意图、100%=满速兜底）
+                lastWriteHeld = true
+            }
         }
         lastAppliedPercent = pct
         return pct
@@ -97,6 +101,10 @@ public struct FanCurveController {
 
     // 切回系统自动：清空输出记忆（下次重新接管从头限速）
     public mutating func clearOutput() { lastAppliedPercent = nil }
+
+    /// v3.7 决策透镜：最近一次 shape/slew 调用中，写入是否被死区/迟滞带保持。
+    /// 仅展示语义（"本拍没写入是因为带内保持"），不影响任何控制行为
+    public private(set) var lastWriteHeld = false
 
     // 纯升降速限速（不含死区）。供 AI 模式用——AI 控制器本身是平滑积分 PD，
     // 不能再用 shape() 的死区（死区会吞噬 AI 的 1-4% 微调、与 PD 叠加易振荡），
@@ -116,6 +124,7 @@ public struct FanCurveController {
             return pct
         }
 
+        lastWriteHeld = false
         if let last = lastAppliedPercent {
             if pct > last { pct = min(pct, last + tuning.maxStepUp) }
             if pct < last { pct = max(pct, last - tuning.maxStepDown) }
@@ -123,7 +132,10 @@ public struct FanCurveController {
             // 否则 AI 积分钳顶后 last 可能滞留在 97-99（如爬坡步进恰好落在 97），
             // |100-last| < 带宽永远 hold，风扇钉在 97% 且 saturated(≥98) 检测失灵，
             // "AI 目标压不住"状态永不触发。0 侧同理（AI 输出趋 0 时滞留 1-3%）。
-            if hysteresis > 0, pct != 100, pct != 0, abs(pct - last) < hysteresis { pct = last }
+            if hysteresis > 0, pct != 100, pct != 0, abs(pct - last) < hysteresis {
+                pct = last
+                lastWriteHeld = true
+            }
         }
         lastAppliedPercent = pct
         return pct

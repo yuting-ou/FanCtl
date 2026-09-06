@@ -113,6 +113,10 @@ public final class ControlEngine {
     var lastPlausibleEnvTemp: Double? = nil         // 读数偏低期谷值会被"贴近芯片"检查判 nil，保留最近合理值
     var aiCyclingGuardActive = false                // 启停循环抑制边沿日志
     var prevStatsAppliedPercent: Double? = nil      // 调速次数统计的上一拍输出
+    // v3.7（P3 节流）：学习地图快照只在样本数变化时重算重发，其余拍复用——
+    // 否则 status 变化感知会打穿节流（每次学习都触发写盘）；同时避免每拍编码 28 桶
+    var lastLearnMapSamples = -1
+    var lastLearnMap: [ThermalLearn.LearnedPoint]? = nil
     var statsKeeper: StatsSampler
 
     // MARK: - 看门狗心跳（跨线程读：主队列写、watchdog 队列读，锁保护）
@@ -501,6 +505,8 @@ public final class ControlEngine {
         var aiPercent: Double? = nil
         var aiIntent: AIIntent? = nil
         var curveTargetPercent: Double? = nil  // 当前温度下用户曲线的期望值（AI 模式展示"曲线基准"）
+        var hysteresisHold = false             // v3.7 决策透镜：本拍写入被迟滞带保持
+        var learnedNow: Double? = nil          // v3.7 透镜：当前温度学习查表值
         var guardArmedThisBeat = false         // v3.1 启停抑制本拍武装（战报计数用）
         var overshootNow: Double? = nil        // v3.2 本拍温度超出 AI 有效目标的量（战报过冲峰值用）
         // AI 实际控制的"目标温度"（电池+省电时控制器会放宽 +4°）。学习窗口与"压不住"检测
@@ -551,6 +557,7 @@ public final class ControlEngine {
                 // 与查表取较大者（模型能覆盖查表没见过的温度/负载组合）
                 let learnedPct = thermalLearn.percent(for: temp, onBattery: onBattery,
                                                       powerWatts: powerWatts)
+                learnedNow = learnedPct
                 let modelPct = thermalModel.predictedPercent(for: envTemp ?? 25,
                                                              power: powerWatts ?? 0,
                                                              targetTemp: aiTargetEff)
@@ -671,6 +678,7 @@ public final class ControlEngine {
                 shapedBase = controller.slew(target: baseTarget,
                                              force: decision.ssdGuard || decision.batteryGuard || decision.failsafeActive,
                                              hysteresis: effectiveConfig.mode == .ai ? 4 : 0)
+                hysteresisHold = controller.lastWriteHeld
             } else {
                 shapedBase = controller.shape(target: baseTarget,
                                               force: decision.ssdGuard || decision.batteryGuard || decision.failsafeActive)
@@ -973,6 +981,18 @@ public final class ControlEngine {
         //    变化感知：稳态时温度/RPM 可能仅微小波动，无实质变化时跳过磁盘写入，
         //    避免每 3–5s 唤醒 App 解析 JSON。最多 10s 心跳保证 App 不超过 10s 无更新。
         let loopIntervalToReport = currentLoopInterval
+        // v3.7（P3 学习地图节流）：仅 AI 模式且采信样本总数变化时重算快照。
+        // 样本总数是学习发生的充分信号（record 必然 +1）；学习门限频（稳态才记），
+        // 所以重算频率 = 学习频率，不会打穿 status 写盘节流
+        var learnMapSnapshot: [ThermalLearn.LearnedPoint]? = nil
+        if effectiveConfig.mode == .ai {
+            let total = thermalLearn.sampleTotal
+            if total != lastLearnMapSamples {
+                lastLearnMapSamples = total
+                lastLearnMap = thermalLearn.learnedPoints()
+            }
+            learnMapSnapshot = lastLearnMap
+        }
         // v2.6.2：故障期 reason 置 nil——appliedPercent=0 却显示"按曲线调速"是自相矛盾
         let faultActive = writeHealth.faulted || feedbackHealth.faulted || stuckDetector.faulted
         let status = DaemonStatus(
@@ -1014,7 +1034,19 @@ public final class ControlEngine {
             palmComp: palmComp > 0.5 ? palmComp : nil,
             // v3.6（方向二·数据裁判）：高温段包络健康度——AI 模式在当前温度下报告
             // （88° 等过冲区旧数据被新样本洗净后 →0；观察协议见 EVOLUTION.md）
-            learnEnvelopeGap: (effectiveConfig.mode == .ai) ? thermalLearn.envelopeGap() : nil
+            learnEnvelopeGap: (effectiveConfig.mode == .ai) ? thermalLearn.envelopeGap() : nil,
+            // v3.7（P3 学习地图）：仅 AI 模式；样本数变化时重算快照，否则复用
+            learnMap: learnMapSnapshot,
+            // v3.7（P2 决策透镜）：AI 模式可解释快照，全部为引擎已有状态的转述
+            decisionTrace: (effectiveConfig.mode == .ai) ? DecisionTrace(
+                target: aiTargetEff,
+                temp: temp,
+                error: temp - aiTargetEff,
+                learned: learnedNow,
+                idle: aiIdleActive,
+                hysteresisHold: hysteresisHold,
+                guardSeconds: aiController.cyclingGuardRemainingSeconds > 0
+                    ? aiController.cyclingGuardRemainingSeconds : nil) : nil
         )
 
         let summary = statusChangeSummary(status)
