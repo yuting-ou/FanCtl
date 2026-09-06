@@ -46,9 +46,11 @@ func testSafetyThresholdBoundaries() {
     expect(bCrit.criticalActive && bCrit.floor == 100, "电池 48° 整点 = 危急 100")
     let bWarn = FanPipeline.batteryState(battTemp: 45, wasGuardActive: false, wasCriticalActive: false)
     expect(bWarn.guardActive && !bWarn.criticalActive && bWarn.floor == 60, "电池 45° 整点 = 警告 60")
-    // 释放滞回边界：兜底激活后回落 88 释放
-    let dRel = decide(FanConfig(mode: .curve), smoothed: 80, raw: 88, wasFailsafeActive: true)
-    expect(dRel.targetPercent != 100, "兜底 88° 释放")
+    // 释放滞回边界：激活后回落——88° 整点仍保持（>= 语义），87.9° 才释放
+    let dHold = decide(FanConfig(mode: .curve), smoothed: 80, raw: 88, wasFailsafeActive: true)
+    expectEqual(dHold.targetPercent, 100, "兜底释放滞回：88° 整点仍激活")
+    let dRel = decide(FanConfig(mode: .curve), smoothed: 80, raw: 87.9, wasFailsafeActive: true)
+    expect(dRel.targetPercent != 100, "兜底 87.9° 释放")
 }
 
 // MARK: - v2.7 电池高温托底（与 SSD 同构的安全红线）
