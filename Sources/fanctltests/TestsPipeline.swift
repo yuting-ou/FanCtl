@@ -157,17 +157,13 @@ func testReassertLoop() {
     let clock = FakeClock()
     let col = EngineCollector()
     let engine = makeEngine(smc: smc, clock: clock, collector: col)
-    var tgCounts: [Int] = []
-    for b in 0..<45 {
-        let before = smc.writes.filter { $0.key == "F0Tg" }.count
+    for _ in 0..<45 {
         engine.beat()
         clock.advance(3)
         // 风扇健康跟随：不跟随会累积反馈失配 → 5 拍后闭环故障交还（另一条路径），
         // 与本测试无关——本测试锁的是纯稳态下的重申节奏
         if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
-        tgCounts.append(smc.writes.filter { $0.key == "F0Tg" }.count - before)
     }
-    print("DBG-C7 写入拍: \(tgCounts.enumerated().compactMap { $0.element > 0 ? $0.offset + 1 : nil })")
     // 稳态无目标变化：写入应只发生在 首拍 + 第 20/40 拍重申 = 3 次
     //（变异体 2000 → 只有首拍 1 次，SMC 复位后无人纠正）
     let tgWrites = smc.writes.filter { $0.key == "F0Tg" }.count
