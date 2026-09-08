@@ -1663,6 +1663,11 @@ private struct UpgradeMenuSection: View {
     let tag: String
     let skip: () -> Void
 
+    // 进行中/失败态用 phase.tag（实际下载的版本）——24h 自检若中途刷新
+    // updateAvailable，外部 tag 可能已变，文案必须跟实际操作走（审查修复④）；
+    // idle 态无 phase.tag，用外部 tag（= updateAvailable，刚刚查到的）
+    private var activeTag: String { upgrader.phase.tag ?? tag }
+
     var body: some View {
         switch upgrader.phase {
         case .idle:
@@ -1671,16 +1676,16 @@ private struct UpgradeMenuSection: View {
         case .downloading, .validating, .installing:
             let step: String = {
                 switch upgrader.phase {
-                case .downloading: return "正在下载 \(tag)…"
-                case .validating: return "正在校验 \(tag)…"
-                default: return "等待授权安装 \(tag)…（若弹窗未出现请先点击面板）"
+                case .downloading: return "正在下载 \(activeTag)…"
+                case .validating: return "正在校验 \(activeTag)…"
+                default: return "等待授权安装 \(activeTag)…（若弹窗未出现请先点击面板）"
                 }
             }()
             Text(step)
             Button("打开下载页…") { NSWorkspace.shared.open(FanModel.releasesURL) }
         case .failed(_, let reason):
             Text("升级失败：\(reason)")
-            Button("重试升级到 \(tag)") { upgrader.retry(tag: tag) }
+            Button("重试升级到 \(activeTag)") { upgrader.retry(tag: activeTag) }
             Button("打开下载页…") { NSWorkspace.shared.open(FanModel.releasesURL) }
             Button("跳过此版本") { skip() }
         }

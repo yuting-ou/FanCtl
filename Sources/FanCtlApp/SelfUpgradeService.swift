@@ -65,6 +65,12 @@ final class SelfUpgradeService: ObservableObject {
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
                 throw Failure("下载失败（HTTP \(code)）")
             }
+            // 审查加固：download(from:) 的临时文件在返回后由系统择机清理——
+            // 立即移到确定性路径（同卷 rename，瞬时），不等 detached 任务去碰它
+            let zipURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("FanCtlUpgrade-release.zip")
+            try? FileManager.default.removeItem(at: zipURL)
+            try FileManager.default.moveItem(at: tmpURL, to: zipURL)
             // 2) 解压到独立暂存目录（确定性路径，失败残留下次 rm -rf 重建）；
             //    detached 任务返回含 FanCtl.app 的顶层目录（zip 内布局契约 = ci.yml：
             //    FanCtl-{版本}/，内含 FanCtl.app + fanctld），校验段直接复用
@@ -77,7 +83,7 @@ final class SelfUpgradeService: ObservableObject {
                 try fm.createDirectory(at: staging, withIntermediateDirectories: true)
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-                p.arguments = ["-x", "-k", tmpURL.path, staging.path]
+                p.arguments = ["-x", "-k", zipURL.path, staging.path]
                 let pipe = Pipe()
                 p.standardError = pipe
                 try p.run()
@@ -108,37 +114,50 @@ final class SelfUpgradeService: ObservableObject {
                 throw Failure(err.rawValue)
             }
             // 4) 授权 + 安装（osascript 弹原生密码框；本 App 会被脚本 pkill 并重启，
-            //    本 Task 随进程死亡——这是设计内的终点，不是错误）
+            //    本 Task 随进程死亡——这是设计内的终点，不是错误）。
+            //    审查修复①：传 innerDir（含 FanCtl.app 的顶层目录）而非解压根——
+            //    zip 布局是 staging/FanCtl-{版本}/FanCtl.app，传根目录会让脚本
+            //    exit 2"暂存包不完整"（真机 dogfood 手造 stage 恰好掩盖过此 bug）。
+            //    审查修复②：waitUntilExit 同步阻塞调用线程，osascript 等用户输
+            //    密码可能数分钟——绝不能在 MainActor 上等，整段放 detached。
             guard let script = Bundle.main.path(forResource: "upgrade", ofType: "sh") else {
                 throw Failure("App 内缺内嵌升级脚本（打包问题）")
             }
             phase = .installing(tag: tag)
             let quotedScript = script.replacingOccurrences(of: "'", with: "'\\''")
-            let quotedStage = staging.path.replacingOccurrences(of: "'", with: "'\\''")
-            let osa = Process()
-            osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            osa.arguments = [
-                "-e",
-                "do shell script \"bash '\(quotedScript)' '\(quotedStage)'\" with administrator privileges with prompt \"\(SelfUpgrade.authorizationPrompt(tag: tag))\""
-            ]
-            let errPipe = Pipe()
-            osa.standardError = errPipe
-            try osa.run()
-            osa.waitUntilExit()
-            if osa.terminationStatus != 0 {
+            let quotedStage = innerDir.path.replacingOccurrences(of: "'", with: "'\\''")
+            let prompt = SelfUpgrade.authorizationPrompt(tag: tag)
+            let appleScript =
+                "do shell script \"bash '\(quotedScript)' '\(quotedStage)'\" with administrator privileges with prompt \"\(prompt)\""
+            let (osaStatus, osaErr) = try await Task.detached(priority: .userInitiated) {
+                let osa = Process()
+                osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                osa.arguments = ["-e", appleScript]
+                let errPipe = Pipe()
+                osa.standardError = errPipe
+                try osa.run()
+                osa.waitUntilExit()
                 let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(),
                                  encoding: .utf8) ?? ""
-                if msg.contains("-128") {
+                return (osa.terminationStatus, msg)
+            }.value
+            if osaStatus != 0 {
+                if osaErr.contains("(-128)") {
                     // 用户取消授权：不算失败，菜单安静回到可升级态
+                    //（带括号匹配，防 -1280 类错误码误判为取消）
                     phase = .idle
                     started = false
                     return
                 }
-                throw Failure("安装未完成: \(msg.suffix(160))")
+                throw Failure("安装未完成: \(osaErr.suffix(160))")
             }
-            // 走到这里说明脚本没杀掉本进程（如 asuser open 失败的分支）——尽力自救重启
-            try? Process.run(URL(fileURLWithPath: "/usr/bin/open"),
-                             arguments: ["/Applications/清风.app"])
+            // 走到这里说明脚本没杀掉本进程（pkill 失败的边缘）——必须复位菜单态：
+            // 若进程随即被杀，复位无副作用；若存活，UI 不得永久卡"等待授权"
+            //（审查修复③：原实现 started/phase 永不复位，菜单死锁在 installing）
+            phase = .idle
+            started = false
+            _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/open"),
+                                 arguments: ["/Applications/清风.app"])
         } catch {
             if let f = error as? Failure {
                 phase = .failed(tag: tag, reason: f.msg)

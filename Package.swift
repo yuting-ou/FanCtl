@@ -14,6 +14,8 @@ let package = Package(
         // 只读诊断工具
         .executableTarget(name: "fanprobe", dependencies: ["SMCCore"]),
         // 纯逻辑测试（自带轻量断言 harness，无需 Xcode/XCTest，swift run fanctltests）
-        .executableTarget(name: "fanctltests", dependencies: ["SMCCore"]),
+        // Fixtures/ 用 #filePath 定位（v3.4 E 项），不走 SwiftPM 资源机制——exclude 消音
+        .executableTarget(name: "fanctltests", dependencies: ["SMCCore"],
+                          exclude: ["Fixtures"]),
     ]
 )

@@ -90,13 +90,19 @@ if [[ "$LOGIN_USER" != "root" && -n "$LOGIN_USER" ]]; then
     # LaunchServices 在该上下文不可达），`sudo -u user open` 同败。可靠路径 =
     # asuser + launchctl submit 拉起 MachServices 注册的 bundle：
     #   ① asuser open（标准做法，多数场景可用）
-    #   ② asuser submit 直启二进制（open 不可达时的兜底，App 自带 LSUIElement 托盘）
+    #   ② asuser submit 直启二进制（open 不可达时的兜底，App 自带 LSUIElement 托盘；
+    #     submit 无 KeepAlive，进程退出即结束，不残留常驻标签）
     #   ③ 两者都败不算安装失败——daemon 已升级完成，App 由用户手动 open
-    /bin/launchctl asuser "$LOGIN_UID" /usr/bin/open -a "/Applications/清风.app" 2>/dev/null \
-        || /bin/launchctl asuser "$LOGIN_UID" /bin/launchctl submit \
+    # 实测语义（v3.9.0 dogfood）：对运行中的 submit 进程 launchctl remove 会直接
+    # 杀掉它——因此 remove 只放在 submit 之前清残留（此刻 pkill 已杀掉旧进程，
+    # 无副作用；不清则残留标签令本次 submit "already exists" 失败）。
+    if ! /bin/launchctl asuser "$LOGIN_UID" /usr/bin/open -a "/Applications/清风.app" 2>/dev/null; then
+        /bin/launchctl asuser "$LOGIN_UID" /bin/launchctl remove \
+            "com.fanctl.app.upgrade-relaunch" 2>/dev/null || true
+        /bin/launchctl asuser "$LOGIN_UID" /bin/launchctl submit \
             -l "com.fanctl.app.upgrade-relaunch" \
-            -p "/Applications/清风.app/Contents/MacOS/FanCtl" 2>/dev/null \
-        || true
+            -p "/Applications/清风.app/Contents/MacOS/FanCtl" 2>/dev/null || true
+    fi
 fi
 
 echo "✅ 升级完成: $(/usr/local/libexec/fanctld -v)"

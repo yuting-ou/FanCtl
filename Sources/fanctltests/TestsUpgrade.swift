@@ -33,6 +33,15 @@ func testSelfUpgrade() {
     expect(SelfUpgrade.sanitizeTag(String(repeating: "1", count: 25) + ".0") == nil, "超长拒绝")
     expect(SelfUpgrade.sanitizeTag("3.9.0\n; echo pwned") == nil, "换行注入拒绝")
     expect(SelfUpgrade.sanitizeTag("٣.٩") == nil, "非 ASCII 数字拒绝")
+    // R10 审查补强：前缀/边界/前导零
+    expect(SelfUpgrade.sanitizeTag("v") == nil, "裸 v 前缀拒绝")
+    expect(SelfUpgrade.sanitizeTag("vv3.9") == nil, "双 v 前缀拒绝（剥一层后非数字）")
+    expect(SelfUpgrade.sanitizeTag("0") == "0", "单 0 合法（版本 0）")
+    expect(SelfUpgrade.sanitizeTag("00.1") == "00.1", "前导零放行（URL 安全，无需归一）")
+    expect(SelfUpgrade.sanitizeTag(String(repeating: "1", count: 24)) == String(repeating: "1", count: 24),
+           "24 字符边界放行")
+    expect(SelfUpgrade.sanitizeTag(String(repeating: "1", count: 25)) == nil, "25 字符边界拒绝")
+    expect(SelfUpgrade.sanitizeTag("３.９") == nil, "全角数字拒绝")
 
     group("一键升级·资产 URL 契约")
     // 契约 = ci.yml release job：FanCtl-v{X.Y.Z}.zip（实测 v3.7.0 资产名核对）
@@ -45,6 +54,7 @@ func testSelfUpgrade() {
     expect(SelfUpgrade.assetURL(forTag: "3.9; rm -rf /") == nil, "注入 tag 不得产生 URL")
     expect(SelfUpgrade.assetURL(forTag: "") == nil, "空 tag 不得产生 URL")
     expect(SelfUpgrade.assetURL(forTag: "3.9.0")?.scheme == "https", "强制 HTTPS")
+    expect(SelfUpgrade.assetURL(forTag: "3.9.0")?.host == "github.com", "host 锁定 github.com（R10）")
 
     group("一键升级·暂存包校验门")
     func plistData(version: String?, build: String = "58") -> Data {
@@ -53,7 +63,14 @@ func testSelfUpgrade() {
             dict["CFBundleShortVersionString"] = v
             dict["CFBundleVersion"] = build
         }
-        return try! PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
+        // R8 规矩：测试禁 try!。字典→XML 序列化对 [String:Any] 理论不失败，
+        // 但按纪律显式处理失败路径（失败=测试 harness 缺陷，走断言而非 trap）
+        do {
+            return try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
+        } catch {
+            expect(false, "plistData 构造失败（harness 缺陷）: \(error)")
+            return Data()
+        }
     }
     expect(SelfUpgrade.validateStaged(appInfoPlistData: nil, hasDaemonBinary: true,
                                       tag: "v3.9.0") == .missingApp, "缺 App 拒绝")
@@ -88,7 +105,11 @@ func testSelfUpgrade() {
     expect(prompt.contains("3.9.0"), "授权文案含版本号")
     expect(prompt.contains("管理员"), "授权文案说明需要管理员")
     expect(!prompt.contains(";") && !prompt.contains("`"), "授权文案不含 shell 元字符")
+    // R10 审查：原断言 `!a || !b` 是弱断言（两者同现才失败）；非法 tag 必须
+    // 走固定兜底词，精确锁定完整文案
     let injected = SelfUpgrade.authorizationPrompt(tag: "3.9.0\" , do shell script \"pwned")
-    expect(!injected.contains("pwned") || !injected.contains("do shell"),
-           "注入 tag 不原样进文案（消毒路径）")
+    expectEqual(injected, SelfUpgrade.authorizationPrompt(tag: "垃圾tag"),
+                "非法 tag 落到同一固定兜底文案")
+    expectEqual(injected, "清风升级到 v新版本：需要管理员授权替换系统守护进程与菜单栏 App",
+                "兜底文案精确匹配（含 v 新版本 拼接形态）")
 }
