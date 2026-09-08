@@ -353,6 +353,41 @@ func testGarbageCodable() {
         if let m = ConfigStore.loadAIMetrics() {
             let sd = m.temperatureStdDev
             chaosCheck(&parseViolations, 0, sd.isFinite && sd >= 0, "垃圾评测 stdDev \(sd)")
+            // v3.8 dt 账本：垃圾解码后读出侧必须仍在安全域（钳位/归 0 生效）
+            for b in [m.dtLedgerFast, m.dtLedgerNominal, m.dtLedgerSlow].compactMap({ $0 }) {
+                chaosCheck(&parseViolations, 0,
+                           b.samples >= 0 && b.seconds.isFinite && b.seconds >= 0
+                               && b.dAbsSum.isFinite && b.dAbsSum >= 0
+                               && b.pAbsSum.isFinite && b.pAbsSum >= 0,
+                           "垃圾 dt 账本桶越界 \(b)")
+                if b.seconds > 0 {
+                    let r = b.dRatePerSecond ?? 0
+                    chaosCheck(&parseViolations, 0, r.isFinite && r >= 0, "垃圾桶 D 速率 \(r)")
+                }
+            }
+        }
+    }
+    // v3.8 硬件画像：直接喂 9 类垃圾值组合（含类型错配——decodeIfPresent 抛错路径）
+    for _ in 0..<40 {
+        let garbage: [Any] = [0, -1, 1e308, -1e308, "x", true, [1, 2, 3], NSNull(), 12345.678]
+        var obj: [String: Any] = [
+            "modelID": garbage[rng.pick(garbage.count)],
+            "chipName": garbage[rng.pick(garbage.count)],
+            "osVersion": garbage[rng.pick(garbage.count)],
+            "fanCount": garbage[rng.pick(garbage.count)],
+            "sensorCounts": ["cpu": garbage[rng.pick(garbage.count)],
+                             "gpu": garbage[rng.pick(garbage.count)]],
+            "hasPowerKey": garbage[rng.pick(garbage.count)],
+            "collectedAt": garbage[rng.pick(garbage.count)],
+        ]
+        if rng.pick(3) == 0 { obj.removeValue(forKey: "sensorCounts") }
+        if let data = try? JSONSerialization.data(withJSONObject: obj),
+           let hp = try? JSONDecoder().decode(HardwareProfile.self, from: data) {
+            // 解码成功的形态：读出侧保证安全域
+            chaosCheck(&parseViolations, 0,
+                       hp.fanCount >= 0 && hp.fanCount <= 100
+                           && hp.modelID.map { $0.count <= 128 } ?? true,
+                       "垃圾画像字段越界 fanCount=\(hp.fanCount)")
         }
     }
     let statusBase = try! JSONEncoder().encode(

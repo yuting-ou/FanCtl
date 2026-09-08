@@ -67,6 +67,8 @@ public final class ControlEngine {
     public private(set) var lastConfigMTime: Date   // ConfigWatch 事件去重读（跨模块）
     var controller = FanCurveController()
     public private(set) var aiController = AIController()
+    /// v3.8 硬件画像：init 采集一次（慢变量），随每拍 status 下发
+    public private(set) var hardwareProfile: HardwareProfile?
     public private(set) var thermalLearn: ThermalLearn
     public private(set) var aiMetrics: AIControlMetrics
     var aiMetricsUserTarget: Double? = nil   // 评测的用户目标基准（有效目标随环境/夜间漂移，不能用作重置判据）
@@ -186,6 +188,11 @@ public final class ControlEngine {
             hooks.log("归档停机前战报: \(stale.date)")
         }
         self.statsKeeper = restored.sampler
+        // v3.8 硬件画像：启动采集一次（慢变量，进程内不变），随 status 下发。
+        // 单源失败各自降级，画像照常产出——陌生机器 issue 的"这台机器长什么样"
+        self.hardwareProfile = HardwareProfile.collect(fans: fans, sensors: sensors,
+                                                       now: hooks.now())
+        hooks.log("硬件画像: \(hardwareProfile?.oneLine ?? "采集失败")")
     }
 
     // MARK: - 睡眠/唤醒/退出交接（原 SleepHandler 内联逻辑迁入）
@@ -905,7 +912,11 @@ public final class ControlEngine {
                 }
                 aiMetrics.targetTemp = aiTargetEff   // 过冲/超温基准用有效目标（环境/夜间/电池叠加后）
                 aiMetrics.userTargetTemp = userTarget
-                aiMetrics.record(temp: temp, output: output, seconds: actualInterval)
+                // v3.8 D 项 dt 账本：step 与 record 同拍对齐（targetPercent 非 nil 时本拍
+                // 必然走过 PD 路径），把实际生效增量交给账本分桶（EVOLUTION R8 预注册裁决）
+                let appliedDeltas = aiController.lastAppliedDeltas
+                aiMetrics.record(temp: temp, output: output, seconds: actualInterval,
+                                 dDelta: appliedDeltas?.d, pDelta: appliedDeltas?.p)
             }
             // v3.2 过冲观察：与 aiMetrics 同一排除集（静音封顶是用户意图而非控制失效，
             // 安全覆盖/闭环故障期的温度不反映 AI 控制质量——混入会让 τ 自适应的
@@ -1046,7 +1057,9 @@ public final class ControlEngine {
                 idle: aiIdleActive,
                 hysteresisHold: hysteresisHold,
                 guardSeconds: aiController.cyclingGuardRemainingSeconds > 0
-                    ? aiController.cyclingGuardRemainingSeconds : nil) : nil
+                    ? aiController.cyclingGuardRemainingSeconds : nil) : nil,
+            // v3.8 硬件画像：启动时采集一次，恒定下发
+            hardwareProfile: hardwareProfile
         )
 
         let summary = statusChangeSummary(status)

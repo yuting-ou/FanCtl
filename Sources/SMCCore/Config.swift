@@ -374,6 +374,10 @@ public struct DaemonStatus: Codable {
     public var learnMap: [ThermalLearn.LearnedPoint]?
     // v3.7 决策透镜：AI 模式"为什么是这个转速"的可解释快照（全 Optional，旧版兼容）
     public var decisionTrace: DecisionTrace?
+    // v3.8 硬件画像（N=1 通用化第一块砖）：机型/芯片/OS/风扇数/传感器计数/功耗键存在性。
+    // daemon 启动采集一次后随 status 下发——陌生机器的 issue 首问"这台机器长什么样"
+    // 一次回答。Optional：旧 daemon 无此字段
+    public var hardwareProfile: HardwareProfile?
     public var cpuTemp: Double { sensors.cpuDie }
     public var gpuTemp: Double { sensors.gpuDie }
 
@@ -398,7 +402,8 @@ public struct DaemonStatus: Codable {
                 palmComp: Double? = nil,
                 learnEnvelopeGap: Double? = nil,
                 learnMap: [ThermalLearn.LearnedPoint]? = nil,
-                decisionTrace: DecisionTrace? = nil) {
+                decisionTrace: DecisionTrace? = nil,
+                hardwareProfile: HardwareProfile? = nil) {
         self.sensors = sensors
         self.mode = mode
         self.appliedPercent = appliedPercent
@@ -431,6 +436,9 @@ public struct DaemonStatus: Codable {
         self.learnEnvelopeGap = learnEnvelopeGap
         self.learnMap = learnMap
         self.decisionTrace = decisionTrace
+        // v3.8：与 F9（v3.6.0 起静默吞 learnEnvelopeGap）同一教训——Optional 字段
+        // 也必须显式赋值，"没赋值"与"值为 nil"语义不同。
+        self.hardwareProfile = hardwareProfile
     }
 
     // 旧版便利初始化（保持源码兼容）
@@ -466,6 +474,7 @@ public struct DaemonStatus: Codable {
         case aiTargetEffective
                 case palmComp, learnEnvelopeGap // 旧字段
         case learnMap, decisionTrace
+        case hardwareProfile
         case cpuTemp, gpuTemp
     }
 
@@ -512,6 +521,7 @@ public struct DaemonStatus: Codable {
         self.learnEnvelopeGap = try container.decodeIfPresent(Double.self, forKey: .learnEnvelopeGap)
         self.learnMap = try container.decodeIfPresent([ThermalLearn.LearnedPoint].self, forKey: .learnMap)
         self.decisionTrace = try container.decodeIfPresent(DecisionTrace.self, forKey: .decisionTrace)
+        self.hardwareProfile = try container.decodeIfPresent(HardwareProfile.self, forKey: .hardwareProfile)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -544,6 +554,7 @@ public struct DaemonStatus: Codable {
         try container.encodeIfPresent(learnEnvelopeGap, forKey: .learnEnvelopeGap)
         try container.encodeIfPresent(learnMap, forKey: .learnMap)
         try container.encodeIfPresent(decisionTrace, forKey: .decisionTrace)
+        try container.encodeIfPresent(hardwareProfile, forKey: .hardwareProfile)
         // 同时写旧字段，保证回滚到旧版本 App/daemon 时也能读
         try container.encode(sensors.cpuDie, forKey: .cpuTemp)
         try container.encode(sensors.gpuDie, forKey: .gpuTemp)

@@ -1347,3 +1347,246 @@ func testTrustTriangle() {
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
     }
 }
+
+// MARK: - v3.8 兑现轮：D 项 dt 账本 + 硬件画像 + 存活去抖（EVOLUTION R8）
+
+func testDTLedger() {
+    group("v3.8 D 项 dt 账本")
+
+    // —— record() 分桶：边界 1.5s / 4.5s，时长与 |P|/|D| 各自累计 ——
+    do {
+        var m = AIControlMetrics(targetTemp: 76)
+        m.record(temp: 76, output: 40, seconds: 1.0, dDelta: -2, pDelta: 1)     // fast
+        m.record(temp: 77, output: 41, seconds: 1.4, dDelta: 3, pDelta: -1)     // fast（<1.5）
+        m.record(temp: 78, output: 42, seconds: 3.0, dDelta: 1.5, pDelta: 2)    // nominal
+        m.record(temp: 79, output: 43, seconds: 10.0, dDelta: -1, pDelta: 0)    // slow
+        guard let fast = m.dtLedgerFast, let nom = m.dtLedgerNominal, let slow = m.dtLedgerSlow else {
+            expect(false, "四拍后三桶全部建立（fast=\(String(describing: m.dtLedgerFast)) nom=\(String(describing: m.dtLedgerNominal)) slow=\(String(describing: m.dtLedgerSlow))）")
+            return
+        }
+        expectEqual(fast.samples, 2, "快拍样本数")
+        expectClose(fast.seconds, 2.4, 1e-9, "快拍时长累计")
+        expectClose(fast.dAbsSum, 5, 1e-9, "|D| 绝对值累计（1.5→0 无符号吞噬）")
+        expectClose(nom.pAbsSum, 2, 1e-9, "标称桶 |P|")
+        expectEqual(slow.samples, 1, "长拍样本数")
+        expect(m.sampleCount == 4 && abs(m.activeSeconds - 15.4) < 1e-9, "总账不串桶")
+
+        // nil 增量（首拍播种/空闲交还拍）：入时长分布，增量记 0
+        var m2 = AIControlMetrics(targetTemp: 76)
+        m2.record(temp: 76, output: 30, seconds: 3.0)
+        expect(m2.dtLedgerNominal?.samples == 1 && m2.dtLedgerNominal?.dAbsSum == 0,
+               "nil 增量入桶但 |D| 记 0")
+
+        // 非有限增量防御：坏值不入账，样本照记（账本永不因坏值失真）
+        m2.record(temp: 77, output: 31, seconds: 3.0, dDelta: .nan, pDelta: .infinity)
+        expect(m2.dtLedgerNominal?.samples == 2, "非有限增量仍计样本")
+        expect(m2.dtLedgerNominal?.dAbsSum == 0 && m2.dtLedgerNominal?.pAbsSum == 0,
+               "非有限增量不计入累计")
+    }
+
+    // —— 读出侧防御：垃圾解码（合法有限巨值/负值）钳位（P3 同源） ——
+    do {
+        struct Wrapper: Codable { let b: DTermLedgerBucket }
+        let json = #"{"b":{"samples":-5,"seconds":1e308,"dAbsSum":-1e308,"pAbsSum":3}}"#
+        let w = try! JSONDecoder().decode(Wrapper.self, from: Data(json.utf8))
+        expectEqual(w.b.samples, 0, "负样本数归 0")
+        expect(w.b.seconds == 1e9 && w.b.dAbsSum == 0,
+               "正有限巨值钳到上限 1e9、负值归 0（得 \(w.b.seconds)/\(w.b.dAbsSum)）")
+        expectEqual(w.b.pAbsSum, 3, "合法值保留")
+        // 缺字段桶（半截 JSON）不炸
+        let partial = try! JSONDecoder().decode(Wrapper.self, from: Data(#"{"b":{"samples":2}}"#.utf8))
+        expectEqual(partial.b.samples, 2, "半截桶可解码")
+        expect(partial.b.seconds == 0, "缺时长默认 0")
+    }
+
+    // —— 向后兼容：旧版 ai-metrics.json（无账本字段）照常解码 ——
+    do {
+        let old = #"{"targetTemp":76,"activeSeconds":10,"sampleCount":2,"temperatureSum":150,"temperatureSquaredSum":11252,"peakTemp":80,"maxOvershoot":4,"highTempSeconds":0,"outputSum":80,"outputChangeCount":1,"outputChangeMagnitude":10,"updatedAt":700000000.0}"#
+        let m = try! JSONDecoder().decode(AIControlMetrics.self, from: Data(old.utf8))
+        expect(m.sampleCount == 2 && m.dtLedgerFast == nil, "旧 JSON 解码 + 账本字段 nil")
+        // 往返：新结构编码再解码不丢
+        var m2 = AIControlMetrics(targetTemp: 76)
+        m2.record(temp: 80, output: 50, seconds: 1.0, dDelta: 2, pDelta: 1)
+        let data = try! JSONEncoder().encode(m2)
+        let back = try! JSONDecoder().decode(AIControlMetrics.self, from: data)
+        expectEqual(back, m2, "含账本字段的完整往返")
+    }
+
+    // —— 控制器增量转述：dt=1s 快拍 vs dt=3s 标称的 D 每拍增量（理论上同 slopeRate 时相等：
+    //      dDelta = kD·slope·(1/dtNom)，slope=slopeRate·dt → dDelta=3·kD·slopeRate 与 dt 无关；
+    //      每秒贡献才差 3 倍——这正是账本要用真机数据裁决的问题） ——
+    do {
+        let dts: [Double] = [1.0, 3.0]
+        var rates: [Double] = []
+        for dt in dts {
+            var ai = AIController()
+            ai.tuning.targetTemp = 76
+            ai.tuning.comfortBand = 0   // 放开 P 项（大误差）
+            _ = ai.step(temp: 76, dt: 3.0)          // 播种拍
+            _ = ai.step(temp: 76 + 0.6 * dt, dt: dt) // 每秒 +0.6° 的爬升（超死区）
+            guard let deltas = ai.lastAppliedDeltas else {
+                expect(false, "主路径拍有增量转述（dt=\(dt) idleReleased=\(ai.idleReleased)）")
+                return
+            }
+            let d = deltas.d
+            rates.append(d / dt)                     // 每秒 |D| 推力
+        }
+        expectClose(rates[0] / rates[1], 3.0, 1e-9,
+                    "D 每秒推力快拍/标称 = 3（1/dtNom 漂移的解析复核）")
+        // P 项每秒恒定（基线校准的解析依据）：pDelta/dt = kP·error/3
+        guard let p1sPair: (Double, Double) = {
+            var ai3 = AIController(); ai3.tuning.targetTemp = 76; ai3.tuning.comfortBand = 0
+            _ = ai3.step(temp: 76, dt: 3.0)
+            _ = ai3.step(temp: 78, dt: 1.0)   // error=2，output 低不饱和
+            guard let d3 = ai3.lastAppliedDeltas else { return nil }
+            var ai4 = AIController(); ai4.tuning.targetTemp = 76; ai4.tuning.comfortBand = 0
+            _ = ai4.step(temp: 76, dt: 3.0)
+            _ = ai4.step(temp: 78, dt: 3.0)
+            guard let d4 = ai4.lastAppliedDeltas else { return nil }
+            return (d3.p / 1.0, d4.p / 3.0)
+        }() else {
+            expect(false, "P 路径增量转述缺失")
+            return
+        }
+        expectClose(p1sPair.0, p1sPair.1, 1e-9, "P 每秒贡献与 dt 无关（kP·error/3）")
+    }
+
+    // —— 引擎级：AI 拍经 record 通道入账（step/record 同拍对齐，不双计不漏计） ——
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 76, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 78); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        // 连续温升（每拍 +0.6°·3s → 超 D 死区），7 拍全部走主路径。
+        // aiMetrics 60s 节流落盘：21s < 60s，须走 shutdownSave 验证持久化链路
+        for i in 0..<7 {
+            smc.set("Tp01", 78 + 0.6 * Double(i))
+            clock.advance(3)
+            engine.beat()
+        }
+        engine.shutdownSave()
+        let m = ConfigStore.loadAIMetrics()
+        guard let m, let nom = m.dtLedgerNominal else {
+            expect(false, "引擎拍入账（metrics=\(m != nil) nom=\(String(describing: m?.dtLedgerNominal))）")
+            for d in envDirs { try? FileManager.default.removeItem(at: d) }
+            FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+            return
+        }
+        expect(m.sampleCount >= 5, "引擎拍入了评测账本（得 \(m.sampleCount)）")
+        expect(nom.samples >= 5, "3s 拍入标称桶（得 \(nom.samples)）")
+        expect(nom.dAbsSum > 0, "温升段 D 增量有实际入账")
+        // 账本完备性契约：每个入账样本恰好落进唯一桶（首拍 actualInterval=0 被
+        // record 守卫跳过，故不能假设 sampleCount-1；锁的是桶边界无缝）
+        let bucketSum = (m.dtLedgerFast?.samples ?? 0) + nom.samples + (m.dtLedgerSlow?.samples ?? 0)
+        expectEqual(bucketSum, m.sampleCount, "分桶样本数总和 = 总样本数")
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    }
+}
+
+func testHardwareProfile() {
+    group("v3.8 硬件画像")
+
+    // —— 字段往返 + 读出侧防御 ——
+    do {
+        let hp = HardwareProfile(
+            modelID: "Mac16,7", chipName: "Apple M4 Pro", osVersion: "26.1",
+            fanCount: 2,
+            sensorCounts: .init(cpu: 6, gpu: 2, nand: 1, batt: 2, palm: 1, heatsink: 2, other: 8),
+            hasPowerKey: true, collectedAt: Date(timeIntervalSince1970: 700_000_000))
+        let back = try! JSONDecoder().decode(HardwareProfile.self,
+                                             from: try! JSONEncoder().encode(hp))
+        expectEqual(back, hp, "画像完整往返")
+        expect(back.oneLine.contains("Mac16,7") && back.oneLine.contains("风扇x2"),
+               "一行摘要含机型/风扇数")
+
+        // 垃圾域钳位：越界 fanCount/超长字符串/缺字段
+        let garbage = #"{"fanCount":99999,"modelID":"M1","chipName":"AAABBB","hasPowerKey":"yes","collectedAt":700000000.0}"#
+        // fanCount=99999 出界归 0；hasPowerKey 是 Bool 类型不匹配 → decode 抛错走 ?? 默认
+        let g = try! JSONDecoder().decode(HardwareProfile.self, from: Data(garbage.utf8))
+        expectEqual(g.fanCount, 0, "越界 fanCount 归 0")
+        let long = HardwareProfile(modelID: String(repeating: "X", count: 500), chipName: nil,
+                                   osVersion: nil, fanCount: 1,
+                                   sensorCounts: .init(cpu: 0, gpu: 0, nand: 0, batt: 0, palm: 0,
+                                                       heatsink: 0, other: 0),
+                                   hasPowerKey: false, collectedAt: Date())
+        let lback = try! JSONDecoder().decode(HardwareProfile.self,
+                                              from: try! JSONEncoder().encode(long))
+        expectEqual(lback.modelID?.count, 128, "超长 modelID 截断到 128")
+    }
+
+    // —— DaemonStatus 载体：旧 status.json（无画像字段）解码 nil；新字段显式赋值 ——
+    do {
+        let old = """
+        {"sensors":{"cpuDie":70,"gpuDie":60},"mode":"curve","appliedPercent":40,
+         "fans":[{"id":0,"actualRPM":2000,"targetRPM":2000,"minRPM":1200,"maxRPM":5000}],
+         "timestamp":700000000.0}
+        """
+        let st = try! JSONDecoder().decode(DaemonStatus.self, from: Data(old.utf8))
+        expect(st.hardwareProfile == nil, "旧 status 无画像字段 → nil")
+        var st2 = st
+        st2.hardwareProfile = HardwareProfile(
+            modelID: "Mac16,7", chipName: "Apple M4 Pro", osVersion: "26.1", fanCount: 2,
+            sensorCounts: .init(cpu: 6, gpu: 2, nand: 1, batt: 2, palm: 1, heatsink: 2, other: 8),
+            hasPowerKey: true, collectedAt: Date(timeIntervalSince1970: 700_000_000))
+        let back = try! JSONDecoder().decode(DaemonStatus.self,
+                                             from: try! JSONEncoder().encode(st2))
+        expect(back.hardwareProfile != nil && back.hardwareProfile!.fanCount == 2,
+               "新 status 带画像往返（F9 教训：字段必须真的被写进 JSON）")
+    }
+
+    // —— 引擎 init 采集一次并随 status 下发（MockSMC 真实链路） ——
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve))
+        let smc = makeFanSMC(); smc.set("Tp01", 65)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        expect(engine.hardwareProfile != nil, "引擎 init 产出画像")
+        expect(engine.hardwareProfile?.fanCount == 1, "MockSMC 单风扇计数")
+        expect(engine.hardwareProfile?.sensorCounts.cpu ?? 0 >= 1, "Tp01 归 CPU 传感器")
+        clock.advance(1)
+        engine.beat()
+        let st = ConfigStore.loadStatus()
+        expect(st?.hardwareProfile != nil, "status.json 携带画像")
+        expectEqual(st?.hardwareProfile?.modelID, engine.hardwareProfile?.modelID,
+                    "status 与引擎内存画像一致")
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    }
+}
+
+func testAliveDebouncer() {
+    group("v3.8 存活去抖")
+
+    // 初始死：死观测不翻转出假活
+    var d = AliveDebouncer()
+    expect(!d.update(observedAlive: false), "初始死 + 死观测 = 死")
+    expect(!d.update(observedAlive: false), "连续死观测保持死")
+
+    // 上线立即生效（快恢复）
+    expect(d.update(observedAlive: true), "死 → 一次活观测立即上线")
+    expect(d.alive && d.deadStreak == 0, "上线清零连死计数")
+
+    // 下线需连续 2 次死观测：单次读失败/rename 竞态不闪断
+    expect(d.update(observedAlive: false), "第 1 次死观测：宽限保持活")
+    expect(d.alive, "宽限期内 alive 不翻转")
+    expect(!d.update(observedAlive: false), "第 2 次死观测：宣布下线")
+
+    // 宽限期内恢复上线：计数归零
+    expect(d.update(observedAlive: true), "宽限期内复活")
+    _ = d.update(observedAlive: false)
+    expect(d.update(observedAlive: true), "1 死 + 1 活：不判死")
+    expect(d.alive && d.deadStreak == 0, "复活后计数干净")
+
+    // 计数封顶：长死期不无限增长
+    _ = d.update(observedAlive: false)
+    for _ in 0..<1000 { _ = d.update(observedAlive: false) }
+    expectEqual(d.deadStreak, AliveDebouncer.deadThreshold, "死计数封顶")
+    expect(!d.alive, "长死期判定稳定")
+}

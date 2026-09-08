@@ -58,6 +58,8 @@ final class FanModel: ObservableObject {
     @Published var preset: CurvePreset = .balanced
     @Published var aiTargetTemp: Double = 76
     @Published var daemonAlive = false
+    /// v3.8 存活去抖（SMCCore 可单测）：下线需连续 2 次死观测，上线立即生效
+    private var aliveDebouncer = AliveDebouncer()
     @Published var appliedPercent: Double = 0
     @Published var appliedPercents: [Double] = []     // 双风扇独立百分比
     @Published var curveTargetPercent: Double? = nil  // AI 模式下当前温度的曲线期望基准（v7 曲线锚定）
@@ -540,7 +542,9 @@ final class FanModel: ObservableObject {
             // 存活阈值 30s：daemon idle 间隔可达 20s（LOOP_INTERVAL_IDLE），
             // status.json 在 idle 状态下每 20s 更新一次（10s 心跳检查只在 runControlLoop 中）。
             // 阈值需 > 20s + 系统调度余量，避免 idle 状态下误判 daemon 死了。
-            daemonAlive = age < 30
+            // v3.8：下线判定经 AliveDebouncer 去抖（rename 竞态单拍陈旧不再闪断；
+            // 上线方向立即生效），逻辑在 SMCCore 供单测。
+            daemonAlive = aliveDebouncer.update(observedAlive: age < 30)
             // v3.5.1（R1，P2 合并优先）：本函数已解码一次 status，刷新直接传参复用——
             // 旧路径 refreshFromStatus() 会再次读盘解码同一文件（12s 兜底每周期 2 次解码）。
             if !wasAlive && daemonAlive {
@@ -569,26 +573,30 @@ final class FanModel: ObservableObject {
                 palmComp = nil
             }
         } else {
-            // status.json 不存在或无法读取：daemon 下线（含刚下线需清除状态）
-            if daemonAlive {
-                controlReason = nil
-                aiIntent = nil
-                controlFault = false
-                faultReason = nil
-                targetUnreachable = false
-                curveTargetPercent = nil
-                components = []
-                learnedNow = nil
-                learnMap = []
-                decisionTrace = nil
-                daemonMode = nil
-                configMismatch = false
-                envTemp = nil
-                systemPower = nil
-                aiTargetEffective = nil
-                palmComp = nil
+            // status.json 不存在或无法读取：daemon 下线（含刚下线需清除状态）。
+            // 读失败同样走去抖：单次读失败不闪断，连续 2 次才宣布下线；
+            // 宽限期内保持现状（UI 数据是旧的但完整，好过清空回填）
+            if !aliveDebouncer.update(observedAlive: false) {
+                if daemonAlive {
+                    controlReason = nil
+                    aiIntent = nil
+                    controlFault = false
+                    faultReason = nil
+                    targetUnreachable = false
+                    curveTargetPercent = nil
+                    components = []
+                    learnedNow = nil
+                    learnMap = []
+                    decisionTrace = nil
+                    daemonMode = nil
+                    configMismatch = false
+                    envTemp = nil
+                    systemPower = nil
+                    aiTargetEffective = nil
+                    palmComp = nil
+                }
+                daemonAlive = false
             }
-            daemonAlive = false
         }
         // 冲刺/静音到期检查
         if let end = boostEndDate, Date() >= end { endBoost(restore: true) }
@@ -600,22 +608,25 @@ final class FanModel: ObservableObject {
     // （12s 兜底/文件事件路径传入，省一次读盘+全量 JSON 解码；nil = 自读）
     private func refreshFromStatus(preloaded: DaemonStatus? = nil) {
         guard let status = preloaded ?? ConfigStore.loadStatus() else {
-            daemonAlive = false
-            controlReason = nil
-            aiIntent = nil
-            currentLoopInterval = nil
-            controlFault = false
-            faultReason = nil
-            targetUnreachable = false
-            curveTargetPercent = nil
-            daemonMode = nil
-            configMismatch = false
-            aiTargetEffective = nil
-            palmComp = nil
+            // 读失败走同一去抖器：单次失败宽限，连续 2 次判死
+            if !aliveDebouncer.update(observedAlive: false) {
+                daemonAlive = false
+                controlReason = nil
+                aiIntent = nil
+                currentLoopInterval = nil
+                controlFault = false
+                faultReason = nil
+                targetUnreachable = false
+                curveTargetPercent = nil
+                daemonMode = nil
+                configMismatch = false
+                aiTargetEffective = nil
+                palmComp = nil
+            }
             return
         }
         lastStatusTimestamp = status.timestamp
-        daemonAlive = Date().timeIntervalSince(status.timestamp) < 30
+        daemonAlive = aliveDebouncer.update(observedAlive: Date().timeIntervalSince(status.timestamp) < 30)
         if !daemonAlive {
             controlReason = nil
             aiIntent = nil

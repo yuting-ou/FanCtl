@@ -181,6 +181,10 @@ public struct AIController {
     /// v3.7 决策透镜：抑制期剩余秒数（0 = 未抑制）。只读视图，不改变状态语义
     public var cyclingGuardRemainingSeconds: Double { cyclingGuardRemaining }
     public private(set) var currentGuardSeconds: Double = 0 // 最近一次武装的抑制时长（日志/测试用）
+    // v3.8 D 项 dt 账本：本拍实际生效的 (dDelta, pDelta)——pDelta 在 anti-windup
+    // 跳过同向 P 项时记 0（账本只记"真推动了输出"的部分）。nil = 本拍未走 PD
+    // 路径（首拍播种/空闲交还/温度坏值），引擎侧不入账。只读转述，不改控制行为。
+    public private(set) var lastAppliedDeltas: (d: Double, p: Double)?
 
     public init(tuning: AITuning = AITuning()) { self.tuning = tuning }
 
@@ -202,7 +206,7 @@ public struct AIController {
                               gpuPower: Double? = nil,
                               allowRelease: Bool = true, dt: Double = 3.0) -> Double? {
         // 防御：非有限值（NaN/Inf，理论上传感器已过滤）不更新状态，避免一个坏值永久污染
-        guard temp.isFinite else { return idleReleased ? nil : output }
+        guard temp.isFinite else { lastAppliedDeltas = nil; return idleReleased ? nil : output }
         // 钳制 dt：系统睡眠唤醒后可能传入超大值，导致 P 项瞬间冲到 100
         // NaN dt 穿透 min/max（NaN 比较恒 false），导致 output 变 NaN 传播到 SMC。
         // 退回标称拍长 3s（保守降级，P/D 项语义不变）
@@ -248,6 +252,7 @@ public struct AIController {
 
         // 空闲交还中：等夺回条件，不推进积分（温度低于目标，积分只会无意义下沉）
         if idleReleased {
+            lastAppliedDeltas = nil   // 非 PD 拍：dt 账本不入账
             if graceSeconds < .infinity { graceSeconds += dt }
             if secondsSinceRelease < .infinity { secondsSinceRelease += dt }
             // 静音会议中途激活（allowRelease 转 false）→ 强制夺回：
@@ -287,6 +292,7 @@ public struct AIController {
 
         guard prev != nil else {
             // 首拍无历史斜率：优先学习值播种，退回曲线插值，最后退回公式起点
+            lastAppliedDeltas = nil   // 播种拍非 PD 增量：dt 账本不入账
             output = learned ?? curvePercent ?? seedOutput(for: temp)
             return checkIdleRelease(temp: temp, allowRelease: allowRelease, dt: dt)
         }
@@ -316,9 +322,14 @@ public struct AIController {
         let pDelta = tuning.kP * clampedError * dtNom
         let dDelta = tuning.kD * clampedSlope * (1.0 / dtNom)
         var delta = dDelta
+        let pApplied: Double
         if (output < 100 || pDelta <= 0) && (output > 0 || pDelta >= 0) {
             delta += pDelta
+            pApplied = pDelta
+        } else {
+            pApplied = 0   // anti-windup 跳过：账本只记实际生效部分
         }
+        lastAppliedDeltas = (d: dDelta, p: pApplied)
         output = min(100, max(0, output + delta))
 
         // v9 曲线锚定（探测式阶梯，替代 v7 连续拉取）：误差和斜率都归零（稳态）时，
@@ -467,5 +478,6 @@ public struct AIController {
         cyclingBackoffMul = 1
         currentGuardSeconds = 0
         cyclingGuardArmed = false
+        lastAppliedDeltas = nil
     }
 }

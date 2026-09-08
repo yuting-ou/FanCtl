@@ -297,6 +297,8 @@ public final class TemperatureSensors {
     private var heatsinkKeys: [String]  // 散热片/风道
     private var otherHotKeys: [String]  // 其他未归类但温度较高的传感器
     private let powerKey: String?   // 整机功耗键（PSTR=系统总功率，部分机型无）
+    /// v3.8 硬件画像：功耗键存在性（机器形状的一部分；不读值，无 SMC 成本）
+    public var hasPowerKey: Bool { powerKey != nil }
     private var lastScanTime: Date = .distantPast
     private let scanInterval: TimeInterval = 300  // 5 分钟重扫一次，应对休眠唤醒/动态变化
 
