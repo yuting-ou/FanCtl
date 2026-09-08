@@ -394,6 +394,7 @@ func testEngineWiring() {
         let clock = FakeClock()
         let colA = EngineCollector(), colB = EngineCollector()
         var cpuPowerNow = 12.0   // 可变分项功耗（突增由这里注入）
+        seedLearnTable()
         let engineA = makeEngine(smc: smc, clock: clock, collector: colA,
                                  powerComponents: { (cpuPowerNow, 10) })
         let smcB = makeFanSMC(); smcB.set("Tp01", 74); smcB.set("PSTR", 30)
@@ -480,6 +481,7 @@ func testLearnSaturatedGate() {
         let smc = makeFanSMC(); smc.set("Tp01", 88); smc.set("PSTR", 45)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col,
                                 powerComponents: { (40, 15) })
         for _ in 0..<20 {
@@ -503,6 +505,7 @@ func testLearnSaturatedGate() {
         let smc = makeFanSMC(); smc.set("Tp01", 91.5); smc.set("PSTR", 45)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col,
                                 powerComponents: { (40, 15) })
         for _ in 0..<20 {
@@ -979,6 +982,7 @@ func testControlEngine() {
         let smc = makeFanSMC(); smc.set("Tp01", 60); smc.set("TB0t", 49); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         engine.beat()
         expectEqual(smc.lastWrite("F0Tg"), 5000, "电池危急档手动模式也全速")
@@ -1038,6 +1042,7 @@ func testControlEngine() {
         let smc = makeFanSMC(); smc.set("Tp01", 60); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         engine.beat()
         if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
@@ -1064,6 +1069,7 @@ func testControlEngine() {
         let smc = makeFanSMC(); smc.set("Tp01", 60); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         engine.beat()
         // 模拟拖动滑块：config 从 80% 快速写到 20%，每次写触发一次 fast apply 拍；
@@ -1090,6 +1096,7 @@ func testControlEngine() {
         let smc = makeFanSMC(); smc.set("Tp01", 60); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         for _ in 0..<5 {
             engine.beat()
@@ -1139,6 +1146,7 @@ func testControlEngine() {
         let smc = makeFanSMC(); smc.set("Tp01", 60); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         var released = false
         for _ in 0..<15 { engine.beat()
@@ -1166,6 +1174,7 @@ func testControlEngine() {
         let smc = makeFanSMC(); smc.set("Tp01", 73.9); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         for _ in 0..<15 { engine.beat()
             if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
@@ -1184,6 +1193,7 @@ func testControlEngine() {
         let smc = makeFanSMC(); smc.set("Tp01", 70); smc.set("Ts0P", 44); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         engine.beat()
         let st = ConfigStore.loadStatus()
@@ -1206,6 +1216,7 @@ func testControlEngine() {
                                          envCompensation: false))
         let smc = makeFanSMC(); smc.set("Tp01", 82); smc.set("PSTR", 30)
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         for _ in 0..<4 { engine.beat(); clock.advance(3) }
         expectEqual(engine.aiMetrics.sampleCount, 0, "静音封顶期不记评测样本")
@@ -1285,6 +1296,7 @@ func testTrustTriangle() {
         let smc = makeFanSMC(); smc.set("Tp01", 78); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         engine.beat()
         var st = ConfigStore.loadStatus()
@@ -1314,6 +1326,7 @@ func testTrustTriangle() {
         let smc = makeFanSMC(); smc.set("Tp01", 78); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         // F8 修复后 timestamp 走注入时钟——status.json 写盘节流语义可被直接观察
         var snapshots: [[Double]?] = []
@@ -1459,6 +1472,7 @@ func testDTLedger() {
         let smc = makeFanSMC(); smc.set("Tp01", 78); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         // 连续温升（每拍 +0.6°·3s → 超 D 死区），7 拍全部走主路径。
         // aiMetrics 60s 节流落盘：21s < 60s，须走 shutdownSave 验证持久化链路
@@ -1606,6 +1620,7 @@ func testPassiveMachine() {
         smc.set("Tp01", 78); smc.set("PSTR", 30)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         for _ in 0..<5 { clock.advance(3); engine.beat() }
         let st = ConfigStore.loadStatus()
@@ -1628,6 +1643,7 @@ func testPassiveMachine() {
         smc.set("Tp01", 60); smc.set("PSTR", 8)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         clock.advance(3); engine.beat()
         expectEqual(ConfigStore.loadStatus()?.reason, .auto, "passive 机器手动模式同样语义化")
@@ -1645,11 +1661,97 @@ func testPassiveMachine() {
         smc.set("Tp01", 60); smc.set("PSTR", 8)
         let clock = FakeClock()
         let col = EngineCollector()
+        seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         clock.advance(3); engine.beat()
         expect(ConfigStore.loadStatus()?.reason == .manual, "有风扇机器 manual 保持 manual")
         expect(smc.lastWrite("F0Tg") != nil, "有风扇照常写扇（门控零误伤）")
         expect(col.logs.filter { $0.contains("无风扇") }.isEmpty, "有风扇不打 passive 日志")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+}
+
+
+// MARK: - 4.0 B2 冷启动校准期
+
+func testCalibrationColdStart() {
+    group("冷启动校准(4.0 B2)")
+
+    // ① 全生命周期：空学习表 + AI 模式 → 观察期语义化 auto + 系统自控平衡入表 →
+    //    满 2 桶后下一拍接管（AI 输出链恢复，calibrating=false）
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC()   // fan0: Mn=1200 Mx=5000
+        // 稳态温度 70°：观察期系统把风扇放到某固定转速（我们直接设 Ac 模拟系统自控）
+        smc.set("Tp01", 70); smc.set("PSTR", 30); smc.set("F0Ac", 3000)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        // 第 1 拍：进入观察期
+        clock.advance(3); engine.beat()
+        var st = ConfigStore.loadStatus()
+        expectEqual(st?.calibrating, true, "空表 + AI → calibrating=true")
+        expectEqual(st?.reason, .auto, "观察期语义化 auto")
+        expectEqual(smc.lastWrite("F0Tg"), nil as Double?, "观察期不写扇（风扇归系统）")
+        // 采样 24 拍（72s）：12 个稳态样本达 CALIBRATION_MIN_SAMPLES 兜底线，
+        // 且跨过 60s 学习表落盘线（statsAccumSeconds 门）——盘上才读得到样本。
+        // 同温度同转速 = 稳态；F0Ac 每拍重设（模拟系统自控维持的平衡转速）
+        for _ in 0..<24 {
+            clock.advance(3); smc.set("F0Ac", 3000); engine.beat()
+        }
+        st = ConfigStore.loadStatus()
+        // 3000 RPM ∈ [1200,5000] → 反解 (3000-1200)/3800 ≈ 47.4%，稳态样本应已入 70° 桶
+        let learned = ConfigStore.loadLearn() ?? ThermalLearn()
+        expect(learned.sampleTotal >= CALIBRATION_MIN_SAMPLES,
+               "观察期稳态样本已入学习表（实际 \(learned.sampleTotal)）")
+        expect(st?.calibrating != true, "样本达标后不在校准（nil/false 均可）")
+        expect(col.logs.contains { $0.contains("校准完成") }, "完成日志在场")
+        // 接管验证：温度升到目标带外，AI 应主动写扇（不再是 .auto 交还）
+        smc.set("Tp01", 80)
+        clock.advance(3); smc.set("F0Ac", 3000); engine.beat()
+        st = ConfigStore.loadStatus()
+        expect(st?.reason != .auto, "成熟后 AI 接管（reason=\(String(describing: st?.reason))）")
+        expect(smc.lastWrite("F0Tg") != nil, "AI 接管后写扇")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+
+    // ② 成熟表不触发：预置 ≥2 桶学习数据，AI 模式直接接管
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC()
+        smc.set("Tp01", 74); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        seedLearnTable()   // 3 桶 × 5 样本 = 全采信 → 学习表成熟
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        clock.advance(3); engine.beat()
+        let st = ConfigStore.loadStatus()
+        expect(st?.calibrating != true, "成熟表不进观察期（nil/false 均可）")
+        expect(st?.reason != .auto, "直接 AI 接管（reason=\(String(describing: st?.reason))）")
+        expect(col.logs.filter { $0.contains("校准中") }.isEmpty, "无校准日志")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+
+    // ③ curve 模式零影响：校准门只对 AI 模式（curve 模式下积累的桶本来就服务 AI）
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC()
+        smc.set("Tp01", 70); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        clock.advance(3); engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.calibrating, nil as Bool?, "curve 模式无校准标记")
+        expect(ConfigStore.loadStatus()?.reason == .curve, "curve 正常控制")
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
         for d in envDirs { try? FileManager.default.removeItem(at: d) }
     }

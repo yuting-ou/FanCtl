@@ -20,6 +20,14 @@ public let REASSERT_LOOPS = 20           // 每 N 循环强制重写一次（防
 
 public let LOOP_INTERVAL_MIN: TimeInterval = 1.0
 public let LOOP_INTERVAL_DEFAULT: TimeInterval = 3.0
+
+/// 4.0 B2 校准成熟桶数：观察期把系统自控平衡写进学习表，≥2 个采信桶（各 ≥3 样本）
+/// 即可接管；负载期桶由 AI 控制期自身补齐——校准只负责"起步不从公式种子猜"
+public let CALIBRATION_MATURE_BUCKETS = 2
+/// 观察期稳态样本兜底（温度单点徘徊、桶数迟迟不到 2 时的接管路径）
+public let CALIBRATION_MIN_SAMPLES = 12
+/// 观察期超时（秒）
+public let CALIBRATION_MAX_SECONDS: TimeInterval = 45 * 60
 public let LOOP_INTERVAL_STABLE: TimeInterval = 5.0
 public let LOOP_INTERVAL_COOL: TimeInterval = 10.0
 public let LOOP_INTERVAL_IDLE: TimeInterval = 20.0
@@ -107,6 +115,11 @@ public final class ControlEngine {
     var targetUnreachableLogged = false
     var boostExpiredLogged = false
     var passiveModeLogged = false
+    // 4.0 B2 冷启动校准：非持久化状态——学习表是真状态，重启后自然续上/结束；
+    // calibrationSamples 只计本观察期新采样本（重置学习数据时同步清零）
+    var calibrating = false
+    var calibratingStartedAt: Date? = nil
+    var calibrationSamples = 0
     var horizonWarned: Set<String> = []   // v3.6.2（F5）：异常久远截止时间只告警一次
     var lastProbeTime = Date.distantPast
     var probeVerifyLoops = 0
@@ -307,6 +320,7 @@ public final class ControlEngine {
             do {
                 try FileManager.default.removeItem(at: FanCtlPaths.resetLearnFlag)
                 thermalLearn = ThermalLearn()
+                calibrationSamples = 0
                 learnDirty = true
                 hooks.log("AI 热经验已重置，将从零重新积累")
             } catch {
@@ -370,15 +384,33 @@ public final class ControlEngine {
             boostExpiredLogged = false
         }
 
-        // 4.0 B1 冷却能力门控：无风扇机器（passive，如 MacBook Air）上曲线/AI/手动
-        // 均无意义——强制 auto 语义（风扇归系统），但不修改 config 本身（App 的模式
-        // 选择保持用户意志，UI 层另行诚实提示）。hardwareProfile.fanCount 已随 status
-        // 下发，App 据此展示。同源复用 boost 过期路径，零新引擎状态。
-        if fans.fanCount == 0, effectiveConfig.mode != .auto {
-            effectiveConfig.mode = .auto
-            if !passiveModeLogged {
-                hooks.log("此机型无风扇（passive cooling），控制模式语义化为系统自动")
-                passiveModeLogged = true
+        // 4.0 冷却/校准门控（统一"AI 不可信门"）：两种情况把控制语义化为 auto——
+        //   a) 无风扇机器（passive，如 MacBook Air）：曲线/AI/手动均无物理对象；
+        //   b) 冷启动校准期：用户选 AI 但学习表未成熟（无采信桶且本观察期样本
+        //      < 12）——先观察系统自控的实际平衡写进学习表，成熟后下一拍接管
+        //      （AI 播种链 learned 优先，从经验起步而非公式种子猜）。
+        // 不修改 config 本身（App 模式选择保留用户意志）；各打一次边沿日志。
+        let passiveMachine = fans.fanCount == 0
+        let calibrationDue = effectiveConfig.mode == .ai && !passiveMachine
+            && thermalLearn.learnedBucketCount < CALIBRATION_MATURE_BUCKETS
+            && calibrationSamples < CALIBRATION_MIN_SAMPLES
+        if calibrationDue != calibrating {
+            calibrating = calibrationDue
+            calibratingStartedAt = calibrationDue ? hooks.now() : nil
+            if calibrationDue {
+                hooks.log("AI 校准中：学习表未成熟，先观察系统散热特性（≤45 分钟或采够即接管）")
+            }
+        }
+        if passiveMachine || calibrating {
+            if passiveMachine, effectiveConfig.mode != .auto {
+                effectiveConfig.mode = .auto
+                if !passiveModeLogged {
+                    hooks.log("此机型无风扇（passive cooling），控制模式语义化为系统自动")
+                    passiveModeLogged = true
+                }
+            }
+            if calibrating {
+                effectiveConfig.mode = .auto
             }
         }
 
@@ -683,6 +715,44 @@ public final class ControlEngine {
         var writtenRPM: [Int: Double] = [:]
         var appliedPercents: [Double] = []
         var appliedPercent = 0.0
+
+        // 4.0 B2 校准观察期采样（与 targetPercent 分支同级：auto 模式下它是 nil，
+        // 整个分支被跳过、prevSmoothedTemp 在 auto 期无人推进——本块自带推进；
+        // 控制恢复后 prev 由原分支推进，两路径互斥不双推）：
+        // 把系统自控的实际平衡写进学习表——"这台机器稳住 T 需要多少风量"的实测答案。
+        // percent 从 fan0 actualRPM 对 (Mn, Mx) 线性反解（系统在管风扇，Tg 不可信）；
+        // 稳态门/安全覆盖排除照旧（Goodhart：不放宽任何门）。
+        if calibrating, !fastConfigApply, let fan0 = fanStates.first, fan0.maxRPM > fan0.minRPM {
+            let calibPct = min(100, max(0,
+                (fan0.actualRPM - fan0.minRPM) / (fan0.maxRPM - fan0.minRPM) * 100))
+            if let prevCalibT = prevSmoothedTemp,
+               LearningGate.isSteady(temp: temp, prevTemp: prevCalibT,
+                                     baseTarget: calibPct, prevBase: calibPct,
+                                     shapedBase: calibPct, dt: actualInterval),
+               !decision.nightOverride, !decision.ssdGuard, !decision.batteryGuard,
+               !decision.failsafeActive, !writeHealth.faulted, !feedbackHealth.faulted {
+                thermalLearn.record(temp: temp, percent: calibPct, onBattery: onBattery,
+                                    powerWatts: powerWatts, now: hooks.now())
+                calibrationSamples += 1
+                lastLearnAt = hooks.now()
+                learnDirty = true
+                let mature = thermalLearn.learnedBucketCount >= CALIBRATION_MATURE_BUCKETS
+                    || calibrationSamples >= CALIBRATION_MIN_SAMPLES
+                if mature {
+                    hooks.log("AI 校准完成（\(calibrationSamples) 个稳态样本），下一拍接管")
+                }
+            }
+            // auto 期独立推进温度稳定性基准（校准期 effectiveConfig 恒为 auto，
+            // 控制分支不会同时推进 prevSmoothedTemp，两路径不双推）
+            prevSmoothedTemp = temp
+            // 超时兜底：45 分钟仍不成熟（温度剧烈波动采不到稳态）也要接管，种下已有的
+            if let started = calibratingStartedAt,
+               hooks.now().timeIntervalSince(started) >= CALIBRATION_MAX_SECONDS {
+                calibrating = false
+                calibratingStartedAt = nil
+                hooks.log("AI 校准超时（45 分钟）：以当前学习数据接管")
+            }
+        }
 
         if let baseTarget = targetPercent {
             // 升降速限速作用于最终 applied 输出（shapedBase）：
@@ -1072,7 +1142,9 @@ public final class ControlEngine {
                 guardSeconds: aiController.cyclingGuardRemainingSeconds > 0
                     ? aiController.cyclingGuardRemainingSeconds : nil) : nil,
             // v3.8 硬件画像：启动时采集一次，恒定下发
-            hardwareProfile: hardwareProfile
+            hardwareProfile: hardwareProfile,
+            // 4.0 B2 冷启动校准：观察期标记（App 显示"校准中"而非误导性的自动调速）
+            calibrating: calibrating ? true : nil
         )
 
         let summary = statusChangeSummary(status)

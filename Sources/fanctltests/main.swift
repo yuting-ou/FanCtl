@@ -312,6 +312,16 @@ func engineTestEnv() -> URL {
     return dir
 }
 
+// 4.0 B2：预置成熟学习表（2+ 采信桶）——校准门只对"冷表"生效，
+// 既有 AI 行为测试需要绕过观察期直接测控制
+func seedLearnTable(buckets: [(Double, Double)] = [(65, 40), (70, 50), (75, 60)]) {
+    var learn = ThermalLearn()
+    for (t, pct) in buckets {
+        for _ in 0..<5 { learn.record(temp: t, percent: pct, now: Date()) }
+    }
+    ConfigStore.saveLearn(learn)
+}
+
 func makeFanSMC() -> MockSMC {
     let smc = MockSMC()
     smc.set("FNum", 1, type: "ui8 ")
@@ -434,6 +444,7 @@ testAliveDebouncer()
 testSelfUpgrade()
 testSelfUpgradeFuzz()
 testPassiveMachine()
+testCalibrationColdStart()
 testMetamorphicProperties()
 testGarbageCodable()
 testChaosTimelines()

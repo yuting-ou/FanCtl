@@ -106,6 +106,7 @@ final class FanModel: ObservableObject {
     @Published var aiHighEffort: Bool = false      // AI 正在全力散热（满速 ≥20s 且高于目标+2°）
     @Published var aiRecommendedTarget: Double? = nil  // AI 首次进入时基于基线温度推荐的目标
     @Published var hardwareProfile: HardwareProfile? = nil  // 4.0 B1：冷却能力分级展示（fanCount=0 → passive 提示）
+    @Published var calibrating = false        // 4.0 B2：AI 校准观察期（status 下发，AI 卡提示行）
 
     @Published var panelVisible = false {
         didSet {
@@ -574,6 +575,7 @@ final class FanModel: ObservableObject {
                 systemPower = nil
                 aiTargetEffective = nil
                 palmComp = nil
+                calibrating = false
             }
         } else {
             // status.json 不存在或无法读取：daemon 下线（含刚下线需清除状态）。
@@ -679,6 +681,7 @@ final class FanModel: ObservableObject {
             self.learningRecently = status.learningRecently ?? false
             self.learnedSamples = status.learnedSamples ?? 0
             self.hardwareProfile = status.hardwareProfile
+            self.calibrating = status.calibrating ?? false
             // v3.7：学习地图只在 daemon 侧样本变化时才变（节流），直接透传；
             // 数值防御（isFinite/范围）在 LearnedPoint 生成侧已保证，此处仅过滤坏点
             self.learnMap = (status.learnMap ?? []).filter {

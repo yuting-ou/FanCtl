@@ -937,6 +937,15 @@ struct ContentView: View {
                     .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(.orange.opacity(0.14)))
                     .help("散热已到极限仍压不到目标温度，AI 不会记录饱和输出（学习暂停）。建议改用均衡 76° 或静音 80°。")
                     .transition(.opacity)
+            } else if model.calibrating {
+                // 4.0 B2：校准观察期——AI 已选但学习表未成熟，daemon 语义化 auto 采样中。
+                // 复用事件提示槽位（链首优先级最高），零高度变化
+                HStack(spacing: 4) {
+                    Image(systemName: "scope").font(.caption2)
+                    Text("AI 校准中：先观察系统散热，采够即接管").font(.caption2.weight(.medium))
+                }
+                .foregroundStyle(.teal)
+                .transition(.opacity)
             } else if let rec = model.aiRecommendedTarget, abs(rec - model.aiTargetTemp) > 0.5 {
                 // #4: AI 目标推荐（首次进入且无学习数据时基于基线温度推荐，点击采纳）
                 HStack(spacing: 4) {
