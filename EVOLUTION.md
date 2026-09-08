@@ -81,6 +81,47 @@
   语义级漏洞天然低敏。**模糊+变异从此纳入常规轮次**（种子确定性，CI 成本 +0）。
   envOffset 蜕变测试的"跨 guard 边界跳变"也提醒：单调性性质必须分段声明。
 
+## R10（v3.9.1 对抗循环轮）：审查→修复→再审的收敛实例
+
+### 本轮形态
+"对抗式审查，检查问题、修问题，一直循环"——4 路并行 Explore 子代理被环境取消后，
+主代理按预列攻击清单自查；三轮（A 攻击面 → B 修复再审 → C 收敛扫描）后无新 P1/P2
+停机。4418 断言（+9），真机三轮部署验证。
+
+### Round A（8 项实锤，P1×1 + P2×2 + P3×5）
+- **P1 暂存目录错位**：App 传给特权脚本的是解压根，zip 实际布局是
+  `FanCtlUpgrade/FanCtl-{版本}/FanCtl.app` → 首次 App 内自动升级必然 exit 2。
+  **教训：dogfood 用手造 stage（FanCtl.app 在根）恰好符合脚本的错误假设——
+  端到端验证必须复现真实数据形态（真实 zip 布局），不能手工构造"理应如此"的输入。**
+- P2 `osa.waitUntilExit()` 在 @MainActor 同步阻塞主线程（等输密码分钟级）→ 挪 detached。
+- P2 脚本 exit 0 且进程存活的边缘路径 phase/started 死锁在 installing → 成功路径复位。
+- P3×5：进行中文案 tag 与实际下载 tag 脱钩（24h 自检并发刷新）；
+  submit 残留标签阻断下轮升级；URLSession 临时文件生命周期（moveItem 到确定性路径）；
+  取消检测 `contains("-128")` 误匹配 -1280（改 `(-128)`）；测试 try! 违反 R8 自家规矩。
+
+### Round B（对修复本身的再审——修复引入了新隐患）
+Round A 的 submit 兜底被 fresh-eyes 推翻：asuser submit 的进程域归属无法确认
+（若落 system 域 = 菜单栏 App 以 root 跑，权限模型不可接受），且终验"进程=1 但
+标签查不到"说明行为不稳定。**设计裁决：root 不做 GUI 拉起**——重启改为"遗言
+watcher"：osascript 前以用户态拉 bash 轮询进程，App 被 pkill 后被 launchd 收养
+（parent 1 实证），轮询到脚本末尾 touch 的 `.upgrade-done` 标记后以登录用户身份
+open（与手动打开同路）。脚本 root 职责收缩为：装文件、bootstrap daemon、归还属主。
+实验数据落袋：`launchctl remove` 对运行中 submit 进程=杀掉它（remove 必须在
+submit 前）；submit 无 KeepAlive（进程退出即结束，pkill 后 0 重生）；用户临时
+目录 700（TOCTOU 换包面封闭）；open 双调用幂等。
+
+### Round C（收敛判定）
+watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假设/失败路径/双 watcher/
+路径单引号/pkill 误杀/收尾 echo/校验物与安装物一致）——全部 ✓，无新 P1/P2，停机。
+
+### 元经验
+1. **修复本身是新的攻击面**：Round A 修好的 submit 兜底就是 Round B 的 P1 候选。
+   "修完再审"不是仪式——每一轮的修复必须进下一轮的攻击清单。
+2. **特权脚本里 root 的职责边界**：root 只做必须 root 的事；"root 帮用户做
+   方便的事"（重启 GUI）每一次都翻车（open 静默失败/submit 域存疑）。
+3. dogfood 输入形态必须等于真实输入形态（P1 的掩盖事故）。
+4. launchctl 语义实测记录：remove 运行中标签=杀进程；submit 默认不重生。
+
 ## R9（v3.9 一键升级轮）：把"看见更新"推进为"完成更新"
 
 ### 动机（部署链路的最后一公里）
