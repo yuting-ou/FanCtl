@@ -113,3 +113,60 @@ func testSelfUpgrade() {
     expectEqual(injected, "清风升级到 v新版本：需要管理员授权替换系统守护进程与菜单栏 App",
                 "兜底文案精确匹配（含 v 新版本 拼接形态）")
 }
+
+
+// MARK: - R11 模糊/性质测试（v3.6.3 方法论首次覆盖升级模块）
+// 静态审查写得出 16+ 对抗样本，但组合空间是无限的——用确定性 LCG 随机串扫
+// sanitizeTag/assetURL/authorizationPrompt 的四条全局性质，锁定"任何输入下"的行为。
+
+func testSelfUpgradeFuzz() {
+    group("一键升级·模糊性质（500 轮 × 确定性种子）")
+    // 字母表刻意混入：shell 元字符、路径段、Unicode 数字、空白、引号、合法字符
+    let alphabet = Array("0123456789.vV;`$&|><\\\n\r\t '/\"(){}٣٣３abc-+_~*?!#")
+    func randomString(_ rng: inout FuzzRNG) -> String {
+        let len = rng.pick(31)
+        return String((0..<len).map { _ in alphabet[rng.pick(alphabet.count)] })
+    }
+    var violations: [String] = []
+    var accepted = 0
+    for round in 0..<500 {
+        var rng = FuzzRNG(0x5E1F &+ UInt64(round) &* 0x1000193)
+        let s = randomString(&rng)
+        let tag = SelfUpgrade.sanitizeTag(s)
+        // P1: 输出白名单——nil 或 纯 [0-9.] 且 ≤24 字符且 ≤4 个非空段
+        if let t = tag {
+            accepted += 1
+            if t.rangeOfCharacter(from: CharacterSet(charactersIn: "0123456789.").inverted) != nil {
+                violations.append("r\(round): 输出含白名单外字符 \(t.debugDescription)")
+            }
+            if t.count > 24 { violations.append("r\(round): 输出超长 \(t.count)") }
+            let segs = t.split(separator: ".", omittingEmptySubsequences: false)
+            if !(1...4).contains(segs.count) || segs.contains(where: { $0.isEmpty }) {
+                violations.append("r\(round): 输出段结构非法 \(t.debugDescription)")
+            }
+        }
+        // P2: URL 契约——非 nil 必为固定 host/https 的资产模式
+        if let url = SelfUpgrade.assetURL(forTag: s) {
+            if url.scheme != "https" { violations.append("r\(round): scheme \(url.scheme ?? "?")") }
+            if url.host != "github.com" { violations.append("r\(round): host \(url.host ?? "?")") }
+            if !url.path.hasPrefix("/yuting-ou/FanCtl/releases/download/") {
+                violations.append("r\(round): path 漂移 \(url.path)")
+            }
+        }
+        // P3: 授权文案任意输入下无 shell/AppleScript 元字符
+        // （rangeOfCharacter 不加 inverted：语义=找到集合内字符；inverted 会变成
+        //  "含任何其他字符"，中文文案必然命中——首轮运行被自家 fuzz 当场抓住）
+        let prompt = SelfUpgrade.authorizationPrompt(tag: s)
+        if prompt.rangeOfCharacter(from: CharacterSet(charactersIn: ";`\"\\")) != nil {
+            violations.append("r\(round): 文案含元字符（输入 \(s.debugDescription)）")
+        }
+        // P4: 幂等性（蜕变性质）——sanitize(sanitize(x)) == sanitize(x)
+        if let t1 = tag, let t2 = SelfUpgrade.sanitizeTag(t1), t1 != t2 {
+            violations.append("r\(round): 非幂等 \(t1) → \(t2)")
+        }
+    }
+    // 采样健康度：合法串概率低但必须非零（否则接受路径在本轮完全没被测到）
+    expect(accepted > 0, "500 轮应有合法串命中（采样健康度）")
+    expect(violations.isEmpty, "模糊性质违例: \(violations.prefix(5))")
+}
+
