@@ -581,6 +581,17 @@ struct ContentView: View {
             PanelSegmentedPicker(items: [("自动", FanMode.auto), ("曲线", FanMode.curve),
                                          ("AI", FanMode.ai), ("手动", FanMode.manual)],
                                  selection: Binding(get: { model.mode }, set: { model.setMode($0) }))
+            // 4.0 B1 诚实表达：无风扇机器（硬件画像 fanCount=0）上曲线/AI/手动
+            // 无物理对象——模式选择保留（用户意志），但明示边界而非静默空转。
+            // fixedSize 防文案撑高打破"窗口恒定"守恒。
+            if model.hardwareProfile?.fanCount == 0 {
+                Text("此机型无风扇（passive cooling），调速由 macOS 管理")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             // 固定高度容器：各模式内容高度一致，窗口尺寸不变，
             // 避免 MenuBarExtra 面板因尺寸突变而意外收起（bug 修复）

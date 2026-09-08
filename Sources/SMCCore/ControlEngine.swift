@@ -106,6 +106,7 @@ public final class ControlEngine {
     var targetUnreachableSince: Date? = nil
     var targetUnreachableLogged = false
     var boostExpiredLogged = false
+    var passiveModeLogged = false
     var horizonWarned: Set<String> = []   // v3.6.2（F5）：异常久远截止时间只告警一次
     var lastProbeTime = Date.distantPast
     var probeVerifyLoops = 0
@@ -367,6 +368,18 @@ public final class ControlEngine {
             }
         } else {
             boostExpiredLogged = false
+        }
+
+        // 4.0 B1 冷却能力门控：无风扇机器（passive，如 MacBook Air）上曲线/AI/手动
+        // 均无意义——强制 auto 语义（风扇归系统），但不修改 config 本身（App 的模式
+        // 选择保持用户意志，UI 层另行诚实提示）。hardwareProfile.fanCount 已随 status
+        // 下发，App 据此展示。同源复用 boost 过期路径，零新引擎状态。
+        if fans.fanCount == 0, effectiveConfig.mode != .auto {
+            effectiveConfig.mode = .auto
+            if !passiveModeLogged {
+                hooks.log("此机型无风扇（passive cooling），控制模式语义化为系统自动")
+                passiveModeLogged = true
+            }
         }
 
         // 2. 读温度（完整传感器集合）

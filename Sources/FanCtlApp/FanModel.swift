@@ -105,6 +105,7 @@ final class FanModel: ObservableObject {
     @Published var aiTargetEffective: Double? = nil  // daemon 实际生效的 AI 目标（环境/夜间/电池叠加后）
     @Published var aiHighEffort: Bool = false      // AI 正在全力散热（满速 ≥20s 且高于目标+2°）
     @Published var aiRecommendedTarget: Double? = nil  // AI 首次进入时基于基线温度推荐的目标
+    @Published var hardwareProfile: HardwareProfile? = nil  // 4.0 B1：冷却能力分级展示（fanCount=0 → passive 提示）
 
     @Published var panelVisible = false {
         didSet {
@@ -677,6 +678,7 @@ final class FanModel: ObservableObject {
             self.curveTargetPercent = status.curveTargetPercent
             self.learningRecently = status.learningRecently ?? false
             self.learnedSamples = status.learnedSamples ?? 0
+            self.hardwareProfile = status.hardwareProfile
             // v3.7：学习地图只在 daemon 侧样本变化时才变（节流），直接透传；
             // 数值防御（isFinite/范围）在 LearnedPoint 生成侧已保证，此处仅过滤坏点
             self.learnMap = (status.learnMap ?? []).filter {

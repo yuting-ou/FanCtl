@@ -1590,3 +1590,67 @@ func testAliveDebouncer() {
     expectEqual(d.deadStreak, AliveDebouncer.deadThreshold, "死计数封顶")
     expect(!d.alive, "长死期判定稳定")
 }
+
+
+// MARK: - 4.0 B1 冷却能力门控：无风扇（passive）机器
+
+func testPassiveMachine() {
+    group("冷却能力门控(4.0 B1)")
+
+    // ① 零风扇 AI 模式：语义化为 auto，不写任何风扇键，边沿日志一次
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+        let smc = MockSMC()               // 无任何 FNum/F0* 键 → fanCount 0
+        smc.set("Tp01", 78); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        for _ in 0..<5 { clock.advance(3); engine.beat() }
+        let st = ConfigStore.loadStatus()
+        expectEqual(st?.reason, .auto, "passive 机器 AI 模式语义化为系统自动")
+        expect(smc.lastWrite("F0Tg") == nil, "零风扇不写任何风扇键")
+        expect(smc.lastWrite("F0Md") == nil, "零风扇不写模式键")
+        expect(st?.hardwareProfile?.fanCount == 0, "硬件画像 fanCount=0 随 status 下发")
+        let passiveLogs = col.logs.filter { $0.contains("无风扇") }
+        expectEqual(passiveLogs.count, 1, "边沿日志只打一次（实际 \(passiveLogs.count) 次）")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+
+    // ② 零风扇 manual（冲刺态）：同样语义化——manual 也不豁免
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 100, envCompensation: false))
+        let smc = MockSMC()
+        smc.set("Tp01", 60); smc.set("PSTR", 8)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        clock.advance(3); engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.reason, .auto, "passive 机器手动模式同样语义化")
+        expect(smc.lastWrite("F0Tg") == nil, "manual 也不写扇")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+
+    // ③ 有风扇机器零变化：同样配置下照常写扇（门控不误伤）
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 100, envCompensation: false))
+        let smc = makeFanSMC()
+        smc.set("Tp01", 60); smc.set("PSTR", 8)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        clock.advance(3); engine.beat()
+        expect(ConfigStore.loadStatus()?.reason == .manual, "有风扇机器 manual 保持 manual")
+        expect(smc.lastWrite("F0Tg") != nil, "有风扇照常写扇（门控零误伤）")
+        expect(col.logs.filter { $0.contains("无风扇") }.isEmpty, "有风扇不打 passive 日志")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+}
