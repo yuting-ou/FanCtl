@@ -385,6 +385,75 @@ func runHIL(hysteresis: Double) -> (changes: Int, rms: Double, maxO: Double, nan
     return (changes, rms, maxO, nan)
 }
 
+// MARK: - 4.0 B2 冷启动校准 HIL 对比（观察期播种 vs 现状空表，过冲/收敛不劣化）
+
+func runColdStartHIL(calibrated: Bool) -> (maxO: Double, inBand: Int, changes: Int, nan: Bool) {
+    var vm = VirtualMachine()
+    var ai = AIController()
+    ai.tuning.targetTemp = 76
+    var ctrl = FanCurveController()
+    var learn = ThermalLearn()
+    var prevOut = 0.0, changes = 0, maxO = 0.0
+    var inBand = 0, nan = false
+
+    // 负载轨迹（观察期与控制期共用——真实场景：用户在当前负载下开启 AI，
+    // 观察到的平衡桶就是接管后立即遇到的桶）
+    func load(_ i: Int) -> Double { 45 + 15 * sin(Double(i) / 100.0) + ((i / 200) % 2 == 0 ? 8 : 0) }
+
+    // 观察期（仅校准路径）：45 分钟"系统 auto 管风扇"——系统策略未知，
+    // 用均衡曲线近似（macOS 默认策略的合理代理）；稳态样本喂学习表，
+    // 与引擎观察期同一稳态门（LearningGate），同一纪律
+    if calibrated {
+        var obsPrev: Double? = nil
+        for i in 0..<900 {   // 45 分钟 @ 3s，同控制期负载
+            let power = load(i)
+            let p = FanConfig.percent(temp: vm.temp, curve: CurvePreset.balanced.points)
+            let applied = ctrl.slew(target: p, force: false, hysteresis: 0)
+            vm.step(power: power, percent: applied, dt: 3)
+            if let pt = obsPrev,
+               LearningGate.isSteady(temp: vm.temp, prevTemp: pt,
+                                     baseTarget: applied, prevBase: applied,
+                                     shapedBase: applied, dt: 3) {
+                learn.record(temp: vm.temp, percent: applied, onBattery: false,
+                             powerWatts: power, now: Date())
+            }
+            obsPrev = vm.temp
+        }
+    }
+
+    // 控制期（两路径逐拍一致）：AI 接管。
+    // 唯一差异 = learned 是否有表可查（校准播种的全部效果都在这里）。
+    for i in 0..<1200 {
+        let power = load(i)
+        let learned = calibrated ? learn.percent(for: vm.temp) : nil
+        let o = ai.step(temp: vm.temp, learned: learned, powerWatts: power, dt: 3) ?? 0
+        let applied = ctrl.slew(target: o, force: false, hysteresis: 4)
+        if abs(applied - prevOut) >= 3 { changes += 1 }
+        prevOut = applied
+        vm.step(power: power, percent: applied, dt: 3)
+        if vm.temp.isFinite {
+            maxO = max(maxO, vm.temp - 76)
+            if abs(vm.temp - 76) <= 2 { inBand += 1 }
+        } else { nan = true }
+    }
+    return (maxO, inBand, changes, nan)
+}
+
+func testColdStartHIL() {
+    group("冷启动 HIL（4.0 B2 收尾）")
+    let base = runColdStartHIL(calibrated: false)
+    let calib = runColdStartHIL(calibrated: true)
+    print("  [冷启动HIL] 基线: 过冲 +\(String(format: "%.1f", base.maxO))° 带内 \(base.inBand)/1200 调速 \(base.changes)")
+    print("  [冷启动HIL] 校准: 过冲 +\(String(format: "%.1f", calib.maxO))° 带内 \(calib.inBand)/1200 调速 \(calib.changes)")
+    expect(!calib.nan, "校准路径无 NaN")
+    // 不劣化判据（v3.2 HIL 先例：精度损失 ≤1.5°）：过冲不得比基线差 1.5° 以上，
+    // 带内拍数不得少 5% 以上
+    expect(calib.maxO <= base.maxO + 1.5,
+           "过冲不劣化：校准 \(calib.maxO) vs 基线 \(base.maxO)")
+    expect(Double(calib.inBand) >= Double(base.inBand) * 0.95,
+           "带内时长不劣化：校准 \(calib.inBand) vs 基线 \(base.inBand)")
+}
+
 print("== FanCtl 纯逻辑测试 ==")
 testInterpolation()
 testHistogram()
@@ -418,6 +487,7 @@ testCurveAntiDrift()
 testLearningHygiene()
 testAICyclingGuard()
 testHILHysteresis()
+testColdStartHIL()
 testPalmComp()
 testVersionCheck()
 testPowerHistogram()
