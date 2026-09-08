@@ -169,13 +169,12 @@ struct ContentView: View {
             } else {
             Menu {
                 Text("清风 \(Self.appVersion)")
-                // v3.6（方向一）：新版本提示——只在查到更新且未被跳过时出现，
-                // 点击打开 Releases 下载页（不自动安装：常驻不添乱原则）
+                // v3.6（方向一）：新版本提示——只在查到更新且未被跳过时出现。
+                // v3.9 起一键升级：下载→校验→管理员授权安装→自动重启全程 App 内完成，
+                // 用户只面对一次 macOS 授权弹窗；失败/不想自动装仍保留"打开下载页"退路。
                 if let tag = model.updateAvailable {
-                    Button("⬆️ 新版本 \(tag) 可用…") {
-                        NSWorkspace.shared.open(FanModel.releasesURL)
-                    }
-                    Button("跳过此版本") { model.skipUpdateVersion() }
+                    UpgradeMenuSection(upgrader: model.upgrader, tag: tag,
+                                       skip: { model.skipUpdateVersion() })
                     Divider()
                 }
                 Divider()
@@ -1655,3 +1654,36 @@ private struct TintedCard: ViewModifier {
 }
 
 // 迷你趋势折线（自绘 Path，可在 ImageRenderer 离屏渲染）
+
+// v3.9 一键升级菜单区：新版本可用时的完整状态机展示。
+// 进行中（下载/校验/等授权）显示进度文案且禁止重复点击；
+// 失败显示原因并给"重试"；任何时刻保留"打开下载页"手动退路与"跳过此版本"。
+private struct UpgradeMenuSection: View {
+    @ObservedObject var upgrader: SelfUpgradeService
+    let tag: String
+    let skip: () -> Void
+
+    var body: some View {
+        switch upgrader.phase {
+        case .idle:
+            Button("⬆️ 升级到 \(tag)…") { upgrader.start(tag: tag) }
+            Button("跳过此版本") { skip() }
+        case .downloading, .validating, .installing:
+            let step: String = {
+                switch upgrader.phase {
+                case .downloading: return "正在下载 \(tag)…"
+                case .validating: return "正在校验 \(tag)…"
+                default: return "等待授权安装 \(tag)…（若弹窗未出现请先点击面板）"
+                }
+            }()
+            Text(step)
+            Button("打开下载页…") { NSWorkspace.shared.open(FanModel.releasesURL) }
+        case .failed(_, let reason):
+            Text("升级失败：\(reason)")
+            Button("重试升级到 \(tag)") { upgrader.retry(tag: tag) }
+            Button("打开下载页…") { NSWorkspace.shared.open(FanModel.releasesURL) }
+            Button("跳过此版本") { skip() }
+        }
+    }
+
+}

@@ -241,6 +241,8 @@ final class FanModel: ObservableObject {
     /// 新版本 tag（如 "v3.6.0"）；nil = 无更新或从未查到。UI 菜单行据此显隐。
     @Published var updateAvailable: String? = nil
     @MainActor private var updateCheckInFlight = false
+    // v3.9 一键升级：下载→校验→授权安装→重启的编排服务（纯逻辑在 SMCCore.SelfUpgrade）
+    let upgrader = SelfUpgradeService()
 
     var config: FanConfig {
         let offsets = fanOffsets.allSatisfy { $0 == 0 } ? nil : fanOffsets

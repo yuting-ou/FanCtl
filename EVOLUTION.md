@@ -81,6 +81,42 @@
   语义级漏洞天然低敏。**模糊+变异从此纳入常规轮次**（种子确定性，CI 成本 +0）。
   envOffset 蜕变测试的"跨 guard 边界跳变"也提醒：单调性性质必须分段声明。
 
+## R9（v3.9 一键升级轮）：把"看见更新"推进为"完成更新"
+
+### 动机（部署链路的最后一公里）
+v3.6 版本自检只到"菜单提示 + 打开下载页"，安装仍要用户 sudo install.sh——
+2026-09-08 用户明确拒绝该分工："我要的是你自己去升级。麻烦到我，不像是给我提升效率"。
+部署摩擦本身就是产品缺陷。同日 osascript admin-dialog 模式真机预演成功（dist→/tmp +
+路径修补 + 一次授权弹窗完成 3.7→3.8），本轮把该流程产品化。
+
+### 安全设计（特权面三层收窄，全部测试锁定）
+1. **tag 消毒 = 唯一收窄点**：sanitizeTag 只放行 ASCII 数字+点（≤4 段 ≤24 字符），
+   下载 URL、osascript 命令串、授权弹窗文案三处共用一份消毒；16+ 注入对抗样本
+   （分号/反引号/路径穿越/换行/非 ASCII 数字/超长/空段）全部断言拒绝。
+2. **root 执行的代码与 App 同源**：upgrade.sh 内嵌 App Resources（build.sh 打包），
+   绝不从网上下载脚本；下载物（zip）只作为数据被安装。
+3. **校验门在授权弹窗之前**：暂存包 Info.plist 版本与 Release tag **严格相等**
+   （哪怕暂存包版本更新也不放行）+ fanctld 在场；失败根本到不了 osascript。
+
+### 关键实现决策
+- **osascript 场景无 SUDO_USER**：upgrade.sh 用 `stat -f%Su /dev/console` 取登录用户
+  归还 App 属主——保住免密 deploy.sh 通道（v3.8 部署时 App 归 root 的直接教训）。
+- **quarantine 防御性清理**：URLSession 下载不自动加 xattr，但 root 复制后仍执行
+  `xattr -dr com.apple.quarantine`（未公证 bundle + quarantine = Gatekeeper 拦截）。
+- **重启语义**：脚本 pkill 旧 App → 装新 → `launchctl asuser <uid> open` 重启；
+  等待授权的旧进程被杀是设计内终点（Task 随进程死亡），不是错误路径。
+- **取消授权 = 静默回退**（osascript -128 → idle），只有真失败才进 failed 态给重试。
+- zip 顶层目录名随版本变化（FanCtl-{版本}/），布局探测不假设具体名字，只找
+  "含 FanCtl.app 的目录"。
+
+### 本轮教训
+1. **`Character.isNumber` 对非 ASCII 数字（Nd 类，如 ٣）返回 true**——URL/路径消毒
+   必须用 `isASCII && isNumber`；"看着像数字"不等于"是 [0-9]"。新测试当轮抓到。
+2. **struct 无构造器模式匹配**：`if case let Failure(msg) = error` 只适用 enum
+   associated value；对 struct 报 "pattern variable binding cannot appear in an
+   expression"。用 `if let f = error as? Failure`。
+3. `defaults read <相对路径>` 按域名解释而非文件——验证脚本一律绝对路径。
+
 ## R8（v3.8 兑现轮）：审计收敛 → 证据生产
 
 ### 转向依据

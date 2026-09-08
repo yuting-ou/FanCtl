@@ -45,6 +45,10 @@ cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # 随包携带卸载脚本，App“关于”菜单可指引用户一键卸载
 cp "$ROOT/scripts/uninstall.sh" "$APP/Contents/Resources/uninstall.sh"
 chmod +x "$APP/Contents/Resources/uninstall.sh"
+# v3.9 一键升级：特权安装过程内嵌进 App（root 执行的脚本必须与 App 同源发布，
+# 绝不从网上下载脚本）；SelfUpgradeService 经 osascript 调它
+cp "$ROOT/scripts/upgrade.sh" "$APP/Contents/Resources/upgrade.sh"
+chmod +x "$APP/Contents/Resources/upgrade.sh"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
