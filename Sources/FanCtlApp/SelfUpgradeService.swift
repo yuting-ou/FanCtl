@@ -124,6 +124,25 @@ final class SelfUpgradeService: ObservableObject {
                 throw Failure("App 内缺内嵌升级脚本（打包问题）")
             }
             phase = .installing(tag: tag)
+            // 遗言 watcher（R10 设计裁决）：重启不能由 root 做——root 上下文 open
+            // 实测静默失败，submit 域归属存疑（system 域=菜单栏 App root 运行，不可接受）。
+            // 改为 osascript 前以用户态拉起独立 shell：App 被 pkill 后该进程被 launchd
+            // 收养（parent 1），轮询到脚本末尾 touch 的完成标记后以登录用户身份 open——
+            // 与手动打开完全同路。120s 超时自杀防孤儿堆积；取消授权时 watcher 空转到
+            // 超时退出（标记永不存在，无副作用）。
+            let doneFlag = innerDir.appendingPathComponent(".upgrade-done")
+            try? FileManager.default.removeItem(at: doneFlag)
+            let watcherScript = """
+            for i in $(seq 1 120); do
+                [ -f '\(doneFlag.path)' ] && sleep 1 && open '/Applications/清风.app' && exit 0
+                sleep 1
+            done
+            exit 1
+            """
+            let watcher = Process()
+            watcher.executableURL = URL(fileURLWithPath: "/bin/bash")
+            watcher.arguments = ["-c", watcherScript]
+            try? watcher.run()
             let quotedScript = script.replacingOccurrences(of: "'", with: "'\\''")
             let quotedStage = innerDir.path.replacingOccurrences(of: "'", with: "'\\''")
             let prompt = SelfUpgrade.authorizationPrompt(tag: tag)
@@ -153,11 +172,10 @@ final class SelfUpgradeService: ObservableObject {
             }
             // 走到这里说明脚本没杀掉本进程（pkill 失败的边缘）——必须复位菜单态：
             // 若进程随即被杀，复位无副作用；若存活，UI 不得永久卡"等待授权"
-            //（审查修复③：原实现 started/phase 永不复位，菜单死锁在 installing）
+            //（审查修复③：原实现 started/phase 永不复位，菜单死锁在 installing）。
+            // 重启由 watcher 负责（watcher open 对存活实例 = 激活，无副作用）
             phase = .idle
             started = false
-            _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/open"),
-                                 arguments: ["/Applications/清风.app"])
         } catch {
             if let f = error as? Failure {
                 phase = .failed(tag: tag, reason: f.msg)

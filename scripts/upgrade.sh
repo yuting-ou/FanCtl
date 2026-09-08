@@ -82,27 +82,10 @@ chown -R "$LOGIN_USER:staff" "/Applications/清风.app" 2>/dev/null || true
 sleep 2
 [[ -f "$SUPPORT/config.json" ]] && chown root:admin "$SUPPORT/config.json" && chmod 664 "$SUPPORT/config.json" || true
 
-echo "==> 重启菜单栏 App..."
-if [[ "$LOGIN_USER" != "root" && -n "$LOGIN_USER" ]]; then
-    LOGIN_UID=$(id -u "$LOGIN_USER")
-    # root 上下文起用户态 GUI 进程：asuser 切进该用户 bootstrap 域。
-    # 实测（v3.9.0 dogfood）：`asuser ... open -a` 静默失败（open 依赖的用户会话
-    # LaunchServices 在该上下文不可达），`sudo -u user open` 同败。可靠路径 =
-    # asuser + launchctl submit 拉起 MachServices 注册的 bundle：
-    #   ① asuser open（标准做法，多数场景可用）
-    #   ② asuser submit 直启二进制（open 不可达时的兜底，App 自带 LSUIElement 托盘；
-    #     submit 无 KeepAlive，进程退出即结束，不残留常驻标签）
-    #   ③ 两者都败不算安装失败——daemon 已升级完成，App 由用户手动 open
-    # 实测语义（v3.9.0 dogfood）：对运行中的 submit 进程 launchctl remove 会直接
-    # 杀掉它——因此 remove 只放在 submit 之前清残留（此刻 pkill 已杀掉旧进程，
-    # 无副作用；不清则残留标签令本次 submit "already exists" 失败）。
-    if ! /bin/launchctl asuser "$LOGIN_UID" /usr/bin/open -a "/Applications/清风.app" 2>/dev/null; then
-        /bin/launchctl asuser "$LOGIN_UID" /bin/launchctl remove \
-            "com.fanctl.app.upgrade-relaunch" 2>/dev/null || true
-        /bin/launchctl asuser "$LOGIN_UID" /bin/launchctl submit \
-            -l "com.fanctl.app.upgrade-relaunch" \
-            -p "/Applications/清风.app/Contents/MacOS/FanCtl" 2>/dev/null || true
-    fi
-fi
+# 重启菜单栏 App 不在本脚本做（R10 设计裁决）：root 上下文 open 实测静默失败、
+# submit 的进程域归属存疑（菜单栏 App 若落 system 域等于 root 运行，不可接受）。
+# 重启由 App 启动的用户态 watcher 负责——它轮询本标记（脚本最后一行 touch），
+# 被 launchd 收养（App 已 pkill）后以登录用户身份 open，与手动打开完全同路。
+touch "$STAGING/.upgrade-done"
 
 echo "✅ 升级完成: $(/usr/local/libexec/fanctld -v)"
