@@ -971,8 +971,12 @@ func testThermalLearn() {
     expectClose(m.percent(for: 61)!, 30, 1e-9, "桶中值温度中点插值")
     // temp=55 在 [51, 71] 之间，t=(55-51)/(71-51)=0.2 → 10+0.2*40=18
     expectClose(m.percent(for: 55)!, 18, 1e-9, "非中点位置插值精度")
-    expectClose(m.percent(for: 84)!, 50, 1e-9, "超出数据区用单侧")
-    expectClose(m.percent(for: 30)!, 10, 1e-9, "低于数据区用单侧")
+    // 4.0 B3 采信域：单侧外推限带宽 10°C——带内沿用单侧值，带外返回 nil
+    //（低温平衡平推到高温 = 欠冷却方向的错误播种，族扫描 env28/R1.3/τ25/A28 实证）
+    expectClose(m.percent(for: 79)!, 50, 1e-9, "带内单侧（71+8 ≤ 10）沿用")
+    expectClose(m.percent(for: 43)!, 10, 1e-9, "带内下单侧（51-8 ≤ 10）沿用")
+    expect(m.percent(for: 84) == nil, "超出数据区 13° > 带宽 → nil（不再外推）")
+    expect(m.percent(for: 30) == nil, "低于数据区 21° > 带宽 → nil（对称防御）")
 
     // 记录钳位 + Codable 往返
     var cl = ThermalLearn()

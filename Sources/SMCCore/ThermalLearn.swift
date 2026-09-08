@@ -13,6 +13,9 @@ import Foundation
 
 public struct ThermalLearn: Equatable {
     public static let minSamples = 3        // 桶内样本数达标才采信
+    /// 4.0 B3 查表采信域带宽（°C）：单侧外推超出此距离返回 nil。
+    /// 双侧插值不受此限（两个锚点夹逼下的插值语义自洽）
+    public static let lookupBandWidth: Double = 10.0
     private static let emaAlpha = 0.15      // EMA 系数：新样本权重（旧经验缓慢演化）
     private static let earlyAvgCount = 5    // 前 N 个样本算术平均，之后切换到 EMA
     private static let staleDays: Double = 14  // 超过 14 天未更新的桶视为过时
@@ -149,8 +152,17 @@ public struct ThermalLearn: Equatable {
                 // tHi > tLo 恒成立（不同桶中值不同），无需除零保护
                 let t = (temp - tLo) / (tHi - tLo)
                 result = output[lo] + t * (output[hi] - output[lo])
-            case (true, false): result = output[lo]
-            case (false, true): result = output[hi]
+            case (true, false):
+                // 4.0 B3 采信域：单侧外推的最近采信桶超出带宽 → nil（退回曲线/公式种子）。
+                // 把低温平衡平推到高温 = 欠冷却方向的错误播种（族扫描 env28/R1.3/τ25/A28
+                // 实测过冲 +1.7°）。对齐 ThermalModel 采信域先例（v2.7）。
+                if temp - TempHistogram.midTemp(of: lo) > Self.lookupBandWidth { result = nil }
+                else { result = output[lo] }
+            case (false, true):
+                // 对称防御：上方单侧外推（温度低于全部数据）同样出带即 nil——
+                // 学习值语义是"该温度的稳态需求"，低温端照搬高温平衡同理不成立
+                if TempHistogram.midTemp(of: hi) - temp > Self.lookupBandWidth { result = nil }
+                else { result = output[hi] }
             default: result = nil
             }
         }

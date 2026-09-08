@@ -78,7 +78,8 @@ let familyDT = 3.0
 func runFamilyMember(_ m: FamilyMember,
                      profile: [(power: Double, ticks: Int, hold: Bool)],
                      fanFeedback: Bool = false,
-                     stallAtTick: Int = -1) -> FamilyMetrics {
+                     stallAtTick: Int = -1,
+                     seededLearn: ThermalLearn? = nil) -> FamilyMetrics {
     var vm = FamilyVM(m: m, temp: m.env + 10)
     var ai = AIController()
     ai.tuning.targetTemp = familyTarget
@@ -122,7 +123,8 @@ func runFamilyMember(_ m: FamilyMember,
             }
             badStreak = 0
 
-            let o = ai.step(temp: sampled, powerWatts: phase.power, dt: familyDT)
+            let learned = seededLearn?.percent(for: sampled)
+            let o = ai.step(temp: sampled, learned: learned, powerWatts: phase.power, dt: familyDT)
             let applied = ctrl.slew(target: o ?? 0, force: false, hysteresis: 4)
             let pct = (o == nil) ? 0 : applied   // 交还态 = 系统接管（近似停转/最低）
             if restoredWaiting {
@@ -364,3 +366,92 @@ func testFamilyDefense() {
            "5 连丢读不触发故障交还（违例: \(sensorViolationsReal.joined(separator: ","))）")
 }
 
+
+// MARK: - 4.0 B3 泛化边界研究：校准播种 × 81 成员族
+
+/// 观察期播种器：对族成员跑 45 分钟"系统 auto 管风扇"（均衡曲线近似），
+/// 稳态门照旧。与 B2 引擎观察期同一纪律。
+func seedFamilyMember(_ m: FamilyMember) -> ThermalLearn {
+    var vm = FamilyVM(m: m, temp: m.env + 10)
+    var ctrl = FanCurveController()
+    var learn = ThermalLearn()
+    var obsPrev: Double? = nil
+    for _ in 0..<900 {   // 45 分钟 @ 3s，观察期轻载（桌面近似——真实用户开启 AI 的典型场景）
+        let power = 20.0
+        let p = FanConfig.percent(temp: vm.temp, curve: CurvePreset.balanced.points)
+        let applied = ctrl.slew(target: p, force: false, hysteresis: 0)
+        vm.step(power: power, percent: applied, dt: familyDT)
+        if let pt = obsPrev,
+           LearningGate.isSteady(temp: vm.temp, prevTemp: pt,
+                                 baseTarget: applied, prevBase: applied,
+                                 shapedBase: applied, dt: familyDT) {
+            learn.record(temp: vm.temp, percent: applied, onBattery: false,
+                         powerWatts: power, now: Date())
+        }
+        obsPrev = vm.temp
+    }
+    return learn
+}
+
+func testFamilySeeded() {
+    group("泛化边界研究（4.0 B3）：校准播种 × 族")
+    let envs = [22.0, 28.0, 33.0]
+    let Rs = [0.7, 1.0, 1.3]
+    let taus = [25.0, 40.0, 70.0]
+    let authorities = [12.0, 20.0, 28.0]
+    func profile() -> [(power: Double, ticks: Int, hold: Bool)] {
+        [(55, 500, true), (38, 400, false), (75, 100, false), (38, 200, false)]
+    }
+
+    var worseOvershoot: [String] = []
+    var worseReleases: [String] = []
+    var betterOvershoot = 0, same = 0
+    var n = 0
+    var seededCycleViolations = 0
+    var seededSafetyViolations = 0
+
+    for env in envs {
+        for R in Rs {
+            for tau in taus {
+                for authority in authorities {
+                    let name = "env\(Int(env))/R\(R)/τ\(Int(tau))/A\(Int(authority))"
+                    let m = FamilyMember(name: name, env: env, R: R, tau: tau,
+                                         authority: authority, noise: 0, dropEvery: 0, fanLagTau: 0)
+                    let base = runFamilyMember(m, profile: profile())
+                    let seed = seedFamilyMember(m)
+                    let met = runFamilyMember(m, profile: profile(), seededLearn: seed)
+                    n += 1
+
+                    // 安全面与基线同标准：峰值 ≤ 被动平衡+2
+                    let passiveCeil = m.passiveEquilibrium(75) + 2
+                    if !met.nan, met.maxTemp > passiveCeil { seededSafetyViolations += 1 }
+                    // 极限环面：轻载交还 ≤4（与基线同阈）
+                    if met.releases > 4 { seededCycleViolations += 1 }
+
+                    // 泛化判定（可达成员）：过冲不劣化（≤ +1.5° 容差，对齐 R14 判据）
+                    if !met.unreachable, !base.unreachable {
+                        if met.spikePeakExcess > base.spikePeakExcess + 1.5 {
+                            worseOvershoot.append("\(name): \(base.spikePeakExcess)→\(met.spikePeakExcess)")
+                        } else if met.spikePeakExcess < base.spikePeakExcess - 0.3 {
+                            betterOvershoot += 1
+                        } else {
+                            same += 1
+                        }
+                    }
+                    if met.releases > base.releases + 1 {
+                        worseReleases.append("\(name): \(base.releases)→\(met.releases)")
+                    }
+                }
+            }
+        }
+    }
+    print("  [B3 研究扫] 成员 \(n) | 过冲更优 \(betterOvershoot) / 持平 \(same) / 劣化 \(worseOvershoot.count)")
+    print("  [B3 研究扫] 安全面违例 \(seededSafetyViolations) | 极限环面违例 \(seededCycleViolations)")
+    if !worseOvershoot.isEmpty { print("  [B3] 过冲劣化明细: \(worseOvershoot.prefix(5))") }
+    if !worseReleases.isEmpty { print("  [B3] 交还增多明细: \(worseReleases.prefix(5))") }
+    expect(n == 81, "全族 81 成员（实际 \(n)）")
+    expect(seededSafetyViolations == 0, "播种后安全面零违例（\(seededSafetyViolations)）")
+    expect(seededCycleViolations == 0, "播种后极限环面零违例（\(seededCycleViolations)）")
+    expect(worseOvershoot.isEmpty,
+           "播种后过冲无 >1.5° 劣化成员（\(worseOvershoot.prefix(3))）")
+}
