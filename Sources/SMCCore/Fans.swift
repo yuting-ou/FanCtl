@@ -28,15 +28,40 @@ public struct FanState {
 
 public final class FanController {
     private let smc: SMCIO
-    public let fanCount: Int
-    private let hasModeKey: Bool  // F0Md 存在 → Apple Silicon 风格
+    // 4.0 审查修复：可重探——init 只读一次的 let 在 FNum 瞬时读取失败时会把有扇
+    // 机器永久钉在 fanCount=0（B1 后触发 passive 语义，从"响亮的 controlFault"
+    // 变成"安静的错误语义"）。rescanFanCountIfNeeded 低频翻正（见该函数注释）。
+    public private(set) var fanCount: Int
+    private var hasModeKey: Bool  // F0Md 存在 → Apple Silicon 风格
+    // 重探节流基准（进程内状态，不持久化；时钟由调用方注入 hooks.now()，P7 单一来源）
+    private var lastFanCountProbe = Date.distantPast
     // v3.4.1 Mn/Mx 静态缓存（硬件常量；唤醒时由 ControlEngine.wake 调 invalidateFanLimits，
     // rescanAllSensors 是 TemperatureSensors 的方法触达不到这里——引擎层接线更干净）
     var cachedFanLimits: [Int: (min: Double, max: Double)] = [:]
 
-    /// 清空风扇 Mn/Mx 静态缓存（唤醒/固件异常防御时调用）
+    /// 清空风扇 Mn/Mx 静态缓存（唤醒/固件异常防御时调用）。
+    /// 同时复位 FNum 重探节流：唤醒是"固件可能重置"的时刻，下一拍立即重探一次。
     public func invalidateFanLimits() {
         cachedFanLimits.removeAll()
+        lastFanCountProbe = .distantPast
+    }
+
+    /// 4.0 审查修复：fanCount==0 期间低频重探 FNum（30s 节流，时钟由调用方注入）。
+    /// 背景：fanCount 在 init 只读一次；4.0 B1 后 fanCount==0 会触发 passive 语义
+    /// （强制 auto、不写扇）——启动瞬时读取失败会把有扇机器从"响亮的 controlFault"
+    /// 变成"安静的错误语义"。真 passive 机器上重探是每 30s 一次的单键读，代价可忽略。
+    /// 返回 true = 本次重探恢复了风扇数（调用方负责边沿日志与硬件画像更正）。
+    @discardableResult
+    public func rescanFanCountIfNeeded(now: Date) -> Bool {
+        guard fanCount == 0 else { return false }
+        guard now.timeIntervalSince(lastFanCountProbe) >= 30 else { return false }
+        lastFanCountProbe = now
+        let fnum = (try? smc.readDouble("FNum")) ?? 0
+        // 与 init 相同的防御：NaN/Inf 拦截、超大值钳位、非正数归 0
+        let count = (fnum.isFinite && fnum > 0) ? Int(min(fnum, 100)) : 0
+        guard count > 0 else { return false }
+        fanCount = count
+        return true
     }
 
     public init(smc: SMCIO) throws {
@@ -48,6 +73,7 @@ public final class FanController {
         // - 负值/零: > 0 守卫拦截
         self.fanCount = (fnum.isFinite && fnum > 0) ? Int(min(fnum, 100)) : 0
         self.hasModeKey = smc.keyExists("F0Md")
+        self.lastFanCountProbe = .distantPast
     }
 
     // 严格读取：任一键失败即抛错。此前用 try? + ?? 0 兜底，state(of:) 永不抛错，

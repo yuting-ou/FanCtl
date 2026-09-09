@@ -120,6 +120,12 @@ public final class ControlEngine {
     var calibrating = false
     var calibratingStartedAt: Date? = nil
     var calibrationSamples = 0
+    // 4.0 审查修复：超时 latch——45 分钟超时接管后，同条件下顶部门控不再自动
+    // 拉回观察期。原缺陷：超时置 calibrating=false，但下一拍 calibrationDue 仍为
+    // true（条件未变）→ 立即重进并把 45 分钟窗口重置，"超时接管"实为"窗口重置"，
+    // 稳态样本永不增长的负载形态下 AI 永不接管、日志每 45 分钟自相矛盾一对。
+    // 解除时机：离开 AI 模式（用户重新选择 = 重新给观察窗）或重置学习数据。
+    var calibrationTimedOut = false
     var horizonWarned: Set<String> = []   // v3.6.2（F5）：异常久远截止时间只告警一次
     var lastProbeTime = Date.distantPast
     var probeVerifyLoops = 0
@@ -321,6 +327,7 @@ public final class ControlEngine {
                 try FileManager.default.removeItem(at: FanCtlPaths.resetLearnFlag)
                 thermalLearn = ThermalLearn()
                 calibrationSamples = 0
+                calibrationTimedOut = false
                 learnDirty = true
                 hooks.log("AI 热经验已重置，将从零重新积累")
             } catch {
@@ -390,8 +397,24 @@ public final class ControlEngine {
         //      < 12）——先观察系统自控的实际平衡写进学习表，成熟后下一拍接管
         //      （AI 播种链 learned 优先，从经验起步而非公式种子猜）。
         // 不修改 config 本身（App 模式选择保留用户意志）；各打一次边沿日志。
-        let passiveMachine = fans.fanCount == 0
-        let calibrationDue = effectiveConfig.mode == .ai && !passiveMachine
+        let passiveMachine: Bool
+        if fans.fanCount == 0 {
+            // 4.0 审查修复：FNum 在 init 只读一次，启动瞬时读取失败会把有扇机器
+            // 永久钉在 passive 语义（B1 前该故障走 controlFault 响亮路径，B1 后
+            // 变成安静的错误语义）。fanCount==0 期间每 30s 低频重探，恢复即翻正
+            // 并更正画像；真 passive 机器代价 = 每 30s 一次单键读。
+            if fans.rescanFanCountIfNeeded(now: hooks.now()) {
+                hardwareProfile?.fanCount = fans.fanCount
+                hooks.log("FNum 读取恢复：检测到 \(fans.fanCount) 个风扇，退出 passive 语义（硬件画像已更正）")
+            }
+        }
+        passiveMachine = fans.fanCount == 0
+        // 超时 latch 解除时机：离开 AI 模式（用户重新选择 = 重新给观察窗），
+        // 或本就无扇可校准（passive 门接管语义）。AI 在选期间 latch 恒保持。
+        if effectiveConfig.mode != .ai || passiveMachine {
+            calibrationTimedOut = false
+        }
+        let calibrationDue = effectiveConfig.mode == .ai && !passiveMachine && !calibrationTimedOut
             && thermalLearn.learnedBucketCount < CALIBRATION_MATURE_BUCKETS
             && calibrationSamples < CALIBRATION_MIN_SAMPLES
         if calibrationDue != calibrating {
@@ -720,37 +743,51 @@ public final class ControlEngine {
         // 整个分支被跳过、prevSmoothedTemp 在 auto 期无人推进——本块自带推进；
         // 控制恢复后 prev 由原分支推进，两路径互斥不双推）：
         // 把系统自控的实际平衡写进学习表——"这台机器稳住 T 需要多少风量"的实测答案。
-        // percent 从 fan0 actualRPM 对 (Mn, Mx) 线性反解（系统在管风扇，Tg 不可信）；
-        // 稳态门/安全覆盖排除照旧（Goodhart：不放宽任何门）。
-        if calibrating, !fastConfigApply, let fan0 = fanStates.first, fan0.maxRPM > fan0.minRPM {
-            let calibPct = min(100, max(0,
-                (fan0.actualRPM - fan0.minRPM) / (fan0.maxRPM - fan0.minRPM) * 100))
-            if let prevCalibT = prevSmoothedTemp,
-               LearningGate.isSteady(temp: temp, prevTemp: prevCalibT,
-                                     baseTarget: calibPct, prevBase: calibPct,
-                                     shapedBase: calibPct, dt: actualInterval),
-               !decision.nightOverride, !decision.ssdGuard, !decision.batteryGuard,
-               !decision.failsafeActive, !writeHealth.faulted, !feedbackHealth.faulted {
-                thermalLearn.record(temp: temp, percent: calibPct, onBattery: onBattery,
-                                    powerWatts: powerWatts, now: hooks.now())
-                calibrationSamples += 1
-                lastLearnAt = hooks.now()
-                learnDirty = true
-                let mature = thermalLearn.learnedBucketCount >= CALIBRATION_MATURE_BUCKETS
-                    || calibrationSamples >= CALIBRATION_MIN_SAMPLES
-                if mature {
-                    hooks.log("AI 校准完成（\(calibrationSamples) 个稳态样本），下一拍接管")
+        // percent 从 fan0 actualRPM 对 (Mn, Mx) 线性反解（系统在管风扇，Tg 不可信）。
+        // 采样门与正常学习路径的有意差异（审查修复轮如实记账，勿再复用"照旧"口径）：
+        //   - 温度稳定性条件同源同阈值（LearningGate tempRatePerSec）；
+        //   - 风量稳定性条件（targetRatePerSec/shapedGap）不可得——calibPct 传自身，
+        //     恒通过。语义依据：系统自控的输出变化我们无需预判，温度稳定即平衡；
+        //   - baseTarget>5% 低饱和门有意省略：此处 0% 是系统自控的真实物理
+        //     （风扇真停转 = 该温度真实无需风量），与"交还默认值 0%"伪影性质不同。
+        //   - 安全覆盖排除（night/ssd/battery/failsafe/写健康/反馈健康）照常生效。
+        // 超时检查独立于 fan0 有效性（原实现嵌在守卫内，观察期风扇读取全失败时
+        // 超时永不可达，calibrating 无限期挂起）。
+        if calibrating, !fastConfigApply {
+            if let fan0 = fanStates.first, fan0.maxRPM > fan0.minRPM {
+                let calibPct = min(100, max(0,
+                    (fan0.actualRPM - fan0.minRPM) / (fan0.maxRPM - fan0.minRPM) * 100))
+                if let prevCalibT = prevSmoothedTemp,
+                   LearningGate.isSteady(temp: temp, prevTemp: prevCalibT,
+                                         baseTarget: calibPct, prevBase: calibPct,
+                                         shapedBase: calibPct, dt: actualInterval),
+                   !decision.nightOverride, !decision.ssdGuard, !decision.batteryGuard,
+                   !decision.failsafeActive, !writeHealth.faulted, !feedbackHealth.faulted {
+                    thermalLearn.record(temp: temp, percent: calibPct, onBattery: onBattery,
+                                        powerWatts: powerWatts, now: hooks.now())
+                    calibrationSamples += 1
+                    lastLearnAt = hooks.now()
+                    learnDirty = true
+                    let mature = thermalLearn.learnedBucketCount >= CALIBRATION_MATURE_BUCKETS
+                        || calibrationSamples >= CALIBRATION_MIN_SAMPLES
+                    if mature {
+                        hooks.log("AI 校准完成（\(calibrationSamples) 个稳态样本），下一拍接管")
+                    }
                 }
+                // auto 期独立推进温度稳定性基准（校准期 effectiveConfig 恒为 auto，
+                // 控制分支不会同时推进 prevSmoothedTemp，两路径不双推）
+                prevSmoothedTemp = temp
             }
-            // auto 期独立推进温度稳定性基准（校准期 effectiveConfig 恒为 auto，
-            // 控制分支不会同时推进 prevSmoothedTemp，两路径不双推）
-            prevSmoothedTemp = temp
-            // 超时兜底：45 分钟仍不成熟（温度剧烈波动采不到稳态）也要接管，种下已有的
+            // 超时兜底：45 分钟仍不成熟（温度剧烈波动采不到稳态）也要接管，种下已有的。
+            // latch 保证这是真退出：接管后同条件下门控不再拉回观察期（窗口不重置），
+            // 下一拍 AI 直接起步；学习表被后续 AI 控制期持续补齐。
             if let started = calibratingStartedAt,
                hooks.now().timeIntervalSince(started) >= CALIBRATION_MAX_SECONDS {
                 calibrating = false
                 calibratingStartedAt = nil
-                hooks.log("AI 校准超时（45 分钟）：以当前学习数据接管")
+                calibrationTimedOut = true
+                hooks.log("AI 校准超时（45 分钟）：以当前学习数据接管（稳态样本 \(calibrationSamples) 个）"
+                    + "；切换模式再切回可重新校准")
             }
         }
 

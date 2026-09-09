@@ -1670,6 +1670,39 @@ func testPassiveMachine() {
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
         for d in envDirs { try? FileManager.default.removeItem(at: d) }
     }
+
+    // ④ FNum 恢复（审查修复回归）：init 时 FNum 读取失败的有扇机器 → passive 语义；
+    //    30s 节流重探恢复 → 退出 passive、画像更正、正常控制（原缺陷：进程生命期钉死）
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+        // F0Md 在（hasModeKey 走 Apple Silicon 路径）但 FNum 缺 → fanCount 0
+        let smc = MockSMC()
+        smc.set("F0Md", 0, type: "ui8 ")
+        smc.set("Tp01", 70); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        seedLearnTable()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        clock.advance(3); engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.reason, .auto, "④ FNum 缺失 → passive 语义 auto")
+        expect(smc.lastWrite("F0Tg") == nil, "④ passive 期不写扇")
+        // 节流验证：FNum 已恢复但 <30s → 不重探，仍 passive
+        smc.set("FNum", 1, type: "ui8 ")
+        smc.set("F0Ac", 2400); smc.set("F0Mn", 1200); smc.set("F0Mx", 5000); smc.set("F0Tg", 1200)
+        clock.advance(10); engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.reason, .auto, "④ 30s 节流窗内不重探，仍 passive")
+        // 越过节流窗 → 重探恢复 → 退出 passive
+        clock.advance(25); engine.beat()
+        let st = ConfigStore.loadStatus()
+        expect(col.logs.contains { $0.contains("FNum 读取恢复") }, "④ 恢复边沿日志在场")
+        expect(st?.hardwareProfile?.fanCount == 1, "④ 硬件画像 fanCount 已更正为 1")
+        expect(st?.reason == .curve, "④ 退出 passive，curve 恢复控制")
+        expect(smc.lastWrite("F0Tg") != nil, "④ 恢复后照常写扇")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
 }
 
 
@@ -1752,6 +1785,75 @@ func testCalibrationColdStart() {
         clock.advance(3); engine.beat()
         expectEqual(ConfigStore.loadStatus()?.calibrating, nil as Bool?, "curve 模式无校准标记")
         expect(ConfigStore.loadStatus()?.reason == .curve, "curve 正常控制")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+
+    // ④ 超时 latch（审查修复回归）：稳态门永不通过 → 45 分钟超时接管后，
+    //    同条件下不被门控拉回观察期（原缺陷：下一拍重进 + 窗口重置，永不接管）。
+    //    非稳态驱动：温度方波 ±3°（>0.12°/s×3s 阈值），零稳态样本；
+    //    功耗恒定 → 不触发卡死门（需功耗波动 ≥10W 才武装）。
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC()
+        smc.set("Tp01", 60); smc.set("PSTR", 30); smc.set("F0Ac", 3000)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        clock.advance(3); engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.calibrating, true, "进入观察期")
+        // 走满 45 分钟观察窗（900 拍 @3s；温度持续漂移 → 稳态门恒 false，零采样）
+        for i in 0..<900 {
+            smc.set("Tp01", i % 2 == 0 ? 60 : 63)
+            clock.advance(3); engine.beat()
+        }
+        expect(col.logs.contains { $0.contains("校准超时") }, "45 分钟超时日志在场")
+        var st = ConfigStore.loadStatus()
+        expect(st?.calibrating != true, "超时后 calibrating=false")
+        // 关键回归断言：原缺陷在此——温度继续波动（仍零样本、表仍空），
+        // 门控不得把 AI 拉回观察期；接管语义（写扇）应持续
+        smc.set("Tp01", 78)
+        clock.advance(3); smc.set("F0Ac", 3000); engine.beat()
+        st = ConfigStore.loadStatus()
+        expect(st?.calibrating != true, "超时 latch：同条件不重进观察期（原缺陷=重进）")
+        expect(st?.reason != .auto, "超时接管后 AI 保持接管（reason=\(String(describing: st?.reason))）")
+        expect(smc.lastWrite("F0Tg") != nil, "超时接管后写扇")
+        // latch 解除：切离 AI 再切回 = 用户重新给观察窗，应重新校准
+        ConfigStore.saveConfig(FanConfig(mode: .auto, preset: .balanced, envCompensation: false))
+        clock.advance(3); engine.beat()
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+        clock.advance(3); engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.calibrating, true, "切离 AI 再切回：latch 解除，重新观察")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+    }
+
+    // ⑤ 超时可达性（审查修复回归）：校准中途风扇读取全失败时超时检查仍生效
+    //    （原缺陷：检查嵌在 fan0 有效性守卫内，calibrating 无限期挂起）。
+    //    两段式：有扇进观察期 → 抹全部 F 键 → 走满观察窗。
+    //    功耗恒定不触发卡死门（需 ≥10W 波动）；温度恒定有 0.5° 微跳防位漂。
+    do {
+        var envDirs: [URL] = []
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC()
+        smc.set("Tp01", 70); smc.set("PSTR", 30); smc.set("F0Ac", 3000)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        clock.advance(3); engine.beat()
+        expectEqual(ConfigStore.loadStatus()?.calibrating, true, "⑤ 有扇进观察期")
+        smc.resetForTesting()          // 校准中途：风扇读取全失败
+        smc.set("Tp01", 70); smc.set("PSTR", 30)
+        for i in 0..<900 {
+            if i % 40 == 0 { smc.set("Tp01", 70 + Double(i % 80) / 80) }   // ±0.5° 微跳
+            clock.advance(3); engine.beat()
+        }
+        expect(col.logs.contains { $0.contains("校准超时") },
+               "⑤ 风扇读取全失败期超时仍可达（原缺陷=永不触发）")
+        expect(ConfigStore.loadStatus()?.calibrating != true, "⑤ 超时后退出校准")
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
         for d in envDirs { try? FileManager.default.removeItem(at: d) }
     }

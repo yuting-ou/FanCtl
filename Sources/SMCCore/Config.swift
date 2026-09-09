@@ -1072,6 +1072,9 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
     let heatsinkStr = s.sensors.heatsink.map { String(r($0)) } ?? "-"
     let palmCompStr = s.palmComp.map { String(r($0 * 10)) } ?? "-"
     let envGapStr = s.learnEnvelopeGap.map { String(r($0)) } ?? "-"
+    // 4.0 审查修复：calibrating 翻转参与变化感知——此前校准进出/超时接管那一拍
+    // summary 不含此字段，状态不落盘，App 的"校准中"提示要等 10s 心跳才消失
+    let calibStr = s.calibrating == true ? "CAL" : "-"
     return [
         String(r(s.sensors.cpuDie)),
         String(r(s.sensors.gpuDie)),
@@ -1095,6 +1098,7 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
         palmRestStr,
         heatsinkStr,
         palmCompStr,
-        envGapStr
+        envGapStr,
+        calibStr
     ].joined(separator: "|")
 }
