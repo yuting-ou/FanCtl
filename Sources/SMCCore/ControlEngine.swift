@@ -79,10 +79,14 @@ public final class ControlEngine {
     public private(set) var hardwareProfile: HardwareProfile?
     public private(set) var thermalLearn: ThermalLearn
     public private(set) var aiMetrics: AIControlMetrics
+    // 4.0.1（4.1-A1）：dt 账本独立于评测指标——生命周期 = 控制律版本，用户切换
+    // 目标档位不再清零。落盘 dt-ledger.json（60s 节流 + 睡眠/退出全量落盘）
+    public private(set) var dtLedger: DTLedgerState
     var aiMetricsUserTarget: Double? = nil   // 评测的用户目标基准（有效目标随环境/夜间漂移，不能用作重置判据）
     var thermalModel: ThermalModel
     var learnDirty = false
     var modelDirty = false
+    var dtLedgerDirty = false
     var envCompLogged = false
     var lastAIOutput: Double? = nil
     var lastAIIntent: AIIntent? = nil
@@ -175,6 +179,8 @@ public final class ControlEngine {
         let cfgUserTarget = config.aiTargetTemp ?? 76
         self.aiMetrics = ConfigStore.loadAIMetrics() ?? AIControlMetrics(targetTemp: cfgUserTarget,
                                                                          userTargetTemp: cfgUserTarget)
+        // 4.0.1（4.1-A1）：dt 账本独立加载（不随下方评测指标重置判据清零）
+        self.dtLedger = ConfigStore.loadDTLedger() ?? DTLedgerState()
         // 评测账本跨启动重置判据：持久化的"用户目标"（v2.9 起单独存，
         // targetTemp 已改为随环境/夜间漂移的有效目标，不能再用作比对）
         let savedUserTarget = aiMetrics.userTargetTemp ?? aiMetrics.targetTemp
@@ -230,6 +236,7 @@ public final class ControlEngine {
         ConfigStore.saveLearn(thermalLearn)
         ConfigStore.saveModel(thermalModel)
         ConfigStore.saveAIMetrics(aiMetrics)
+        ConfigStore.saveDTLedger(dtLedger)
     }
 
     /// 系统唤醒（主队列调用）：清理残留状态、重扫传感器、立即跑一拍
@@ -272,6 +279,7 @@ public final class ControlEngine {
         ConfigStore.saveLearn(thermalLearn)
         ConfigStore.saveModel(thermalModel)
         ConfigStore.saveAIMetrics(aiMetrics)
+        ConfigStore.saveDTLedger(dtLedger)
     }
 
     private func setSuspended(_ value: Bool) {
@@ -1037,6 +1045,13 @@ public final class ControlEngine {
                 let appliedDeltas = aiController.lastAppliedDeltas
                 aiMetrics.record(temp: temp, output: output, seconds: actualInterval,
                                  dDelta: appliedDeltas?.d, pDelta: appliedDeltas?.p)
+                // 4.0.1（4.1-A1）：账本与评测指标同拍同源入账，但生命周期解耦
+                // （独立 dt-ledger.json，档位切换/评测重置不再清零）。slopeRate 只认
+                // PD 拍（非 PD 拍增量本为 0，斜率上下文不混入）——4.1-A3 斜率权重。
+                dtLedger.record(temp: temp, output: output, seconds: actualInterval,
+                                dDelta: appliedDeltas?.d, pDelta: appliedDeltas?.p,
+                                slopeRate: appliedDeltas?.slopeRate, now: hooks.now())
+                dtLedgerDirty = true
             }
             // v3.2 过冲观察：与 aiMetrics 同一排除集（静音封顶是用户意图而非控制失效，
             // 安全覆盖/闭环故障期的温度不反映 AI 控制质量——混入会让 τ 自适应的
@@ -1102,6 +1117,11 @@ public final class ControlEngine {
                     modelDirty = false
                 }
                 ConfigStore.saveAIMetrics(aiMetrics)
+                // 4.0.1（4.1-A1）：账本与评测指标同节流落盘（变化驱动，无变化不写盘）
+                if dtLedgerDirty {
+                    ConfigStore.saveDTLedger(dtLedger)
+                    dtLedgerDirty = false
+                }
             }
         }
         // v3.6.1 修复：prevRawTemp 的赋值已移至步骤 6 computeNextInterval 之后。

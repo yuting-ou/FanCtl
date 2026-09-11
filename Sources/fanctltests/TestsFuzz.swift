@@ -353,18 +353,33 @@ func testGarbageCodable() {
         if let m = ConfigStore.loadAIMetrics() {
             let sd = m.temperatureStdDev
             chaosCheck(&parseViolations, 0, sd.isFinite && sd >= 0, "垃圾评测 stdDev \(sd)")
-            // v3.8 dt 账本：垃圾解码后读出侧必须仍在安全域（钳位/归 0 生效）
-            for b in [m.dtLedgerFast, m.dtLedgerNominal, m.dtLedgerSlow].compactMap({ $0 }) {
+        }
+    }
+    // 4.0.1（4.1-A1）：账本独立持久化——用账本形状的基线喂变异器（含三桶+startedAt），
+    // 垃圾解码读出侧安全域同源覆盖
+    var ledBase = DTLedgerState()
+    let fuzzT0 = Date(timeIntervalSince1970: 700_000_000)
+    ledBase.record(temp: 76, output: 40, seconds: 1.0, dDelta: -2, pDelta: 1, slopeRate: -2, now: fuzzT0)
+    ledBase.record(temp: 78, output: 42, seconds: 3.0, dDelta: 1.5, pDelta: 2, slopeRate: 0.5, now: fuzzT0)
+    ledBase.record(temp: 80, output: 44, seconds: 10.0, dDelta: -1, pDelta: 0, slopeRate: -0.1, now: fuzzT0)
+    let ledgerBase = try! JSONEncoder().encode(ledBase)
+    for _ in 0..<20 {
+        writeMutated(ledgerBase, to: FanCtlPaths.dtLedgerFile)
+        if let l = ConfigStore.loadDTLedger() {
+            for b in [l.fast, l.nominal, l.slow].compactMap({ $0 }) {
                 chaosCheck(&parseViolations, 0,
                            b.samples >= 0 && b.seconds.isFinite && b.seconds >= 0
                                && b.dAbsSum.isFinite && b.dAbsSum >= 0
-                               && b.pAbsSum.isFinite && b.pAbsSum >= 0,
+                               && b.pAbsSum.isFinite && b.pAbsSum >= 0
+                               && b.slopeWeightedSum.isFinite && b.slopeWeightedSum >= 0,
                            "垃圾 dt 账本桶越界 \(b)")
                 if b.seconds > 0 {
                     let r = b.dRatePerSecond ?? 0
                     chaosCheck(&parseViolations, 0, r.isFinite && r >= 0, "垃圾桶 D 速率 \(r)")
                 }
             }
+            chaosCheck(&parseViolations, 0, l.totalSeconds.isFinite && l.totalSeconds >= 0,
+                       "垃圾账本总时长越界")
         }
     }
     // v3.8 硬件画像：直接喂 9 类垃圾值组合（含类型错配——decodeIfPresent 抛错路径）

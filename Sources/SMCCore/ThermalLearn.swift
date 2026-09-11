@@ -509,4 +509,21 @@ extension ConfigStore {
             return true
         } catch { return false }
     }
+
+    /// 4.0.1（4.1-A1）：dt 账本独立读写（损坏备份协议与 learn/ai-metrics 同源）。
+    /// 不迁移旧 ai-metrics.json 里的账本字段：4.1-A3 修订后的裁决口径需要
+    /// slopeWeightedSum（legacy 数据没有），且原始比值口径已被证伪（选择偏差）——
+    /// 自 4.0.1 起重新起算，受控时长门槛按新账本计（EVOLUTION R17 记账）。
+    public static func loadDTLedger() -> DTLedgerState? {
+        loadCorruptionAware(DTLedgerState.self, from: FanCtlPaths.dtLedgerFile, name: "dt-ledger")
+    }
+
+    @discardableResult
+    public static func saveDTLedger(_ ledger: DTLedgerState) -> Bool {
+        guard let data = try? JSONEncoder().encode(ledger) else { return false }
+        do {
+            try data.write(to: FanCtlPaths.dtLedgerFile, options: .atomic)
+            return true
+        } catch { return false }
+    }
 }

@@ -1366,15 +1366,16 @@ func testTrustTriangle() {
 func testDTLedger() {
     group("v3.8 D 项 dt 账本")
 
-    // —— record() 分桶：边界 1.5s / 4.5s，时长与 |P|/|D| 各自累计 ——
+    // —— record() 分桶：边界 1.5s / 4.5s，时长与 |P|/|D| 各自累计（4.0.1 起独立 DTLedgerState） ——
     do {
-        var m = AIControlMetrics(targetTemp: 76)
-        m.record(temp: 76, output: 40, seconds: 1.0, dDelta: -2, pDelta: 1)     // fast
-        m.record(temp: 77, output: 41, seconds: 1.4, dDelta: 3, pDelta: -1)     // fast（<1.5）
-        m.record(temp: 78, output: 42, seconds: 3.0, dDelta: 1.5, pDelta: 2)    // nominal
-        m.record(temp: 79, output: 43, seconds: 10.0, dDelta: -1, pDelta: 0)    // slow
-        guard let fast = m.dtLedgerFast, let nom = m.dtLedgerNominal, let slow = m.dtLedgerSlow else {
-            expect(false, "四拍后三桶全部建立（fast=\(String(describing: m.dtLedgerFast)) nom=\(String(describing: m.dtLedgerNominal)) slow=\(String(describing: m.dtLedgerSlow))）")
+        var led = DTLedgerState()
+        let t0 = Date(timeIntervalSince1970: 700_000_000)
+        led.record(temp: 76, output: 40, seconds: 1.0, dDelta: -2, pDelta: 1, slopeRate: -2.0, now: t0)     // fast
+        led.record(temp: 77, output: 41, seconds: 1.4, dDelta: 3, pDelta: -1, slopeRate: 3.0, now: t0)      // fast（<1.5）
+        led.record(temp: 78, output: 42, seconds: 3.0, dDelta: 1.5, pDelta: 2, slopeRate: 0.5, now: t0)     // nominal
+        led.record(temp: 79, output: 43, seconds: 10.0, dDelta: -1, pDelta: 0, slopeRate: -0.1, now: t0)    // slow
+        guard let fast = led.fast, let nom = led.nominal, let slow = led.slow else {
+            expect(false, "四拍后三桶全部建立（fast=\(String(describing: led.fast)) nom=\(String(describing: led.nominal)) slow=\(String(describing: led.slow))）")
             return
         }
         expectEqual(fast.samples, 2, "快拍样本数")
@@ -1382,19 +1383,34 @@ func testDTLedger() {
         expectClose(fast.dAbsSum, 5, 1e-9, "|D| 绝对值累计（1.5→0 无符号吞噬）")
         expectClose(nom.pAbsSum, 2, 1e-9, "标称桶 |P|")
         expectEqual(slow.samples, 1, "长拍样本数")
-        expect(m.sampleCount == 4 && abs(m.activeSeconds - 15.4) < 1e-9, "总账不串桶")
+        // 4.1-A3 斜率权重：Σ|slopeRate|·dt，只认 PD 拍
+        expectClose(fast.slopeWeightedSum, 2.0*1.0 + 3.0*1.4, 1e-9, "快拍斜率权重累计")
+        expectClose(nom.slopeWeightedSum, 1.5, 1e-9, "标称斜率权重累计")
+        expectClose(led.totalSeconds, 15.4, 1e-9, "受控总时长（A2 口径的账本底数）")
+        expectEqual(led.startedAt, t0, "startedAt 用注入时钟（P7）")
 
-        // nil 增量（首拍播种/空闲交还拍）：入时长分布，增量记 0
-        var m2 = AIControlMetrics(targetTemp: 76)
-        m2.record(temp: 76, output: 30, seconds: 3.0)
-        expect(m2.dtLedgerNominal?.samples == 1 && m2.dtLedgerNominal?.dAbsSum == 0,
+        // nil 增量（首拍播种/空闲交还拍）：入时长分布，增量记 0，斜率权重不混入
+        var led2 = DTLedgerState()
+        led2.record(temp: 76, output: 30, seconds: 3.0, dDelta: nil, pDelta: nil, slopeRate: 0.5, now: t0)
+        expect(led2.nominal?.samples == 1 && led2.nominal?.dAbsSum == 0,
                "nil 增量入桶但 |D| 记 0")
+        expect(led2.nominal?.slopeWeightedSum == 0, "非 PD 拍不计斜率权重")
+        // 死区拍（dDelta=0 但斜率非零）：同样不计权重——I_D 的分子分母必须同源
+        led2.record(temp: 77, output: 31, seconds: 3.0, dDelta: 0, pDelta: 2, slopeRate: 0.05, now: t0)
+        expect(led2.nominal?.samples == 2 && led2.nominal?.slopeWeightedSum == 0,
+               "死区拍不计斜率权重（I_D 分子分母同源）")
 
-        // 非有限增量防御：坏值不入账，样本照记（账本永不因坏值失真）
-        m2.record(temp: 77, output: 31, seconds: 3.0, dDelta: .nan, pDelta: .infinity)
-        expect(m2.dtLedgerNominal?.samples == 2, "非有限增量仍计样本")
-        expect(m2.dtLedgerNominal?.dAbsSum == 0 && m2.dtLedgerNominal?.pAbsSum == 0,
-               "非有限增量不计入累计")
+        // 非有限增量防御：坏值不入账，样本照记（账本永不因坏值失真）。
+        // 前两拍累计：dAbsSum=0（nil+死区），pAbsSum=2（死区拍合法 pDelta=2）
+        led2.record(temp: 77, output: 31, seconds: 3.0, dDelta: .nan, pDelta: .infinity, slopeRate: .nan, now: t0)
+        expect(led2.nominal?.samples == 3, "非有限增量仍计样本")
+        expect(led2.nominal?.dAbsSum == 0 && led2.nominal?.pAbsSum == 2,
+               "非有限增量对 |P|/|D| 累计零贡献")
+        // 守卫同源：坏温度/坏时长整拍不入账（与评测 record 同一守卫）
+        var led3 = DTLedgerState()
+        led3.record(temp: .nan, output: 40, seconds: 3.0, dDelta: 1, pDelta: 1, slopeRate: 1, now: t0)
+        led3.record(temp: 76, output: 40, seconds: 0, dDelta: 1, pDelta: 1, slopeRate: 1, now: t0)
+        expect(led3.isEmpty, "坏温度/零时长整拍不入账")
     }
 
     // —— 读出侧防御：垃圾解码（合法有限巨值/负值）钳位（P3 同源） ——
@@ -1406,23 +1422,35 @@ func testDTLedger() {
         expect(w.b.seconds == 1e9 && w.b.dAbsSum == 0,
                "正有限巨值钳到上限 1e9、负值归 0（得 \(w.b.seconds)/\(w.b.dAbsSum)）")
         expectEqual(w.b.pAbsSum, 3, "合法值保留")
+        expectEqual(w.b.slopeWeightedSum, 0, "新字段缺省 0（legacy 桶兼容）")
         // 缺字段桶（半截 JSON）不炸
         let partial = try! JSONDecoder().decode(Wrapper.self, from: Data(#"{"b":{"samples":2}}"#.utf8))
         expectEqual(partial.b.samples, 2, "半截桶可解码")
         expect(partial.b.seconds == 0, "缺时长默认 0")
+        // slopeWeightedSum 巨值同样钳位
+        let sw = try! JSONDecoder().decode(Wrapper.self, from: Data(
+            #"{"b":{"samples":1,"seconds":1,"dAbsSum":1,"pAbsSum":1,"slopeWeightedSum":-1e308}}"#.utf8))
+        expect(sw.b.slopeWeightedSum == 0, "负斜率权重归 0")
     }
 
-    // —— 向后兼容：旧版 ai-metrics.json（无账本字段）照常解码 ——
+    // —— 向后兼容（4.0.1 双向）——
     do {
-        let old = #"{"targetTemp":76,"activeSeconds":10,"sampleCount":2,"temperatureSum":150,"temperatureSquaredSum":11252,"peakTemp":80,"maxOvershoot":4,"highTempSeconds":0,"outputSum":80,"outputChangeCount":1,"outputChangeMagnitude":10,"updatedAt":700000000.0}"#
+        // 旧版 ai-metrics.json（含 v3.8 账本字段）：新结构忽略未知键照常解码
+        let old = #"{"targetTemp":76,"activeSeconds":10,"sampleCount":2,"temperatureSum":150,"temperatureSquaredSum":11252,"peakTemp":80,"maxOvershoot":4,"highTempSeconds":0,"outputSum":80,"outputChangeCount":1,"outputChangeMagnitude":10,"dtLedgerFast":{"samples":3,"seconds":3,"dAbsSum":9,"pAbsSum":4},"updatedAt":700000000.0}"#
         let m = try! JSONDecoder().decode(AIControlMetrics.self, from: Data(old.utf8))
-        expect(m.sampleCount == 2 && m.dtLedgerFast == nil, "旧 JSON 解码 + 账本字段 nil")
-        // 往返：新结构编码再解码不丢
+        expect(m.sampleCount == 2, "旧 JSON（带遗留账本键）解码不炸、键被忽略")
+        // 评测指标往返（已无账本字段）
         var m2 = AIControlMetrics(targetTemp: 76)
         m2.record(temp: 80, output: 50, seconds: 1.0, dDelta: 2, pDelta: 1)
         let data = try! JSONEncoder().encode(m2)
         let back = try! JSONDecoder().decode(AIControlMetrics.self, from: data)
-        expectEqual(back, m2, "含账本字段的完整往返")
+        expectEqual(back, m2, "评测指标完整往返")
+        // 独立账本往返：startedAt/slopeWeightedSum 全保留
+        var led = DTLedgerState()
+        let t0 = Date(timeIntervalSince1970: 700_000_000)
+        led.record(temp: 76, output: 40, seconds: 1.0, dDelta: -2, pDelta: 1, slopeRate: -2, now: t0)
+        let ledBack = try! JSONDecoder().decode(DTLedgerState.self, from: try! JSONEncoder().encode(led))
+        expectEqual(ledBack, led, "dt-ledger 独立往返（含 startedAt/斜率权重）")
     }
 
     // —— 控制器增量转述：dt=1s 快拍 vs dt=3s 标称的 D 每拍增量（理论上同 slopeRate 时相等：
@@ -1441,6 +1469,7 @@ func testDTLedger() {
                 expect(false, "主路径拍有增量转述（dt=\(dt) idleReleased=\(ai.idleReleased)）")
                 return
             }
+            expectClose(deltas.slopeRate, 0.6, 1e-9, "增量转述携带原始斜率（4.1-A3 斜率权重数据源）")
             let d = deltas.d
             rates.append(d / dt)                     // 每秒 |D| 推力
         }
@@ -1464,7 +1493,8 @@ func testDTLedger() {
         expectClose(p1sPair.0, p1sPair.1, 1e-9, "P 每秒贡献与 dt 无关（kP·error/3）")
     }
 
-    // —— 引擎级：AI 拍经 record 通道入账（step/record 同拍对齐，不双计不漏计） ——
+    // —— 引擎级：AI 拍经账本通道入账（step/record 同拍对齐，不双计不漏计；
+    //      4.0.1 起落 dt-ledger.json，生命周期与评测指标解耦） ——
     do {
         var envDirs: [URL] = []
         envDirs.append(engineTestEnv())
@@ -1475,29 +1505,136 @@ func testDTLedger() {
         seedLearnTable()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         // 连续温升（每拍 +0.6°·3s → 超 D 死区），7 拍全部走主路径。
-        // aiMetrics 60s 节流落盘：21s < 60s，须走 shutdownSave 验证持久化链路
+        // 60s 节流落盘：21s < 60s，须走 shutdownSave 验证持久化链路
         for i in 0..<7 {
             smc.set("Tp01", 78 + 0.6 * Double(i))
             clock.advance(3)
             engine.beat()
         }
         engine.shutdownSave()
-        let m = ConfigStore.loadAIMetrics()
-        guard let m, let nom = m.dtLedgerNominal else {
-            expect(false, "引擎拍入账（metrics=\(m != nil) nom=\(String(describing: m?.dtLedgerNominal))）")
+        let led = ConfigStore.loadDTLedger()
+        guard let led, let nom = led.nominal else {
+            expect(false, "引擎拍入账（ledger=\(led != nil) nom=\(String(describing: led?.nominal))）")
             for d in envDirs { try? FileManager.default.removeItem(at: d) }
             FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
             return
         }
-        expect(m.sampleCount >= 5, "引擎拍入了评测账本（得 \(m.sampleCount)）")
+        let m = ConfigStore.loadAIMetrics()
+        expect((m?.sampleCount ?? 0) >= 5, "引擎拍入了评测账本（得 \(m?.sampleCount ?? 0)）")
         expect(nom.samples >= 5, "3s 拍入标称桶（得 \(nom.samples)）")
         expect(nom.dAbsSum > 0, "温升段 D 增量有实际入账")
+        expect(nom.slopeWeightedSum > 0, "斜率权重随 PD 拍入账（4.1-A3）")
         // 账本完备性契约：每个入账样本恰好落进唯一桶（首拍 actualInterval=0 被
         // record 守卫跳过，故不能假设 sampleCount-1；锁的是桶边界无缝）
-        let bucketSum = (m.dtLedgerFast?.samples ?? 0) + nom.samples + (m.dtLedgerSlow?.samples ?? 0)
-        expectEqual(bucketSum, m.sampleCount, "分桶样本数总和 = 总样本数")
+        let bucketSum = (led.fast?.samples ?? 0) + nom.samples + (led.slow?.samples ?? 0)
+        expectEqual(bucketSum, m?.sampleCount ?? -1, "分桶样本数总和 = 总样本数")
+
+        // 4.1-A1 核心回归：目标档位切换（评测指标重置路径）不清账本
+        ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 72, envCompensation: false))
+        clock.advance(3); engine.beat()
+        clock.advance(3); engine.beat()
+        // 差分断言：评测账本已随档位切换重置（sampleCount 回到个位数），
+        // dt 账本保留且继续增长——两个生命周期从此分道
+        expect(engine.aiMetrics.sampleCount <= 2,
+               "档位切换后评测指标已重置（sampleCount=\(engine.aiMetrics.sampleCount)）")
+        expect((engine.dtLedger.nominal?.samples ?? 0) > nom.samples,
+               "档位切换后 dt 账本保留且增长（nominal=\(engine.dtLedger.nominal?.samples ?? 0) vs \(nom.samples)）")
+        engine.shutdownSave()
+        let ledOnDisk = ConfigStore.loadDTLedger()
+        expect(ledOnDisk?.nominal?.samples == engine.dtLedger.nominal?.samples,
+               "档位切换后账本照常落盘")
+        // 4.1-A1 核心回归：重启（新引擎）保留账本
+        let engine2 = makeEngine(smc: smc, clock: clock, collector: col)
+        expect(engine2.dtLedger.nominal?.samples == engine.dtLedger.nominal?.samples,
+               "重启后账本从 dt-ledger.json 恢复")
         for d in envDirs { try? FileManager.default.removeItem(at: d) }
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    }
+}
+
+// MARK: - 4.1-A3：dt 账本选择偏差复现（P 校准线前提证伪的仿真判据，EVOLUTION R17）
+
+/// 引擎自适应调度的仿真近似（computeNextInterval 的桶相关骨架）：
+/// 温差 >3°/拍 → 1s 快拍；>1° → 3s 标称；其余 → 10s 长拍
+private func simulatedNextInterval(prevRaw: Double, raw: Double) -> Double {
+    let change = abs(raw - prevRaw)
+    if change > 3 { return 1 }
+    if change > 1 { return 3 }
+    return 10
+}
+
+func testDTLedgerSelectionBias() {
+    group("dt 账本选择偏差复现(4.1-A3)")
+    // 预注册判据（EVOLUTION R17，先于运行定稿）：
+    //   引擎自适应调度骨架（温差>3°→1s / >1°→3s / 其余 10s）+ 守卫 episode
+    //   （SSD 拷贝式 1s 轮询窗，真机快拍秒的主要来源）跑 VirtualMachine 闭环，
+    //   按引擎语义入账。锁定两个结构契约：
+    //   ① I_D = dAbsSum/slopeWeightedSum（斜率归一 D 强度）快/标称比 ≈ 3.0 =
+    //      纯 dt 效应——工具有效性契约：slopeWeightedSum 把原始比里的斜率选择
+    //      效应完整剥离；
+    //   ② P 每秒基线跨桶不等 = 桶间 operating regime 不同的结构性后果
+    //      （长拍≈舒适区 clampedError=0 → P≈0；快拍陡爬≈输出饱和 anti-windup
+    //      跳 P → P≈0；标称=主动控温 → P>0）——"三桶校准线应相等"前提对分桶
+    //      数据结构性不成立，P 校准线退役（真机 4.33/2.68/0.66 同理解释）。
+    //   若 ① 偏离 3.0 过远或 ② 反转（P 线相等）→ 工具或归因有问题，禁止进入裁决。
+    do {
+        var vm = VirtualMachine()
+        var ai = AIController()
+        ai.tuning.targetTemp = 76
+        var ctrl = FanCurveController()
+        var led = DTLedgerState()
+        var dt: Double = 3
+        var t = 0.0
+        for i in 0..<3000 {
+            // 负载：45W 基础 + 15W 正弦 + 8W 阶跃；守卫 episode（每 500 拍 50 拍）
+            // +20W 模拟 SSD 拷贝期——1s 轮询窗，真机快拍秒的主要来源
+            let episode = (i % 500) < 50
+            let power = 45 + 15 * sin(Double(i) / 100.0) + ((i / 200) % 2 == 0 ? 8 : 0)
+                + (episode ? 20 : 0)
+            let beatDt: Double = episode ? 1 : dt
+            let rawBefore = vm.temp
+            guard let o = ai.step(temp: vm.temp, learned: nil, powerWatts: power, dt: beatDt) else {
+                // 空闲交还拍：引擎评测门不入账（targetPercent nil）——语义对齐
+                vm.step(power: power, percent: 0, dt: beatDt)
+                dt = simulatedNextInterval(prevRaw: rawBefore, raw: vm.temp)
+                t += beatDt
+                continue
+            }
+            let applied = ctrl.slew(target: o, force: false, hysteresis: 4)
+            vm.step(power: power, percent: applied, dt: beatDt)
+            let deltas = ai.lastAppliedDeltas
+            led.record(temp: vm.temp, output: o, seconds: beatDt,
+                       dDelta: deltas?.d, pDelta: deltas?.p,
+                       slopeRate: deltas?.slopeRate,
+                       now: Date(timeIntervalSince1970: t))
+            dt = simulatedNextInterval(prevRaw: rawBefore, raw: vm.temp)
+            t += beatDt
+        }
+        // 桶覆盖：三类拍都必须有实质样本（调度骨架在跑）
+        expect((led.fast?.seconds ?? 0) > 30, "快拍桶有实质覆盖（\(led.fast?.seconds ?? 0)s）")
+        expect((led.nominal?.seconds ?? 0) > 60, "标称桶有实质覆盖（\(led.nominal?.seconds ?? 0)s）")
+        expect((led.slow?.seconds ?? 0) > 300, "长拍桶有实质覆盖（\(led.slow?.seconds ?? 0)s）")
+        expect((led.fast?.slopeWeightedSum ?? 0) > 0, "快拍斜率权重在账（4.1-A3 工具在跑）")
+        // 契约 ①：I_D 快/标称比 = 纯 dt 效应（当前律理论值 3.0；死区发生率差异允许 ±15%）
+        guard let iFast = led.fast?.dIntensity, let iNom = led.nominal?.dIntensity, iNom > 0 else {
+            expect(false, "I_D 可读（fast=\(String(describing: led.fast?.dIntensity)) nom=\(String(describing: led.nominal?.dIntensity))）")
+            return
+        }
+        print(String(format: "  [A3 拆解] D 原始比 %.2f | I_D 斜率归一比 %.2f（dt 效应理论值 3.0）",
+                     (led.fast!.dRatePerSecond ?? 0) / max(led.nominal!.dRatePerSecond ?? 1e-9, 1e-9),
+                     iFast / iNom))
+        expect(iFast / iNom > 2.9 && iFast / iNom < 3.1,
+               "斜率归一剥离 dt 效应：I_D 比 = 3.0（同桶同 dt 下精确；得 \(String(format: "%.3f", iFast / iNom))）")
+        // 契约 ②：P 基线跨桶结构性不等（regime 不同），"校准线"前提退役
+        let pRates = [led.fast?.pRatePerSecond ?? 0,
+                      led.nominal?.pRatePerSecond ?? 0,
+                      led.slow?.pRatePerSecond ?? 0]
+        let pMax = pRates.max() ?? 0
+        let pMin = pRates.min() ?? 0
+        print(String(format: "  [A3 复现] P_fast=%.2f P_nom=%.2f P_slow=%.2f（真机 4.33/2.68/0.66）",
+                     pRates[0], pRates[1], pRates[2]))
+        expect(pMax > 0 && (pMin == 0 || pMax / pMin > 2),
+               "P 基线跨桶结构性不等复现（max=\(pMax) min=\(pMin)）")
     }
 }
 

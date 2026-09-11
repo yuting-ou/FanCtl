@@ -890,6 +890,9 @@ public enum FanCtlPaths {
     public static var historyFile: URL { supportDir.appendingPathComponent("history.json") }
     public static var learnFile: URL { supportDir.appendingPathComponent("ai-learn.json") }
     public static var aiMetricsFile: URL { supportDir.appendingPathComponent("ai-metrics.json") }
+    // 4.0.1（4.1-A1）：dt 账本独立持久化——生命周期 = 控制律版本，与评测指标
+    // （目标档位切换即重置）解耦。控制律结构变更时手动删除本文件重攒（EVOLUTION 记账）。
+    public static var dtLedgerFile: URL { supportDir.appendingPathComponent("dt-ledger.json") }
     public static var modelFile: URL { supportDir.appendingPathComponent("thermal-model.json") }
     public static var resetLearnFlag: URL { supportDir.appendingPathComponent("reset-learn.flag") }
     public static var exitReasonFile: URL { supportDir.appendingPathComponent("exit-reason.flag") }

@@ -6,6 +6,12 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 DIST="$ROOT/dist"
 
+# 2026-09-11：CLT 6.4 更新后 MacOSX.sdk 符号链接指向 MacOSX27.0.sdk，而该 SDK 的
+# SwiftUI 外部宏（@State 等）缺插件实现（SwiftUIMacros，实测最小复现失败；26.5 SDK
+# 正常）→ App 目标无法编译。显式指回 26.5 SDK（≥ App 的 macOS 26 最低部署目标），
+# 待 CLT 修复或安装完整 Xcode 后移除本段。
+export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+
 echo "==> 运行回归测试（失败则中断构建）..."
 swift run -c release --disable-sandbox fanctltests
 

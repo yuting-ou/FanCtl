@@ -57,27 +57,27 @@ do {
                      m.activeSeconds / 60, m.averageTemp, m.temperatureStdDev,
                      m.averageOutput, m.highTempSeconds))
     }
-    // v3.8 D 项 dt 账本（EVOLUTION R8 预注册裁决）：
-    //   D 快拍/标称比 = 快拍 D 每秒贡献 ÷ 标称拍 D 每秒贡献。
-    //   当前实现（dDelta = 3·kD·slopeRate/dt）理论值 ≈ 3；若真机长期 ≈1（快拍占比极低）
-    //   或比值的绝对影响可忽略，D 项 1/dtNom 漂移不必修（改控制律需账本支撑——R4 跳过项 1）。
-    //   P 基线跨桶应近似相等（P 每秒贡献与 dt 无关）——不等 = 账本自身有 bug。
-    let m = ConfigStore.loadAIMetrics()
+    // v3.8 D 项 dt 账本（EVOLUTION R8 预注册裁决；4.1-A3 规则修订见 EVOLUTION R17）：
+    //   D 快拍/标称比 = 快拍 D 每秒贡献 ÷ 标称拍 D 每秒贡献。当前律下按构造 ≈3×斜率比
+    //   （选择偏差保证 ≥3），该比值只作诊断；裁决 = 快拍秒占比门槛 + VM 危害测试。
+    //   P 基线跨桶不等 = 选择偏差的预期表现（4.0.1 起退役"校准线"语义）。
+    // 4.0.1（4.1-A1）：账本在独立 dt-ledger.json（生命周期 = 控制律版本，与评测指标解耦）。
+    let ledger = ConfigStore.loadDTLedger()
     let buckets: [(String, DTermLedgerBucket?)] = [
-        ("快拍<1.5s", m?.dtLedgerFast), ("标称1.5-4.5s", m?.dtLedgerNominal), ("长拍>4.5s", m?.dtLedgerSlow)]
-    if let metrics = m, buckets.contains(where: { $0.1?.seconds ?? 0 > 0 }) {
-        print("D 项 dt 账本（预注册裁决）:")
+        ("快拍<1.5s", ledger?.fast), ("标称1.5-4.5s", ledger?.nominal), ("长拍>4.5s", ledger?.slow)]
+    if let l = ledger, buckets.contains(where: { $0.1?.seconds ?? 0 > 0 }) {
+        let started = l.startedAt.map { DateFormatter.localizedString(from: $0, dateStyle: .short, timeStyle: .short) } ?? "?"
+        print(String(format: "D 项 dt 账本（自 %@，受控 %.2f 天）:", started, l.totalSeconds / 86400))
         for (label, b) in buckets {
             guard let b, b.seconds > 0 else { continue }
             let dRate = b.dRatePerSecond ?? 0
             let pRate = b.pRatePerSecond ?? 0
-            print(String(format: "  %@: %d 拍 / %.0f 分钟 | D 每秒 %.2f%% | P 每秒 %.2f%%",
-                         label, b.samples, b.seconds / 60, dRate, pRate))
+            let dInt = b.dIntensity.map { String(format: "%.1f", $0) } ?? "-"
+            print(String(format: "  %@: %d 拍 / %.0f 分钟 | D 每秒 %.2f%% | P 每秒 %.2f%% | 斜率权重 %.0f | I_D %@",
+                         label, b.samples, b.seconds / 60, dRate, pRate, b.slopeWeightedSum, dInt))
         }
-        if let fast = metrics.dtLedgerFast, let nom = metrics.dtLedgerNominal,
-           fast.seconds > 60, nom.seconds > 60,
-           let fr = fast.dRatePerSecond, let nr = nom.dRatePerSecond, nr > 0 {
-            print(String(format: "  ⇒ D 快拍/标称比: %.2f（理论 3；P 基线跨桶应相等）", fr / nr))
+        if let share = l.fastSecondsShare {
+            print(String(format: "  ⇒ 快拍秒占比: %.1f%%（裁决暴露度门槛 5%%）", share * 100))
         }
     }
     // v3.8 硬件画像（陌生机器 issue 首问）

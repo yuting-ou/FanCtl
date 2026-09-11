@@ -184,7 +184,10 @@ public struct AIController {
     // v3.8 D 项 dt 账本：本拍实际生效的 (dDelta, pDelta)——pDelta 在 anti-windup
     // 跳过同向 P 项时记 0（账本只记"真推动了输出"的部分）。nil = 本拍未走 PD
     // 路径（首拍播种/空闲交还/温度坏值），引擎侧不入账。只读转述，不改控制行为。
-    public private(set) var lastAppliedDeltas: (d: Double, p: Double)?
+    // 4.0.1（4.1-A3）：追加 slopeRate（死区前的原始斜率 °C/s）——账本的
+    // slopeWeightedSum = Σ|slopeRate|·dt 需要它把快拍/标称比里的 dt 效应与
+    // 斜率选择效应分开（P 校准线前提已被证伪，见 ControlMetrics 头注）。
+    public private(set) var lastAppliedDeltas: (d: Double, p: Double, slopeRate: Double)?
 
     public init(tuning: AITuning = AITuning()) { self.tuning = tuning }
 
@@ -329,7 +332,7 @@ public struct AIController {
         } else {
             pApplied = 0   // anti-windup 跳过：账本只记实际生效部分
         }
-        lastAppliedDeltas = (d: dDelta, p: pApplied)
+        lastAppliedDeltas = (d: dDelta, p: pApplied, slopeRate: slopeRate)
         output = min(100, max(0, output + delta))
 
         // v9 曲线锚定（探测式阶梯，替代 v7 连续拉取）：误差和斜率都归零（稳态）时，
