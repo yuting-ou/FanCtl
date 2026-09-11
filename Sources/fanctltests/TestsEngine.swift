@@ -1638,6 +1638,92 @@ func testDTLedgerSelectionBias() {
     }
 }
 
+// MARK: - 4.1-E：D 项秒基危害测试（预注册裁决 EVOLUTION R17/R19；开关默认 false = 生产零变化）
+
+/// 引擎调度骨架下的闭环危害对比（负载 schedule 两律完全一致，VirtualMachine 确定性）
+private func runSecondsBaseHarm(secondsBase: Bool) -> (maxO: Double, changes: Int, reversals: Int, rms: Double, beats: Int) {
+    var vm = VirtualMachine()
+    var ai = AIController()
+    ai.tuning.targetTemp = 76
+    ai.tuning.dSecondsBase = secondsBase
+    var ctrl = FanCurveController()
+    var dt: Double = 3
+    var prevApplied = 0.0
+    var prevDeltaSign = 0
+    var maxO = 0.0, sumSq = 0.0
+    var changes = 0, reversals = 0, beats = 0
+    for i in 0..<3000 {
+        // 与 A3 复现测试同源：45W 基础 + 15W 正弦 + 8W 阶跃 + 守卫 episode（1s 快拍窗）
+        let episode = (i % 500) < 50
+        let power = 45 + 15 * sin(Double(i) / 100.0) + ((i / 200) % 2 == 0 ? 8 : 0) + (episode ? 20 : 0)
+        let beatDt: Double = episode ? 1 : dt
+        if let o = ai.step(temp: vm.temp, learned: nil, powerWatts: power, dt: beatDt) {
+            let applied = ctrl.slew(target: o, force: false, hysteresis: 4)
+            let d = applied - prevApplied
+            if abs(d) >= 3 { changes += 1 }
+            let sign = d > 0.01 ? 1 : (d < -0.01 ? -1 : 0)
+            if sign != 0, prevDeltaSign != 0, sign != prevDeltaSign { reversals += 1 }
+            if sign != 0 { prevDeltaSign = sign }
+            prevApplied = applied
+            vm.step(power: power, percent: applied, dt: beatDt)
+            maxO = max(maxO, vm.temp - 76)
+            sumSq += vm.temp * vm.temp
+            beats += 1
+        } else {
+            vm.step(power: power, percent: 0, dt: beatDt)
+        }
+        dt = simulatedNextInterval(prevRaw: vm.temp, raw: vm.temp)
+    }
+    return (maxO, changes, reversals, (sumSq / Double(max(beats, 1))).squareRoot(), beats)
+}
+
+func testDTSecondsBaseHarm() {
+    group("D 项秒基危害测试(4.1-E)")
+    // 预注册（EVOLUTION R19，先于运行定稿）：
+    //   ① 等价性门槛（R17 规则原文）：纯 3s 拍下现行律与秒基律输出逐拍严格相等——
+    //      秒基只允许改变快拍/长拍的 dt 剖面，不允许改标称行为。
+    //   ② 危害阈值（触发"改秒基"的充分条件，任一）：现行律相对秒基——
+    //      过冲 +1.5° 以上 / 调速次数 +20% 以上 / 方向翻转 +50% 以上。
+    //      三条都不满足 = 无实质危害 → 议题关闭（账本攒满后仅形式确认占比门槛）。
+    //      反向（秒基更差）同样保持现行律——不为精致而改控制律。
+    // ① 纯 3s 拍严格等价
+    do {
+        var vmA = VirtualMachine(), vmB = VirtualMachine()
+        var aiA = AIController(), aiB = AIController()
+        aiA.tuning.targetTemp = 76; aiB.tuning.targetTemp = 76
+        aiB.tuning.dSecondsBase = true
+        var ctrlA = FanCurveController(), ctrlB = FanCurveController()
+        var diverged = -1
+        for i in 0..<300 {
+            let power = 45 + 15 * sin(Double(i) / 100.0) + ((i / 200) % 2 == 0 ? 8 : 0)
+            let oA = aiA.step(temp: vmA.temp, learned: nil, powerWatts: power, dt: 3)
+            let oB = aiB.step(temp: vmB.temp, learned: nil, powerWatts: power, dt: 3)
+            let aA = oA.map { ctrlA.slew(target: $0, force: false, hysteresis: 4) } ?? 0
+            let aB = oB.map { ctrlB.slew(target: $0, force: false, hysteresis: 4) } ?? 0
+            if diverged < 0, abs(aA - aB) > 1e-9 { diverged = i }
+            vmA.step(power: power, percent: aA, dt: 3)
+            vmB.step(power: power, percent: aB, dt: 3)
+        }
+        expect(diverged < 0, "纯 3s 拍两律逐拍严格等价（首分岐拍=\(diverged)）")
+    }
+    // ② 混合 dt（自适应调度 + 守卫 1s 窗）闭环危害对比
+    do {
+        let cur = runSecondsBaseHarm(secondsBase: false)
+        let sec = runSecondsBaseHarm(secondsBase: true)
+        expect(cur.beats == sec.beats, "两律经历同拍数（\(cur.beats) vs \(sec.beats)）")
+        print(String(format: "  [E 对比] 现行: 过冲 +%.1f° 调速 %d 翻转 %d RMS %.2f | 秒基: 过冲 +%.1f° 调速 %d 翻转 %d RMS %.2f",
+                     cur.maxO, cur.changes, cur.reversals, cur.rms,
+                     sec.maxO, sec.changes, sec.reversals, sec.rms))
+        // 预注册危害阈值（任一越界 = 触发改秒基）
+        expect(cur.maxO <= sec.maxO + 1.5,
+               "过冲无实质危害：现行 \(String(format: "%.2f", cur.maxO)) ≤ 秒基 \(String(format: "%.2f", sec.maxO)) + 1.5")
+        expect(Double(cur.changes) <= Double(sec.changes) * 1.2,
+               "调速次数无实质危害：现行 \(cur.changes) ≤ 秒基 \(sec.changes) × 1.2")
+        expect(Double(cur.reversals) <= Double(sec.reversals) * 1.5 + 2,
+               "方向翻转无实质危害：现行 \(cur.reversals) ≤ 秒基 \(sec.reversals) × 1.5 + 2")
+    }
+}
+
 func testHardwareProfile() {
     group("v3.8 硬件画像")
 

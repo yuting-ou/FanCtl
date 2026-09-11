@@ -75,6 +75,13 @@ public struct AITuning: Equatable {
     // v3.6.2（F4）：拍数→秒基——1s 快拍下 5 拍只有 5s，冷却窗缩水 3 倍；
     // 秒基在自适应间隔下语义恒定，dt=3 时与旧行为严格等价。
     public var anchorHoldSeconds: Double = 15
+    // 4.1-E 危害测试专用开关（预注册裁决 EVOLUTION R17/R19）：D 项 dt 语义变体。
+    //   false（默认，生产行为）：dDelta = kD·clampedSlope/dtNom = 3kD·slopeRate ——
+    //     每拍推力与 dt 无关，但每秒推力 ∝ 1/dt（1s 快拍是 3s 拍的 3 倍，R4 跳过项 1）。
+    //   true（秒基变体）：dDelta = kD·clampedSlope —— 每拍推力 ∝ dt，每秒推力恒定；
+    //     dt=3 时与现行律严格等价（dtNom=1），仅改变快拍/长拍的 dt 剖面。
+    //   裁决流程：VM 危害测试对比两律 → 触发才翻转默认（届时 +HIL+族扫描全验证）。
+    public var dSecondsBase: Bool = false
     // 双通路功耗前馈：信号（真实负载 30W 突增）与噪声（PSTR/PDTR ±2W）幅度差 15 倍，
     // 单一 EMA 必然顾此失彼——EMA(α=0.4) 单拍只捕获 40% 增量，30W 突增被压到 12W。
     // 分两路并行处理：
@@ -323,7 +330,11 @@ public struct AIController {
         // 导致 output 在温度已降到 84°C 时仍维持 100%。跳过同向 P 项后，降温段 output
         // 随 D 项快速下降，温度回到目标附近时 output 不再卡在高位。
         let pDelta = tuning.kP * clampedError * dtNom
-        let dDelta = tuning.kD * clampedSlope * (1.0 / dtNom)
+        // 4.1-E 危害测试开关（默认 false = 生产行为不变）：现行律每拍推力 dt 无关
+        // （每秒 ∝ 1/dt），秒基变体每拍 ∝ dt（每秒恒定）；dt=3 时两者严格等价
+        let dDelta = tuning.dSecondsBase
+            ? tuning.kD * clampedSlope
+            : tuning.kD * clampedSlope * (1.0 / dtNom)
         var delta = dDelta
         let pApplied: Double
         if (output < 100 || pDelta <= 0) && (output > 0 || pDelta >= 0) {
