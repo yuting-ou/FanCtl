@@ -69,7 +69,7 @@ struct FanCtlApp: App {
             if CommandLine.arguments.contains("boost") { model.boostEndDate = now.addingTimeInterval(900) }
             // 排版实测用：--snapshot dead <mode> 预览 daemon 挂态（双标签同现最坏情况）
             if CommandLine.arguments.contains("dead") { model.daemonAlive = false }
-            if lastArg == "hotspots" || lastArg == "today" || lastArg == "custom" {
+            if lastArg == "hotspots" || lastArg == "today" || lastArg == "custom" || lastArg == "label" {
                 renderStandaloneViews(lastArg)
                 exit(0)
             }
@@ -116,6 +116,15 @@ struct FanCtlApp: App {
                                                         live: model.daemonAlive,
                                                         onChange: { _ in }),
                                      to: "/tmp/fanctl-snapshot-custom.png")
+                case "label":
+                    // 4.1.1：菜单栏标签像素验证（常温/高温警示两态并排）
+                    model.cpuTemp = 62; model.gpuTemp = 45
+                    let normal = MenuBarLabel(model: model)
+                    model.cpuTemp = 82
+                    let warm = MenuBarLabel(model: model)
+                    renderStandalone(VStack(spacing: 10) { normal; warm }
+                                        .background(.white),
+                                     to: "/tmp/fanctl-snapshot-label.png")
                 default:
                     break
                 }
@@ -174,26 +183,12 @@ struct MenuBarLabel: View {
         // 图标随状态变：冲刺→闪电、静音→月亮、常态→扇叶（一眼知道当前模式）
         let glyph = model.boostEndDate != nil ? "bolt.fill"
                   : (model.quietEndDate != nil ? "moon.fill" : "fanblades.fill")
-        Image(nsImage: Self.cachedRender(temp: temp, style: style, glyph: glyph))
-    }
-
-    // 图标只依赖整数温度、样式、状态符号：同帧直接复用，避免每 2 秒离屏重渲染
-    private static var cache: (key: String, image: NSImage)?
-
-    @MainActor
-    static func cachedRender(temp: Double, style: String, glyph: String) -> NSImage {
-        let key = "\(temp > 1 ? Int(temp) : -1)-\(style)-\(glyph)"
-        if let c = cache, c.key == key { return c.image }
-        let image = render(temp: temp, style: style, glyph: glyph)
-        cache = (key, image)
-        return image
-    }
-
-    // 低温用模板图（自动适配浅/深菜单栏）；高温渲染彩色非模板图警示
-    @MainActor
-    static func render(temp: Double, style: String = "both", glyph: String = "fanblades.fill") -> NSImage {
         let warnColor: Color? = temp >= 88 ? .red : (temp >= 78 ? .orange : nil)
-        let label = HStack(spacing: 2.5) {
+        // 4.1.1（R20）：原生视图直出，禁用 ImageRenderer——旧实现每帧离屏渲染 NSImage
+        // （缓存键 Int 温度被控制期噪声频繁翻转 → ~0.3s 主线程渲染 + 菜单栏图层 CA
+        // 交换，实测均值 ~3.5% CPU / 17h 烧 36 CPU 分钟）。原生文本/符号由系统状态栏
+        // 高效增量更新；.primary 自动适配菜单栏明暗（等效旧 isTemplate）。
+        HStack(spacing: 2.5) {
             if style != "temp" {
                 Image(systemName: glyph)
                     .font(.system(size: 11.5, weight: .medium))
@@ -204,14 +199,7 @@ struct MenuBarLabel: View {
                     .monospacedDigit()
             }
         }
-        .foregroundStyle(warnColor ?? .black)
-        .frame(height: 16)
-
-        let renderer = ImageRenderer(content: label)
-        renderer.scale = 2
-        let image = renderer.nsImage ?? NSImage()
-        image.isTemplate = (warnColor == nil)
-        return image
+        .foregroundStyle(warnColor ?? .primary)
     }
 }
 

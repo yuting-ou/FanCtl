@@ -87,7 +87,9 @@ struct ContentView: View {
     // 优先级：写入失败（设置不生效，用户可行动）> 调速闭环故障 > 配置对账
     private var activeWarning: (text: String, icon: String, color: Color)? {
         if model.configWriteFailed {
-            return ("配置写入失败，调速设置不会生效。请以管理员账户运行，或重跑 sudo ./scripts/install.sh",
+            // 文案不引导仓库路径（sudo ./scripts/install.sh 只对有源码的人有意义，
+            // 对 Release 用户是死路）；"重新安装"对两类受众都成立且两行高度内放得下
+            return ("配置写入失败，调速设置不会生效。请以管理员身份重新安装清风",
                     "exclamationmark.triangle.fill", .orange)
         }
         if model.controlFault {
@@ -615,6 +617,9 @@ struct ContentView: View {
             // 地图展开时再长高 ~110pt（图表+冻结按钮），动画平滑
             .frame(height: learnMapExpanded ? 326 : 216, alignment: .top)
             .animation(.smooth(duration: 0.3), value: learnMapExpanded)
+            // dead 态统一降饱和：各模式内容（意图胶囊/曲线读数/滑块值）都是停更的
+            // 最后状态，半透明诚实表达"数据停更"（快照审查 R20；opacity 不改高度）
+            .opacity(model.daemonAlive ? 1 : 0.55)
         }
         .cardStyle()
     }
@@ -856,7 +861,9 @@ struct ContentView: View {
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: "sparkles").font(.callout).foregroundStyle(.purple.gradient)
-                Text("AI 自动接管").font(.callout.weight(.semibold))
+                // dead 态语义诚实：守护进程停更时不再断言"自动接管"（快照审查 R20）
+                Text(model.daemonAlive ? "AI 自动接管" : "AI 控制 · 数据停更")
+                    .font(.callout.weight(.semibold))
                 Spacer()
                 Text(cur > 1 ? "\(Int(cur))°" : "--")
                     .font(.system(size: 24, weight: .semibold, design: .rounded)).monospacedDigit()
@@ -1312,6 +1319,9 @@ struct LearnMapView: View {
             }
         }
         .chartYScale(domain: 0...100)
+        // 顶刻度"100"标签中心在绘图区顶边上，字身一半悬出 frame 被裁（快照审查 R20）
+        // ——留 4pt 顶白容纳标签
+        .padding(.top, 4)
         .help("每个点是 AI 采信的一个温度档：位置=该温度下的稳态风量，点越大=样本越多越可信。虚线期的非单调包络修正已计入。")
     }
 }
