@@ -117,14 +117,25 @@ struct FanCtlApp: App {
                                                         onChange: { _ in }),
                                      to: "/tmp/fanctl-snapshot-custom.png")
                 case "label":
-                    // 4.1.1：菜单栏标签像素验证（常温/高温警示两态并排）
-                    model.cpuTemp = 62; model.gpuTemp = 45
-                    let normal = MenuBarLabel(model: model)
-                    model.cpuTemp = 82
-                    let warm = MenuBarLabel(model: model)
-                    renderStandalone(VStack(spacing: 10) { normal; warm }
+                    // 4.1.1：菜单栏标签像素验证（常温/高温警示两态并排）。
+                    // 4.1.2（R21）：标签改为订阅 MenuBarState。渲染内容跟随 @AppStorage
+                    // menuBarStyle（用户可能设了 icon 只剩图标），快照通道临时覆写为
+                    // both 并在渲染后恢复——同域 defaults，不恢复会改掉用户真实设置。
+                    let savedStyle = UserDefaults.standard.string(forKey: "menuBarStyle")
+                    UserDefaults.standard.set("both", forKey: "menuBarStyle")
+                    let normalState = MenuBarState()
+                    normalState.update(temp: 62, boost: false, quiet: false, style: "both")
+                    let warmState = MenuBarState()
+                    warmState.update(temp: 82, boost: false, quiet: false, style: "both")
+                    renderStandalone(VStack(spacing: 10) { MenuBarLabel(state: normalState)
+                                                         MenuBarLabel(state: warmState) }
                                         .background(.white),
                                      to: "/tmp/fanctl-snapshot-label.png")
+                    if let s = savedStyle {
+                        UserDefaults.standard.set(s, forKey: "menuBarStyle")
+                    } else {
+                        UserDefaults.standard.removeObject(forKey: "menuBarStyle")
+                    }
                 default:
                     break
                 }
@@ -166,7 +177,7 @@ struct FanCtlApp: App {
         MenuBarExtra {
             ContentView(model: model)
         } label: {
-            MenuBarLabel(model: model)
+            MenuBarLabel(state: model.menuBar)
         }
         .menuBarExtraStyle(.window)
     }
@@ -175,26 +186,28 @@ struct FanCtlApp: App {
 // MARK: - 菜单栏标签（实时温度 + 按温度变色）
 
 struct MenuBarLabel: View {
-    @ObservedObject var model: FanModel
+    // 4.1.2（R21）：只订阅量化后的显示状态，不再观察整 FanModel——status 控制态
+    // 每 ~2s 一拍全对象 objectWillChange，观察整模型 = 每拍重算标签并连累
+    // MenuBarExtra 宿主布局/光栅（sample 实锤：MenuBarExtraLayout.sizeThatFits 高频）。
+    // 整数温度桶/字形/警示色档不变 → 不发布 → 标签零开销。
+    @ObservedObject var state: MenuBarState
     @AppStorage("menuBarStyle") private var style = "both"  // both | icon | temp
 
     var body: some View {
-        let temp = max(model.cpuTemp, model.gpuTemp)
+        let d = state.display
         // 图标随状态变：冲刺→闪电、静音→月亮、常态→扇叶（一眼知道当前模式）
-        let glyph = model.boostEndDate != nil ? "bolt.fill"
-                  : (model.quietEndDate != nil ? "moon.fill" : "fanblades.fill")
-        let warnColor: Color? = temp >= 88 ? .red : (temp >= 78 ? .orange : nil)
-        // 4.1.1（R20）：原生视图直出，禁用 ImageRenderer——旧实现每帧离屏渲染 NSImage
-        // （缓存键 Int 温度被控制期噪声频繁翻转 → ~0.3s 主线程渲染 + 菜单栏图层 CA
-        // 交换，实测均值 ~3.5% CPU / 17h 烧 36 CPU 分钟）。原生文本/符号由系统状态栏
-        // 高效增量更新；.primary 自动适配菜单栏明暗（等效旧 isTemplate）。
+        let glyph = d.boostActive ? "bolt.fill"
+                  : (d.quietActive ? "moon.fill" : "fanblades.fill")
+        let warnColor: Color? = d.warnLevel >= 2 ? .red : (d.warnLevel == 1 ? .orange : nil)
+        // 4.1.1（R20）：原生视图直出，禁用 ImageRenderer（旧实现每次缓存键翻转
+        // ~0.3s 主线程离屏渲染 + 菜单栏图层 CA 交换）。.primary 自动适配菜单栏明暗。
         HStack(spacing: 2.5) {
             if style != "temp" {
                 Image(systemName: glyph)
                     .font(.system(size: 11.5, weight: .medium))
             }
             if style != "icon" {
-                Text(temp > 1 ? "\(Int(temp))°" : "--")
+                Text(d.tempBucket >= 0 ? "\(d.tempBucket)°" : "--")
                     .font(.system(size: 12.5, weight: .semibold, design: .rounded))
                     .monospacedDigit()
             }

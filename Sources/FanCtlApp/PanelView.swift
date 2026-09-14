@@ -14,17 +14,35 @@ struct ContentView: View {
     // v3.4.1：model.monitorTab 由 FanModel 持有（DoD-5a：ps 采样仅在"占用"tab 采样）
 
     var body: some View {
-        // 快照模式：无玻璃（ImageRenderer 离屏无法合成 Liquid Glass），实心卡直出。
-        // 运行时：GlassEffectContainer 把各卡的独立玻璃融合成连续液态玻璃面
-        // （用户定调的原生观感）。⚠️ z 序教训：glassEffect 只能作为内容链上的
-        // 修饰符（玻璃在内容后），放进 .background{Color.clear.glassEffect()} 会被
-        // 容器合成到内容之上盖住全部内容（9f0ffee 修过一次）。
-        if snapshotPlainCards {
-            panelContent
-        } else {
-            GlassEffectContainer(spacing: 8) {
-                panelContent
+        // 4.1.2（R21）关闭态门禁：MenuBarExtra(.window) 关着时并不销毁视图树，status
+        // 控制态每拍（~2s）objectWillChange → 整树 body 重评（玻璃融合 vImage 卷积 +
+        // Charts 布局，sample 实锤的 CPU 风暴主体）——关着时没有任何观看者。关闭态
+        // 只留同尺寸占位（340×908，窗口 idealSize 不变；固定高度防"跳"的口径同下），
+        // 窗口出现 → onAppear 置 panelVisible → 真实树才建立。
+        Group {
+            if model.panelVisible || snapshotPlainCards {
+                // 快照模式：无玻璃（ImageRenderer 离屏无法合成 Liquid Glass），实心卡直出。
+                // 运行时：GlassEffectContainer 把各卡的独立玻璃融合成连续液态玻璃面
+                // （用户定调的原生观感）。⚠️ z 序教训：glassEffect 只能作为内容链上的
+                // 修饰符（玻璃在内容后），放进 .background{Color.clear.glassEffect()} 会被
+                // 容器合成到内容之上盖住全部内容（9f0ffee 修过一次）。
+                if snapshotPlainCards {
+                    panelContent
+                } else {
+                    GlassEffectContainer(spacing: 8) {
+                        panelContent
+                    }
+                }
+            } else {
+                Color.clear.frame(width: 340, height: 908)
             }
+        }
+        // 开关把手挂在外层容器：分支切换（占位↔真实树）不影响开关连线
+        .onAppear {
+            model.panelVisible = true
+        }
+        .onDisappear {
+            model.panelVisible = false
         }
     }
 
@@ -74,12 +92,8 @@ struct ContentView: View {
         .animation(.smooth(duration: 0.3), value: model.controlFault)
         // 无入场动画：blur/scale 逐帧离屏渲染在深层级面板上是打开卡顿的根源，
         // 即时出现更跟手（用户已确认宁可不要入场动画）
-        .onAppear {
-            model.panelVisible = true
-        }
-        .onDisappear {
-            model.panelVisible = false
-        }
+        // 4.1.2（R21）：onAppear/onDisappear 移至 body 外层容器——关闭态分支换成
+        // 占位视图后，旧连线随 panelContent 消失会永远丢失"重新打开"事件。
     }
 
     // 面板警示条按优先级只显示最高一条：面板固定高度 908 仅容一条两行警示（906pt），

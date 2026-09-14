@@ -25,6 +25,7 @@ extension FanModel {
         mode = .manual
         manualPercent = 100
         saveConfig()
+        syncMenuBarState()   // 字形：扇叶→闪电（4.1.2 R21）
     }
 
     func endBoost(restore: Bool) {
@@ -50,6 +51,7 @@ extension FanModel {
         boostEndDate = nil
         UserDefaults.standard.removeObject(forKey: Self.boostEndKey)
         UserDefaults.standard.removeObject(forKey: Self.boostPrevKey)
+        syncMenuBarState()   // 字形恢复（4.1.2 R21）
     }
 
     // MARK: - 静音承诺
@@ -61,6 +63,7 @@ extension FanModel {
         UserDefaults.standard.set(end, forKey: Self.quietEndKey)
         quietEndDate = end
         saveConfig()
+        syncMenuBarState()   // 字形：扇叶→月亮（4.1.2 R21）
     }
 
     func endQuiet() {
@@ -68,5 +71,6 @@ extension FanModel {
         quietEndDate = nil
         UserDefaults.standard.removeObject(forKey: Self.quietEndKey)
         saveConfig()
+        syncMenuBarState()   // 字形恢复（4.1.2 R21）
     }
 }

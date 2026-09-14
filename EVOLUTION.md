@@ -116,6 +116,32 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
 
 
 #
+### R21（4.1.2(64)）：R20 修复复验失败 → 根因修正——风暴主体是"关着的面板整树每拍重评"
+- **复验推翻 R20 验收**：4.1.1(63) 进程（跑 2d6h）实测均值 **3.9%**（129 CPU 分/3291 分），
+  瞬时突发 50%。"0.23%"验收拍在 daemon 空闲期（20s 拍、温度稳），从未在 AI 控制态
+  （~2s 拍）下测量——"根除"结论下早了。
+- **根因修正（sample 8s 堆栈实锤）**：ImageRenderer 只是放大器之一；主体是 MenuBarExtra
+  的 label 与关着的面板共享整个 FanModel——status 每拍落盘 → refreshFromStatus 无条件
+  赋值近 30 个 @Published → objectWillChange 全对象失效 → ① label 每拍重算（本机
+  menuBarStyle=icon，温度数字根本不在场，纯浪费）；② MenuBarExtra(.window) 关闭不销毁
+  视图树，整面板 body 每拍重评（Liquid Glass vImage 卷积 + Charts 布局；CGDrawingLayer
+  光栅 539/6745 样本，主线程 ~50%）。
+- **修复（仅 FanCtlApp）**：① MenuBarState 量化小状态对象——label 单独订阅，按
+  menuBarStyle 可见部分去重（icon 态只有字形/警示色变化才发布），display 恒真值、
+  发布与否另判；② ContentView 关闭态门禁——!panelVisible 时渲染 340×908 占位
+  （窗口 idealSize 不变），onAppear/onDisappear 上移到外层容器（旧连线挂 panelContent，
+  分支切换会丢"重新打开"事件）；与 R3 落盘门同源哲学。
+- **验收（这次在风暴触发态下测）**：4×yes 负载 + 温度 65-74° 波动 90s，标签步进正常
+  （AX name 实测 70°→74°→67°），App CPU 0.27s/90s = **0.3%**；8s sample
+  CGDrawingLayer/sizeThatFits 风暴签名**归零**（此前 539/361）。4496 断言绿。
+- **无头盲区记录**：本机当前无显示会话（list_displays 空），面板打开交互无法截屏/AX 验证
+  ——对照实验证明 4.1.1 在无头下同样开不出窗口，故 NO WINDOW 不是门禁回归；门禁的
+  onAppear 机制与生产已验证的连线位置等价，但**需用户下次手动开面板确认一次**（空白=回归，回滚）。
+- **元经验**：① 验收窗必须覆盖病灶触发态——"2 分钟采样突发消失"（空闲期）≠"根除"；
+  ② 换渲染实现前先数"谁在观察同一个 publisher"——全对象 objectWillChange 的成本在
+  观察者的树上，不在渲染方法里；③ 快照通道临时覆写用户 defaults 必须用后恢复
+  （menuBarStyle 同域污染）。
+
 ### R20（4.1.1 全方位打磨轮）：菜单栏 CPU 根除 + 快照矩阵三修
 - **菜单栏 CPU 根除（R19 记账的 4.2 首项提前兑现）**：MenuBarLabel 原生视图直出替代
   ImageRenderer 离屏渲染——旧缓存键 Int(温度) 被控制期噪声频繁翻转，每次翻转 ~0.3s

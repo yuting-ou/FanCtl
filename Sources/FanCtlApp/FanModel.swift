@@ -108,6 +108,10 @@ final class FanModel: ObservableObject {
     @Published var hardwareProfile: HardwareProfile? = nil  // 4.0 B1：冷却能力分级展示（fanCount=0 → passive 提示）
     @Published var calibrating = false        // 4.0 B2：AI 校准观察期（status 下发，AI 卡提示行）
 
+    // 4.1.2（R21）：菜单栏标签单独订阅的量化状态（MenuBarState.swift）——本对象每次
+    // status 拍都全对象 objectWillChange，标签若继续观察整模型就仍每拍重渲。
+    let menuBar = MenuBarState()
+
     @Published var panelVisible = false {
         didSet {
             if panelVisible && !oldValue {
@@ -781,6 +785,9 @@ final class FanModel: ObservableObject {
         // 发烧元凶检测
         notifications.checkOverheat(hottest)
 
+        // 4.1.2（R21）：菜单栏标签量化状态——温度/字形/警示色真的变了才发布
+        syncMenuBarState()
+
         // 面板可见时同步额外数据
         if panelVisible {
             syncPanelDataFromSensors(sensors)
@@ -802,6 +809,14 @@ final class FanModel: ObservableObject {
                 refreshThermalHealth(preloadedDays: days)
             }
         }
+    }
+
+    /// 菜单栏标签同步：按 menuBarStyle 的可见部分去重，真变了才发布（MenuBarState）。
+    /// 调用点 = refreshFromStatus 尾 + 冲刺/静音状态机（FanControlActions）。
+    func syncMenuBarState() {
+        menuBar.update(temp: max(cpuTemp, gpuTemp),
+                       boost: boostEndDate != nil, quiet: quietEndDate != nil,
+                       style: UserDefaults.standard.string(forKey: "menuBarStyle") ?? "both")
     }
 
     // status.json 数值防御：非有限/越界值不进入 UI（daemon 侧有防御，App 侧此前为零）
