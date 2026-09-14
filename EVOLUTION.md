@@ -116,6 +116,31 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
 
 
 #
+### R22（工具链轮，版本不变）：macOS 27 适配——SDK 钉住范围从"全局 26.5"收窄到"仅 App 目标"，其余目标跑真实 27 SDK
+- **卡点本质（本轮查清，推翻"SDK 正常/异常"的笼统认知）**：27.0 SDK 的 SwiftUICore 把
+  @State 从 property wrapper 改成了外部宏（26.5 里是 `@frozen @propertyWrapper struct
+  State`；27 里是 `#externalMacro(module:"SwiftUIMacros")`），而 CLT 6.4 只随包
+  Observation/Swift/Testing 三个宏插件、缺 SwiftUIMacros（全盘 mdfind+find 无
+  dylib；softwareupdate 无新包；swift.org 无 6.4 macOS 工具链；本机无 Xcode）——
+  09-11 的全局钉 26.5 workaround 绕的就是这个打包缺陷，App 是唯一受害者。
+- **波及面实测**：只有 FanCtlApp 的 6 个文件 import SwiftUI。SMCCore/fanctld/fanprobe/
+  fanctltests 与宏无关：27 SDK 下编译干净、**4496 断言全绿**（此前被全局钉住，从未验证过）。
+- **改造（scripts/build.sh）**：全局 export SDKROOT → 探测式分目标钉住：① @State 小样例
+  编默认 SDK，过 → 不钉（CLT 修复或装 Xcode 后**自动回默认**，workaround 免手删）；
+  ② 不过 → 旧代 SDK 从新到旧找第一个可编的（当前 26.5），仅 App 目标钉它，且走独立
+  scratch-path（.build-app-sdk）避免与默认构建互相失效缓存；③ daemon/fanprobe/测试
+  恒用默认系统 SDK。CI（macos-26 runner 完整 Xcode）探测必过，行为不变。全链路 EXIT=0，
+  dist 4.1.2(64) 产物完整、codesign ok。
+- **运行时侧印证**：本机 09-10 起跑 macOS 27.0 (26A428)，daemon 硬件档案已记
+  osVersion 27.0，SMC 温度/双风扇/powermetrics 通道正常（status/stats 连续落盘）——
+  适配无需任何运行时改动（min deploy 26.0 天然兼容 27）。
+- **踩坑记录**：新构建系统（.build/out/SwiftBuild 路线）链接产物的 LC_BUILD_VERSION sdk
+  字段打的是平台最低值（26.0）**而非所用 SDK**——拿它验证"是否真在 27 SDK 构建"会误判；
+  对照实验（plain swiftc 双 SDK 编译打戳 27.0/26.5）确立正确验证法：查前端命令行的
+  `-target-sdk-version`。
+- **元经验**：workaround 的钉住范围应收窄到"受影响的最小目标集"——全局 env 钉 SDK 宽了
+  一个量级，把真实 27 SDK 的编译期契约漂移全挡在盲区里。
+
 ### R21（4.1.2(64)）：R20 修复复验失败 → 根因修正——风暴主体是"关着的面板整树每拍重评"
 - **复验推翻 R20 验收**：4.1.1(63) 进程（跑 2d6h）实测均值 **3.9%**（129 CPU 分/3291 分），
   瞬时突发 50%。"0.23%"验收拍在 daemon 空闲期（20s 拍、温度稳），从未在 AI 控制态

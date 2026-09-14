@@ -4,3 +4,4 @@ dist/
 .qoder/
 *.log
 .zcode/
+.build-app-sdk/
