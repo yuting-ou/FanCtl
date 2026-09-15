@@ -190,8 +190,9 @@ func testOffsetsAndReadings() {
         expect(fh.faulted, "risingGrace=false 下目标上升也计数(探测真实故障)")
     }
 
-    // v8: 故障锁存——交还（无命令）不单拍解除，需连续 recoverThreshold 拍匹配
-    // （否则 restoreAutoAll 清空证据后立即夺回，形成"交还→夺回"振荡）
+    // R23（物理故障振荡修复）：交还（无命令）不再计恢复进度——坏风扇不能靠空拍自解
+    // faulted（那会绕开 30s 试探节流形成 ~8 拍"交还→夺回"振荡）。恢复只能靠"高目标命令
+    // 且真实跟随"（试探协议路径：probe 写命令→风扇跟随→连续 recoverThreshold 拍→解除）。
     do {
         var fh = FanFeedbackHealth()
         let st = FanState(id: 0, actualRPM: 1000, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
@@ -199,13 +200,18 @@ func testOffsetsAndReadings() {
         fh.record(states: [st], commandedRPM: cmd)   // 启动宽限热身拍（只记录不计数）
         for _ in 0..<FanFeedbackHealth.faultThreshold { fh.record(states: [st], commandedRPM: cmd) }
         expect(fh.faulted, "前置：已故障")
-        // 交还：无命令 → 恢复进度 1 拍，仍保持 faulted
-        fh.record(states: [st], commandedRPM: [:])
-        expect(fh.faulted, "交还 1 拍不解除（防夺回振荡）")
-        fh.record(states: [st], commandedRPM: [:])
-        expect(fh.faulted, "交还 2 拍仍不解除")
-        fh.record(states: [st], commandedRPM: [:])
-        expect(!fh.faulted, "交还 3 拍后解除（daemon 据此恢复正常接管）")
+        for i in 0..<10 {
+            fh.record(states: [st], commandedRPM: [:])
+            expect(fh.faulted, "交还空拍 \(i + 1) 仍锁存（无命令≠恢复证据，堵死 8 拍振荡）")
+        }
+        // 试探跟随恢复路径：连续 recoverThreshold 拍高目标命令且真实跟上才解除
+        let ok = FanState(id: 0, actualRPM: 3900, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        fh.record(states: [ok], commandedRPM: cmd, risingGrace: false)
+        expect(fh.faulted, "恢复第 1 拍仍锁存")
+        fh.record(states: [ok], commandedRPM: cmd, risingGrace: false)
+        expect(fh.faulted, "恢复第 2 拍仍锁存")
+        fh.record(states: [ok], commandedRPM: cmd, risingGrace: false)
+        expect(!fh.faulted && fh.consecutiveFailures == 0, "连续 3 拍真实跟随后解除（试探恢复）")
     }
 
     // controlFault 字段往返 + 旧 status 兼容

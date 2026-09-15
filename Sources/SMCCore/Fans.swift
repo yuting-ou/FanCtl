@@ -261,6 +261,7 @@ public struct FanFeedbackHealth: Equatable {
             return
         }
         var mismatch = false
+        var matched = false   // 本拍有"高目标命令且确实在跟随"的风扇 = 真实健康证据
         for st in states {
             guard let target = commandedRPM[st.id] else { continue }
             guard target > st.minRPM + 150 else { continue }
@@ -270,13 +271,12 @@ public struct FanFeedbackHealth: Equatable {
                 continue
             }
             let lagging = abs(st.actualRPM - target) > max(300, target * 0.35)
-            if lagging {
-                // 升速宽限：本拍目标高于上拍 → 风扇在物理追赶中，滞后不判故障。
-                // daemon 的故障试探验证期传 risingGrace: false——probe 目标通常高于
-                // 旧值，若仍宽限则验证永远"通过"，探测不到真实故障
-                let rising = risingGrace && (lastCommanded[st.id].map { target > $0 + 50 } ?? false)
-                if !rising { mismatch = true }
-            }
+            // 升速宽限：本拍目标高于上拍 → 风扇在物理追赶中，滞后不判故障。
+            // daemon 的故障试探验证期传 risingGrace: false——probe 目标通常高于
+            // 旧值，若仍宽限则验证永远"通过"，探测不到真实故障
+            let rising = risingGrace && (lastCommanded[st.id].map { target > $0 + 50 } ?? false)
+            if lagging && !rising { mismatch = true }
+            else { matched = true }   // 未 stalled 且（跟上 或 升速追赶中）= 风扇在响应命令
         }
         // 记录本拍命令（无命令的交还期保留旧值，重新接管时首拍目标高于旧值会走宽限）
         for st in states {
@@ -287,14 +287,21 @@ public struct FanFeedbackHealth: Equatable {
             recoverCount = 0
             if consecutiveFailures >= Self.faultThreshold { faulted = true }
         } else if faulted {
-            // 锁存：交还（无命令）或匹配都算恢复进度，连续达标才解除，
-            // 避免"交还→单拍即恢复→立即夺回"的振荡
-            recoverCount += 1
-            if recoverCount >= Self.recoverThreshold {
-                faulted = false
-                consecutiveFailures = 0
-                recoverCount = 0
+            // R23（物理故障振荡修复）：只有"高目标命令且真实跟随"才算恢复证据。
+            // 交还期无命令的空拍不再白白累积 recoverCount——否则坏风扇 faulted 会在
+            // recoverThreshold 个空拍后自解、走正常分支立即重申，绕开 30s 试探节流形成
+            // ~8 拍"交还→夺回"振荡（Md 反复翻转=最高磨损事件）。恢复改由试探协议作唯一
+            // 入口：probe 写命令→风扇跟随→matched 累计→解除；坏风扇则 matched 永不达标、
+            // faulted 锁存，配合 ControlEngine 侧的指数退避把重试降到封顶间隔。
+            if matched {
+                recoverCount += 1
+                if recoverCount >= Self.recoverThreshold {
+                    faulted = false
+                    consecutiveFailures = 0
+                    recoverCount = 0
+                }
             }
+            // 无命令/低目标空拍：保持 faulted 锁存，不动 recoverCount
         } else {
             consecutiveFailures = 0
         }
