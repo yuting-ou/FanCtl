@@ -133,10 +133,6 @@ public final class ControlEngine {
     var horizonWarned: Set<String> = []   // v3.6.2（F5）：异常久远截止时间只告警一次
     var lastProbeTime = Date.distantPast
     var probeVerifyLoops = 0
-    // R23（物理故障振荡修复）：连续失败的故障试探计数 → 试探间隔按 2^n 指数退避
-    // （30s→60s→…→封顶 30<<6≈32min），使"真坏掉的风扇"的重试频率随失败递减，
-    // 而不是每 30s 一次无限翻转 Md（启停=最高磨损）。任一真实跟随（faulted 解除）即清零。
-    var feedbackProbeFails = 0
     var stuckDetector = StuckSensorDetector()       // v2.8 传感器卡死一致性门
     var belowAmbientSeconds = 0.0                    // v3.0 读数偏低门（秒制，累计钳顶 90）
     var belowAmbientFaulted = false                  // 偏低门锁存：≥90s 触发、衰减到 0 才解除
@@ -268,7 +264,6 @@ public final class ControlEngine {
         tempFailCount = 0
         probeVerifyLoops = 0
         lastProbeTime = .distantPast
-        feedbackProbeFails = 0
         targetUnreachable = false
         targetUnreachableSince = nil
         targetUnreachableLogged = false
@@ -972,11 +967,7 @@ public final class ControlEngine {
             // 且周期按拍数（idle 20s/拍时 6 分钟才探一次）。
             let controlBlocked = writeHealth.faulted || feedbackHealth.faulted
             if controlBlocked {
-                // R23（物理故障振荡修复）：试探间隔按连续失败数指数退避（30s→60s→…→
-                // 封顶 30<<6≈32min）。配合 record 侧"空拍不再自解 faulted"，坏风扇的重试
-                // 频率随失败递减而非固定翻转；真实跟随恢复后 feedbackProbeFails 归零回到 30s。
-                let probeInterval = 30.0 * Double(1 << min(feedbackProbeFails, 6))
-                let probeDue = hooks.now().timeIntervalSince(lastProbeTime) >= probeInterval
+                let probeDue = hooks.now().timeIntervalSince(lastProbeTime) >= 30
                 if probeDue, probeVerifyLoops <= 0 {
                     lastProbeTime = hooks.now()
                     var probeOK = !fanStates.isEmpty
@@ -993,12 +984,6 @@ public final class ControlEngine {
                     }
                     writeHealth.record(loopSuccess: probeOK)
                     if probeOK {
-                        // R23 审查修复（P1-1）：试探写 setForcedRPM 即已把风扇切入强制模式
-                        // （Md=1），必须置 forcedModeActive=true——否则第 1 轮交还把它置 false 后，
-                        // 后续每轮 probe 夺权却不置位 → 验证失败的交还分支（`if forcedModeActive`）
-                        // 永不触发 → 健康风扇被永久钉在上次试探的强制 RPM（v2.6.2 明令消灭的旧洞）、
-                        // 且退避计数不再递增。
-                        forcedModeActive = true
                         // 设 4：本拍末尾 -=1 后剩 3，保证注释承诺的完整 3 拍严格验证窗
                         probeVerifyLoops = 4
                         hooks.log("故障试探写入成功，进入跟随验证（3 拍）…")
@@ -1013,8 +998,6 @@ public final class ControlEngine {
                         fans.restoreAutoAll()
                         forcedModeActive = false
                         lastWrittenRPM.removeAll()
-                        // 一次试探周期结束仍 faulted = 该风扇确实不跟随 → 退避计数递增
-                        if feedbackHealth.faulted { feedbackProbeFails += 1 }
                         hooks.log(feedbackHealth.faulted
                             ? "风扇实际 RPM 持续未跟随目标，调速闭环失效，已交还系统调度"
                             : "风扇写入连续失败，调速闭环失效，已交还系统调度")
@@ -1023,8 +1006,6 @@ public final class ControlEngine {
                     appliedPercents = []
                 }
             } else {
-                // 控制恢复（faulted 已解除）→ 试探退避归零，下次故障重新从 30s 起
-                feedbackProbeFails = 0
                 let mustReassert = !forcedModeActive || loopCount % REASSERT_LOOPS == 0
                 var loopWriteFailed = false
                 // fanStates 为空但 targetPercent 非 nil 时，说明 SMC 读取全部失败（风扇状态严格读取

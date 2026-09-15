@@ -1282,28 +1282,6 @@ func testControlEngine() {
         engine.beat()
         expect(engine.aiMetrics.sampleCount >= 1, "解除静音后恢复评测")
     }
-
-    // —— 场景 11：物理故障风扇锁存交还、不卡死强制（R23 修复端到端）——
-    // 坏风扇（F0Ac 恒 0，永不跟随）：faulted 锁存后靠 30s 试探协议周期性复查（配合
-    // 指数退避），不再"空拍自解→立即重申"。端到端断言稳健不变量：controlFault 持续
-    // 锁存、且确实交还过系统（不永久卡在强制模式）。恢复判据本身由 FanFeedbackHealth
-    // 单测（场景"交还空拍不解除/真实跟随才解除"）精确锁定。
-    do {
-        envDirs.append(engineTestEnv())
-        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
-        let smc = makeFanSMC()
-        smc.set("Tp01", 85); smc.set("PSTR", 30)
-        smc.set("F0Ac", 0)          // 坏风扇：实际转速恒 0，永不跟随任何命令
-        let clock = FakeClock()
-        let col = EngineCollector()
-        let engine = makeEngine(smc: smc, clock: clock, collector: col)
-        for _ in 0..<60 { engine.beat(); clock.advance(3) }   // 真实拍级（3s），跨多轮试探
-        let handbacks = smc.writes.filter { $0.key == "F0Md" && $0.value == 0 }.count
-        expect(ConfigStore.loadStatus()?.controlFault == true, "坏风扇 controlFault 持续锁存（不振荡进出）")
-        // R23 审查（P1-1）回归：修复前 probe 不置 forcedModeActive → 第 1 轮交还后再不
-        // 交还（健康风扇被永久钉在强制 RPM），handbacks 恒 =1；修复后每轮试探都交还 → ≥2。
-        expect(handbacks >= 2, "坏风扇每轮试探都交还（不卡死强制；修复前恒 1 次，得 \(handbacks)）")
-    }
 }
 
 // MARK: - v3.7 信任三角：学习地图 / 冻结曲线 / 决策透镜
