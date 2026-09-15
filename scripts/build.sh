@@ -18,6 +18,7 @@ DIST="$ROOT/dist"
 # 找第一个可编样例的，仅 App 目标钉它（≥ 部署目标 macOS 26）。
 # ---------------------------------------------------------------------------
 _PROBE_DIR="$(mktemp -d)"
+trap 'rm -rf "$_PROBE_DIR"' EXIT   # R23：探测失败/中途退出也回收临时目录（原仅成功路径清理）
 _PROBE="$_PROBE_DIR/swiftui-state-probe.swift"
 cat > "$_PROBE" <<'SWIFT'
 import SwiftUI
@@ -64,6 +65,16 @@ cat > "$ROOT/Sources/fanctld/Version.generated.swift" <<EOF
 import Foundation
 
 let fanctldVersion = "$APP_VERSION ($BUILD_NUMBER)"
+EOF
+
+# 内嵌升级脚本正文（R23 P1 修复）：upgrade.sh base64 进 App 二进制——被授权执行的
+# 内容与二进制同源同版，root 不再读用户可写的包内副本（篡改包内脚本=静默提权通道）。
+# 提交的占位文件供裸 swift build 使用；打包构建时严格同步（与 4E 版本常量同一纪律）。
+cat > "$ROOT/Sources/FanCtlApp/UpgradeScript.generated.swift" <<EOF
+// 由 scripts/build.sh 从 scripts/upgrade.sh 重新生成（勿手改）。
+// 占位值供裸 \`swift build\` 使用；打包构建时与 upgrade.sh 严格同步（R23 P1 修复：
+// 被授权执行的脚本正文内嵌进二进制，root 不再读用户可写的包内副本）。
+let embeddedUpgradeScriptBase64 = "$(base64 -i "$ROOT/scripts/upgrade.sh" | tr -d '\n')"
 EOF
 
 echo "==> 编译 release（非 UI 目标：默认系统 SDK）..."
@@ -148,9 +159,10 @@ CFBundleDisplayName = "清风";
 CFBundleName = "清风";
 STRINGS
 
-# ad-hoc 签名（本机运行足够）
-codesign --force --sign - "$APP" 2>/dev/null || true
-codesign --force --sign - "$DIST/fanctld" 2>/dev/null || true
+# ad-hoc 签名（本机运行足够）。R23（P3）：失败必须红——此前 `|| true` 把签名失败
+# 静默吞掉，可能让未签名二进制混进 dist/ 发行资产，装机后才在 Gatekeeper/升级链炸。
+codesign --force --sign - "$APP"
+codesign --force --sign - "$DIST/fanctld"
 
 echo "==> 构建完成:"
 echo "    $DIST/fanctld"

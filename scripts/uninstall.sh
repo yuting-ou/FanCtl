@@ -20,8 +20,14 @@ sleep 1
 echo "==> 关闭菜单栏 App（先注销登录项，再停进程，避免删文件时它还在回写配置）..."
 # v3.4.5（4D）：SMAppService 登录项必须在 App 被删除前由 App 自身注销
 #（系统无 CLI 反注册接口；不注销会在系统设置→登录项留下死条目）
-/Applications/FanCtl.app/Contents/MacOS/FanCtl --unregister-login-item 2>/dev/null \
-  || /Applications/清风.app/Contents/MacOS/FanCtl --unregister-login-item 2>/dev/null || true
+# R23（P2 修复）：注销必须发生在**控制台用户**的 launchd 域——本脚本以 root 运行，
+# 直接执行注销的是 root 会话（没有登记），真用户的登录项删不掉（死条目恰是 4D
+# 要防的）。与下方 defaults 清理同法，su 到控制台用户执行。
+CU=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || echo "")
+if [[ -n "$CU" && "$CU" != "root" ]]; then
+    /usr/bin/su "$CU" -c "/Applications/清风.app/Contents/MacOS/FanCtl --unregister-login-item" 2>/dev/null \
+      || /usr/bin/su "$CU" -c "/Applications/FanCtl.app/Contents/MacOS/FanCtl --unregister-login-item" 2>/dev/null || true
+fi
 pkill -x FanCtl 2>/dev/null || true
 sleep 1
 

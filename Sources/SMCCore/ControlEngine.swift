@@ -430,6 +430,15 @@ public final class ControlEngine {
             calibratingStartedAt = calibrationDue ? hooks.now() : nil
             if calibrationDue {
                 hooks.log("AI 校准中：学习表未成熟，先观察系统散热特性（≤45 分钟或采够即接管）")
+            } else {
+                // R23（P2 修复）：校准退出边沿必须重置 AI 控制器——观察期 step() 不被调用，
+                // lastTemp 冻结在进期前；接管首拍把分钟级温漂当 3s 拍斜率（kD/dtNom=24×，
+                // -4°C 冷漂 → D 项 -96% 一拍猛打）。模式切换 reset（上方）只认 config.mode，
+                // calibrating 的语义切换不触它 → 在此收口。重置项与模式切换对齐（含 aiIdleActive）。
+                aiController.reset()
+                lastAIOutput = nil
+                lastAIIntent = nil
+                aiIdleActive = false
             }
         }
         if passiveMachine || calibrating {
@@ -794,6 +803,12 @@ public final class ControlEngine {
                 calibrating = false
                 calibratingStartedAt = nil
                 calibrationTimedOut = true
+                // R23（P2）：超时接管同样绕过上方边沿（latch 使下一拍 calibrationDue
+                // 恒 false，无翻转）→ 在此独立收口 D 基线重置（理由见边沿注释）
+                aiController.reset()
+                lastAIOutput = nil
+                lastAIIntent = nil
+                aiIdleActive = false
                 hooks.log("AI 校准超时（45 分钟）：以当前学习数据接管（稳态样本 \(calibrationSamples) 个）"
                     + "；切换模式再切回可重新校准")
             }

@@ -2,7 +2,7 @@
 # 安装 FanCtl（需要 sudo）：
 #   - fanctld → /usr/local/libexec/，注册为 LaunchDaemon 开机自启
 #   - FanCtl.app → /Applications/
-#   - 创建配置目录（staff 组可写，App 无需特权即可改配置）
+#   - 创建配置目录（admin 组可写，App 无需特权即可改配置；v2.8 起组由 staff 收紧为 admin）
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -73,7 +73,13 @@ cat > "$PLIST" <<'EOF'
 EOF
 chown root:wheel "$PLIST"
 chmod 644 "$PLIST"
-launchctl bootstrap system "$PLIST"
+# R23（P3）：bootstrap 失败此前被 set -e 无声吞退——此刻 daemon 已 bootout、二进制已装、
+# App 未装，处于"调速无人管"中间态且无提示。显式报错并给恢复路径。
+if ! launchctl bootstrap system "$PLIST"; then
+    echo "❌ LaunchDaemon 注册失败（plist=$PLIST）。风扇调速当前无人接管——" >&2
+    echo "   排查后重跑 sudo ./scripts/install.sh；或先手动恢复系统调度：launchctl kickstart -k system/com.fanctl.daemon" >&2
+    exit 1
+fi
 
 echo "==> 安装菜单栏 App..."
 # v3.6.1：升级时先停旧实例——不杀则旧进程持有已删除的 bundle 继续运行，

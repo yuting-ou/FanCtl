@@ -15,7 +15,9 @@ if [[ ! -d "$DIST_APP" ]]; then
 fi
 
 echo "==> 关闭运行中的 App..."
-pkill -f "清风.app/Contents/MacOS/FanCtl" 2>/dev/null || true
+# R23（P3）：-f 全命令行正则匹配会误杀命令行含该串的无关进程（tail -f 该路径、
+# 编辑器 helper 等）；与 install/uninstall 对齐用 -x 精确进程名
+pkill -x FanCtl 2>/dev/null || true
 sleep 1
 
 echo "==> 替换 App bundle（无需 sudo）..."

@@ -112,6 +112,19 @@ func testSelfUpgrade() {
                 "非法 tag 落到同一固定兜底文案")
     expectEqual(injected, "清风升级到 v新版本：需要管理员授权替换系统守护进程与菜单栏 App",
                 "兜底文案精确匹配（含 v 新版本 拼接形态）")
+
+    // R23（P1）：暂存二进制 sha256 助手——root 侧复核的数据源，必须与系统 shasum 一致。
+    group("一键升级·暂存哈希")
+    do {
+        let f = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fanctl-sha-\(UUID().uuidString)")
+        try? Data("abc".utf8).write(to: f)
+        expectEqual(SelfUpgrade.sha256Hex(of: f),
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                    "sha256(\"abc\") 命中已知向量")
+        try? FileManager.default.removeItem(at: f)
+        expect(SelfUpgrade.sha256Hex(of: f) == nil, "文件不可读 → nil（跳过门，与旧行为一致）")
+    }
 }
 
 

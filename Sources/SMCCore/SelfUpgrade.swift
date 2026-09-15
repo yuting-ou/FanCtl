@@ -11,11 +11,19 @@
 // 安全门（缺一不可）：
 //   1. 下载只走固定 HTTPS 模式（github.com/yuting-ou/FanCtl/releases/download/…），
 //      tag 必须通过 sanitizeTag（数字+点），杜绝路径/命令注入进 URL 与 shell。
-//   2. 特权脚本是 App bundle 内嵌资源，不是下载物——被授权执行的内容先于本次下载就存在。
+//   2. 特权脚本正文在构建期内嵌进 App 二进制（R23 P1 修复；build.sh 从
+//      scripts/upgrade.sh 生成 UpgradeScript.generated.swift 的 base64 常量），
+//      经 echo|base64 -d|bash -s 直交 root——包内副本仅供手动场景，不再是
+//      "被授权执行的内容"（用户可写 bundle 内的文件可被驻留进程篡改=提权通道）。
 //   3. 暂存包校验门：解压出的 FanCtl.app 的 Info.plist 版本必须与 Release tag 严格
-//      相等、fanctld 二进制必须存在——防止误装残缺包或错版本包（root 替换系统文件前最后一道闸）。
+//      相等、fanctld 二进制必须存在——防止误装残缺包或错版本包。
+//   4. root 侧复核（R23，闭合授权后 TOCTOU）：App 在弹窗前算好暂存 daemon/App 二进制
+//      的 sha256 随授权命令传入，upgrade.sh 在动系统文件之前重算比对；版本/哈希任一
+//      不符即 exit 3，原运行环境零扰动。校验与安装同在 root 时间线，"确认后偷换"
+//      只剩脚本自身执行的毫秒窗口。
 
 import Foundation
+import CryptoKit
 
 public enum SelfUpgrade {
 
@@ -71,5 +79,13 @@ public enum SelfUpgrade {
     public static func authorizationPrompt(tag: String) -> String {
         let v = sanitizeTag(tag) ?? "新版本"
         return "清风升级到 v\(v)：需要管理员授权替换系统守护进程与菜单栏 App"
+    }
+
+    /// 暂存二进制文件的 sha256 十六进制（R23：授权命令携带，upgrade.sh root 侧复核）。
+    /// 文件不可读返回 nil——调用方按"无法复核"处理（nil 传入脚本=跳过该门，
+    /// 与旧版行为一致，不给新门制造假失败）。
+    public static func sha256Hex(of url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }

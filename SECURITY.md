@@ -6,7 +6,7 @@ FanCtl（清风）包含一个以 **root 权限运行** 的守护进程（fanctl
 
 | 版本 | 支持 |
 |---|---|
-| 最新 release（当前 v3.1.0） | ✅ 安全修复 |
+| 最新 release（见 [Releases](https://github.com/yuting-ou/FanCtl/releases) 顶部，与仓库 `VERSION` 同源） | ✅ 安全修复 |
 | 更早版本 | ❌ 仅建议升级 |
 
 ## 报告的漏洞类型

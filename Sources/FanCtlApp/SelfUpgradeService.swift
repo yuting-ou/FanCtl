@@ -120,21 +120,34 @@ final class SelfUpgradeService: ObservableObject {
             //    exit 2"暂存包不完整"（真机 dogfood 手造 stage 恰好掩盖过此 bug）。
             //    审查修复②：waitUntilExit 同步阻塞调用线程，osascript 等用户输
             //    密码可能数分钟——绝不能在 MainActor 上等，整段放 detached。
-            guard let script = Bundle.main.path(forResource: "upgrade", ofType: "sh") else {
+            //    R23（P1 修复）：被授权执行的脚本正文 = 构建期内嵌的 base64
+            //    （UpgradeScript.generated.swift，由 build.sh 从 scripts/upgrade.sh
+            //    生成），经 echo|base64 -d|bash -s 直交 root——不再读用户可写的
+            //    包内副本（驻留进程篡改 upgrade.sh → 下次升级静默提权的通道关闭；
+            //    b64 字母表对 AppleScript/shell 双层引号天然安全，无竞态窗口）。
+            //    同时把暂存 daemon/App 二进制的 sha256 随命令传入，root 侧动手前
+            //    复核（闭合"授权确认后偷换暂存包"的 TOCTOU）。
+            guard !embeddedUpgradeScriptBase64.isEmpty else {
                 throw Failure("App 内缺内嵌升级脚本（打包问题）")
             }
+            let shaDaemon = SelfUpgrade.sha256Hex(of: innerDir.appendingPathComponent("fanctld")) ?? ""
+            let shaAppBin = SelfUpgrade.sha256Hex(
+                of: appDir.appendingPathComponent("Contents/MacOS/FanCtl")) ?? ""
             phase = .installing(tag: tag)
             // 遗言 watcher（R10 设计裁决）：重启不能由 root 做——root 上下文 open
             // 实测静默失败，submit 域归属存疑（system 域=菜单栏 App root 运行，不可接受）。
             // 改为 osascript 前以用户态拉起独立 shell：App 被 pkill 后该进程被 launchd
-            // 收养（parent 1），轮询到脚本末尾 touch 的完成标记后以登录用户身份 open——
+            // 收养（parent 1），轮询到脚本末尾写的完成标记后以登录用户身份 open——
             // 与手动打开完全同路。120s 超时自杀防孤儿堆积；取消授权时 watcher 空转到
             // 超时退出（标记永不存在，无副作用）。
-            let doneFlag = innerDir.appendingPathComponent(".upgrade-done")
-            try? FileManager.default.removeItem(at: doneFlag)
+            // R23：标记移到 /tmp 随机路径且比对内容为授权版本（原先"用户可写暂存目录
+            // 里文件存在即完成"可被预置伪造提前触发 open）。
+            let marker = URL(fileURLWithPath: "/tmp/fanctl-upgrade-\(UUID().uuidString).done")
+            try? FileManager.default.removeItem(at: marker)
+            let quotedMarker = marker.path.replacingOccurrences(of: "'", with: "'\\''")
             let watcherScript = """
             for i in $(seq 1 120); do
-                [ -f '\(doneFlag.path)' ] && sleep 1 && open '/Applications/清风.app' && exit 0
+                [ "$(cat '\(quotedMarker)' 2>/dev/null)" = '\(tag)' ] && sleep 1 && open '/Applications/清风.app' && exit 0
                 sleep 1
             done
             exit 1
@@ -143,11 +156,12 @@ final class SelfUpgradeService: ObservableObject {
             watcher.executableURL = URL(fileURLWithPath: "/bin/bash")
             watcher.arguments = ["-c", watcherScript]
             try? watcher.run()
-            let quotedScript = script.replacingOccurrences(of: "'", with: "'\\''")
             let quotedStage = innerDir.path.replacingOccurrences(of: "'", with: "'\\''")
             let prompt = SelfUpgrade.authorizationPrompt(tag: tag)
             let appleScript =
-                "do shell script \"bash '\(quotedScript)' '\(quotedStage)'\" with administrator privileges with prompt \"\(prompt)\""
+                "do shell script \"echo \(embeddedUpgradeScriptBase64) | base64 -d | bash -s -- "
+                + "'\(quotedStage)' '\(quotedMarker)' '\(tag)' '\(shaDaemon)' '\(shaAppBin)'\""
+                + " with administrator privileges with prompt \"\(prompt)\""
             let (osaStatus, osaErr) = try await Task.detached(priority: .userInitiated) {
                 let osa = Process()
                 osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")

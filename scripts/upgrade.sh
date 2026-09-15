@@ -1,12 +1,12 @@
 #!/bin/bash
 # upgrade.sh — 清风 App 内一键升级的特权安装过程（v3.9.0）
-# 由 App 经 osascript "with administrator privileges" 调起：
-#   bash <App>.app/Contents/Resources/upgrade.sh <暂存目录>
-# 暂存目录由 App 侧（用户态）准备好并已通过 SelfUpgrade.validateStaged 校验门：
-#   <staging>/FanCtl.app  <staging>/fanctld
-# 本脚本只做安装动作，不做下载、不做校验（校验在用户态完成，失败根本不会走到这里）。
-# 与 install.sh 的差异：不用 SUDO_USER（osascript 场景没有），App 归属按控制台用户归还；
-# 结尾自动重启菜单栏 App，旧实例先杀。
+# R23（P1 修复）起由 App 内嵌正文执行（build.sh 把本文件 base64 进二进制，
+# 经 echo|base64 -d|bash -s 管道直交 root），不再从用户可写的 App bundle 读取——
+# 关闭"驻留进程篡改包内脚本 → 用户例行升级输密码即被静默提权"的通道。
+# 调起签名：bash -s -- <暂存目录> [标记文件] [授权版本tag] [daemon哈希] [App二进制哈希]
+# 暂存目录由 App 侧（用户态）准备好并已通过 SelfUpgrade.validateStaged 校验门；
+# 后三个参数缺省时退化为旧行为（手动兼容），提供时 root 侧在动手前复核——
+# 关闭"授权弹窗确认之后偷换暂存包"的 TOCTOU（校验与安装同在 root 时间线）。
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -16,12 +16,40 @@ fi
 
 STAGING="${1:-}"
 if [[ -z "$STAGING" || ! -d "$STAGING" ]]; then
-    echo "用法: upgrade.sh <暂存目录>" >&2
+    echo "用法: upgrade.sh <暂存目录> [标记文件] [tag] [daemon-sha256] [appbin-sha256]" >&2
     exit 1
 fi
 if [[ ! -d "$STAGING/FanCtl.app" || ! -f "$STAGING/fanctld" ]]; then
     echo "暂存包不完整（缺 FanCtl.app 或 fanctld）" >&2
     exit 2
+fi
+MARKER="${2:-$STAGING/.upgrade-done}"
+TAG="${3:-}"
+SHA_DAEMON="${4:-}"
+SHA_APPBIN="${5:-}"
+
+# root 侧复核（在 bootout 之前——不匹配则原状退出，运行中的 daemon/App 不受扰动）
+if [[ -n "$TAG" ]]; then
+    STAGED_VER=$(plutil -extract CFBundleShortVersionString raw \
+        "$STAGING/FanCtl.app/Contents/Info.plist" 2>/dev/null || true)
+    if [[ "$STAGED_VER" != "$TAG" ]]; then
+        echo "暂存包版本 $STAGED_VER ≠ 授权版本 $TAG（授权后被篡改？）" >&2
+        exit 3
+    fi
+fi
+if [[ -n "$SHA_DAEMON" ]]; then
+    actual=$(/usr/bin/shasum -a 256 "$STAGING/fanctld" | awk '{print $1}')
+    if [[ "$actual" != "$SHA_DAEMON" ]]; then
+        echo "暂存 daemon 二进制哈希不符（授权后被篡改？）" >&2
+        exit 3
+    fi
+fi
+if [[ -n "$SHA_APPBIN" ]]; then
+    actual=$(/usr/bin/shasum -a 256 "$STAGING/FanCtl.app/Contents/MacOS/FanCtl" | awk '{print $1}')
+    if [[ "$actual" != "$SHA_APPBIN" ]]; then
+        echo "暂存 App 二进制哈希不符（授权后被篡改？）" >&2
+        exit 3
+    fi
 fi
 
 PLIST=/Library/LaunchDaemons/com.fanctl.daemon.plist
@@ -84,8 +112,14 @@ sleep 2
 
 # 重启菜单栏 App 不在本脚本做（R10 设计裁决）：root 上下文 open 实测静默失败、
 # submit 的进程域归属存疑（菜单栏 App 若落 system 域等于 root 运行，不可接受）。
-# 重启由 App 启动的用户态 watcher 负责——它轮询本标记（脚本最后一行 touch），
-# 被 launchd 收养（App 已 pkill）后以登录用户身份 open，与手动打开完全同路。
-touch "$STAGING/.upgrade-done"
+# 重启由 App 启动的用户态 watcher 负责——它轮询本标记（被 launchd 收养（App 已
+# pkill）后以登录用户身份 open，与手动打开完全同路）。R23：标记写授权版本作
+# 内容（watcher 比对内容而非仅存在性），且 App 侧把标记放 /tmp 随机路径——
+# 用户可写暂存目录里"存在性即完成"可被预置伪造。
+if [[ -n "$TAG" ]]; then
+    printf '%s' "$TAG" > "$MARKER"
+else
+    touch "$MARKER"
+fi
 
 echo "✅ 升级完成: $(/usr/local/libexec/fanctld -v)"

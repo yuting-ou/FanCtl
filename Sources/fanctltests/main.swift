@@ -523,7 +523,8 @@ testGarbageCodable()
 testChaosTimelines()
 print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
-let minAssertions = 2499
+// R23：2499→4400——原下限是 4496 实际值的 55%，砍掉近半测试仍发绿徽章，契约形同虚设
+let minAssertions = 4400
 if failures == 0 {
     if checks < minAssertions {
         print("❌ 断言数 \(checks) 低于契约下限 \(minAssertions)（测试被删/跳过？）")

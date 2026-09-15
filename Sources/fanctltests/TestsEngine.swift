@@ -62,6 +62,9 @@ final class MockSMC: SMCIO {
     }
     func write(_ key: String, bytes: [UInt8]) throws {}
     func writeDouble(_ key: String, value: Double) throws {
+        // R23 全量审查（TSan 实锤）：v3.4.5 锁纪律的漏网方法——主线程写 values 与
+        // 后台重扫持锁读并发 = 同一起段错误根因的 Dictionary COW 损坏，补齐锁。
+        lock.lock(); defer { lock.unlock() }
         writes.append((key, value))
         values[key]?.value = value
     }
@@ -106,6 +109,24 @@ func testFanControllerMock() {
         let st = try! fc.state(of: 0)
         expectClose(fc.rpm(forPercent: 50, state: st), 3100, 1e-9, "50%=(min+max)/2")
         expectClose(fc.rpm(forPercent: 150, state: st), 5000, 1e-9, "百分比钳到 100")
+    }
+    // R23（P2-1）：固件 flt 键可读出 NaN——NaN 进 FanState 会让 saveStatus/saveStats
+    // 每拍编码抛错静默停摆（观测面全瞎、history 停止归档）。按"严格读取"设计：非有限=
+    // 读失败抛错，allStates 跳过该风扇，健康风扇不受累。
+    do {
+        let smc = MockSMC()
+        smc.set("FNum", 2, type: "ui8 ")
+        for i in 0...1 {
+            smc.set("F\(i)Md", 0, type: "ui8 ")
+            smc.set("F\(i)Ac", i == 0 ? .nan : 1500)
+            smc.set("F\(i)Mn", 1200); smc.set("F\(i)Mx", 5000); smc.set("F\(i)Tg", 1500)
+        }
+        let fc = try! FanController(smc: smc)
+        expect((try? fc.state(of: 0)) == nil, "NaN 转速 → state(of:0) 抛错（不污染持久化）")
+        let states = fc.allStates()
+        expect(states.allSatisfy { $0.actualRPM.isFinite && $0.targetRPM.isFinite },
+               "allStates 无 NaN 泄漏到 FanState")
+        expectEqual(states.count, 1, "NaN 风扇被 allStates 跳过，健康风扇保留")
     }
     // Intel 风格（无 F0Md，用 FS! 位掩码）：强制置位、恢复清位
     do {

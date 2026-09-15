@@ -184,6 +184,18 @@ func testConfigAndCodable() {
         expectEqual(s.curve[2].percent, 0, "NaN percent 钳到 0")
         expectEqual(s.curve[3].percent, 100, "合法值保留")
     }
+    // R23（P2-2）：数组长度上限——组内用户写超长曲线会让每拍 percent() 排序 O(n log n)
+    // 拖爆主队列看门狗（自杀-重启死循环）。>64 点视为攻击，回退预设；偏移 >8 截断。
+    do {
+        let huge = (0..<1000).map { CurvePoint(temp: 40.0 + Double($0) * 0.05,
+                                               percent: Double($0 % 100)) }
+        let s = FanConfig(mode: .curve, curve: huge, preset: .balanced).sanitized()
+        expect(s.curve.count <= 64, "超长曲线（1000 点）被拒→回退预设（≤64）")
+        expectEqual(s.curve, CurvePreset.balanced.points, "超长曲线精确回退均衡预设")
+        let offsets = Array(repeating: 5.0, count: 500)
+        let s2 = FanConfig(mode: .ai, fanOffsets: offsets).sanitized()
+        expect((s2.fanOffsets?.count ?? 0) <= 8, "超长 fanOffsets（500）截断到 ≤8")
+    }
 
     group("Codable")
     do {

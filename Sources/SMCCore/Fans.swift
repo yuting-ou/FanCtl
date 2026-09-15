@@ -92,11 +92,20 @@ public final class FanController {
                 cachedFanLimits[fan] = limits
             }
         }
+        let actual = try smc.readDouble("F\(fan)Ac")
+        let target = try smc.readDouble("F\(fan)Tg")
+        // R23（P2 修复）：固件 flt 键可读出 NaN——NaN 进 FanState 后 JSONEncoder 编码
+        // 抛错，saveStatus/saveStats 从此每拍静默失败（观测面全瞎、history 停止归档），
+        // 而 lastStatusWrite 照常更新连"3 拍强写"都失效。按"严格读取"设计：非有限值=
+        // 读失败，抛错交给 allStates 跳过该风扇 → 走既有写入失败/冷却上报路径。
+        guard actual.isFinite, target.isFinite, limits.min.isFinite, limits.max.isFinite else {
+            throw SMCError.smcResult("F\(fan)Ac", 0xFF)
+        }
         return FanState(id: fan,
-                 actualRPM: try smc.readDouble("F\(fan)Ac"),
+                 actualRPM: actual,
                  minRPM: limits.min,
                  maxRPM: limits.max,
-                 targetRPM: try smc.readDouble("F\(fan)Tg"))
+                 targetRPM: target)
     }
 
     public func allStates() -> [FanState] {
@@ -442,7 +451,10 @@ public final class TemperatureSensors {
         let newBatt = floatKeys(prefixes: ["TB"])
 
         // 掌托/键盘体感：Ts0P/Ts1P/W0PR/W0PT/TB0T 等
-        let newPalm = floatKeys(prefixes: ["Ts", "W0P", "F0A"])
+        // R23（P3）：删 "F0A" 前缀——F0Ac 是风扇当前 RPM（flt），d<120 验证会把
+        // 起转/停转瞬间 0~119 的转速当"掌托温度"，污染环境谷值候选（0.5°C/h 泄漏
+        // 上漂可拖住假环境温度数小时）；Apple 键表本无 F0A 系掌托键，系笔误遗留
+        let newPalm = floatKeys(prefixes: ["Ts", "W0P"])
         // 散热片/风道：Th0p/Th1p/Tf0s/Tf1s/TA0P 等
         let newHeatsink = floatKeys(prefixes: ["Th", "Tf", "TA"])
 

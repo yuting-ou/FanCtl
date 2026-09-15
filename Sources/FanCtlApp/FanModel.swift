@@ -427,8 +427,10 @@ final class FanModel: ObservableObject {
     // MARK: - 版本自检（v3.6 方向一）
 
     /// 查询 GitHub Releases latest 并与本地版本比较。24h 内已成功查过则跳过；
-    /// 失败（无网/限流/超时）全静默，10 分钟后重试一次节流。命中"跳过此版本"不提示。
-    @MainActor func checkForUpdate(force: Bool = false) {
+    /// 失败（无网/限流/超时）全静默，10 分钟后重试（R23：上限 3 次——原实现每次
+    /// 失败都再挂一个 600s timer，"重试一次"实为无限链，长期离线机器每 10 分钟
+    /// 网络唤醒一次）。命中"跳过此版本"不提示。
+    @MainActor func checkForUpdate(force: Bool = false, retry: Int = 0) {
         if updateCheckInFlight { return }
         if !force,
            let last = UserDefaults.standard.object(forKey: Self.updateLastCheckKey) as? Date,
@@ -457,11 +459,14 @@ final class FanModel: ObservableObject {
                 owner.updateCheckInFlight = false
                 guard let tag else {
                     // v3.6.1：失败不写 lastCheck——原实现在请求前落盘，开机时网络未就绪
-                    // 的这次失败会消费掉整个 24h 窗口。失败后 10 分钟重试一次
-                    let retry = Timer.scheduledTimer(withTimeInterval: 600, repeats: false) { _ in
-                        Task { @MainActor in owner.checkForUpdate() }
+                    // 的这次失败会消费掉整个 24h 窗口。R23：重试预算 3 次封顶——
+                    // 原"重试一次"每次失败再挂 timer，实为无限链
+                    if retry < 3 {
+                        let retryTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: false) { _ in
+                            Task { @MainActor in owner.checkForUpdate(retry: retry + 1) }
+                        }
+                        retryTimer.tolerance = 120
                     }
-                    retry.tolerance = 120
                     return
                 }
                 UserDefaults.standard.set(Date(), forKey: Self.updateLastCheckKey)

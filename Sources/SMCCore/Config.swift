@@ -181,13 +181,13 @@ public struct FanConfig: Codable, Equatable {
             CurvePoint(temp: p.temp.isFinite ? p.temp : 0,
                        percent: p.percent.isFinite ? max(0, min(100, p.percent)) : 0)
         }
-        if c.curve.count < 2 { c.curve = (c.preset ?? .balanced).points }
+        if c.curve.count < 2 || c.curve.count > 64 { c.curve = (c.preset ?? .balanced).points }
         if let bc = c.batteryCurve {
             c.batteryCurve = bc.map { p in
                 CurvePoint(temp: p.temp.isFinite ? p.temp : 0,
                            percent: p.percent.isFinite ? max(0, min(100, p.percent)) : 0)
             }
-            if c.batteryCurve!.count < 2 { c.batteryCurve = nil }
+            if c.batteryCurve!.count < 2 || c.batteryCurve!.count > 64 { c.batteryCurve = nil }
         }
         // v2.6.2:nightCurve 与 batteryCurve 同样逐点防御(此前漏了,坏曲线会绕过 sanitized)
         if let nc = c.nightCurve {
@@ -195,12 +195,12 @@ public struct FanConfig: Codable, Equatable {
                 CurvePoint(temp: p.temp.isFinite ? p.temp : 0,
                            percent: p.percent.isFinite ? max(0, min(100, p.percent)) : 0)
             }
-            if c.nightCurve!.count < 2 { c.nightCurve = nil }
+            if c.nightCurve!.count < 2 || c.nightCurve!.count > 64 { c.nightCurve = nil }
         }
         // 偏移值钳位到 [-20, 20] 合理范围
         // NaN 穿透 min/max（NaN 比较恒 false），需显式过滤
         if let offsets = c.fanOffsets {
-            c.fanOffsets = offsets.map { $0.isFinite ? max(-20, min(20, $0)) : 0 }
+            c.fanOffsets = offsets.prefix(8).map { $0.isFinite ? max(-20, min(20, $0)) : 0 }
         }
         // AI 目标温度钳位到 [40, 95]：0/200/NaN 会导致 AI 锁死或 NaN 传播到 SMC
         if let t = c.aiTargetTemp, t.isFinite {
@@ -924,9 +924,16 @@ public enum ConfigStore {
             return config.sanitized()
         } catch {
             // 配置损坏：备份坏文件，写回默认配置
+            // R23（P3）：备份加保留上限 5（对齐 loadCorruptionAware）——此前无上限，
+            // 组内用户高频写非法 config 可让 root 在组可写目录持续落盘撑爆磁盘
             let backupPath = FanCtlPaths.supportDir
                 .appendingPathComponent("config.corrupted.\(Int(Date().timeIntervalSince1970)).json")
             try? data.write(to: backupPath)
+            let stale = (try? FileManager.default.contentsOfDirectory(
+                at: FanCtlPaths.supportDir, includingPropertiesForKeys: nil))?
+                .filter { $0.lastPathComponent.hasPrefix("config.corrupted.") && $0.pathExtension == "json" }
+                .sorted { $0.lastPathComponent > $1.lastPathComponent } ?? []
+            for old in stale.dropFirst(5) { try? FileManager.default.removeItem(at: old) }
             NSLog("fanctld: config.json 损坏，已备份到 \(backupPath.path)，使用默认配置")
             saveConfig(defaultConfig)
             return defaultConfig
@@ -941,24 +948,43 @@ public enum ConfigStore {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(sanitized) else { return false }
-        do {
-            try data.write(to: FanCtlPaths.configFile, options: .atomic)
-            // 原子写（临时文件+rename）会重置权限为 644 且属主变为写入者，
-            // 必须补回组写：daemon(root) 与 App(staff/admin 组) 双方都要能写这个文件。
-            // v3.6.2：root 写入时再把组归 admin——此前只改权限不改属主，config.json
-            // 损坏后 daemon 自愈重写会把文件变成 root:wheel 664，App 用户从此静默
-            // 失去写配置能力（直到重跑 install.sh）。App（非 root）写入时 chown
-            // 必然失败，跳过无害。
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o664], ofItemAtPath: FanCtlPaths.configFile.path)
-            if getuid() == 0 {
-                try? FileManager.default.setAttributes(
-                    [.groupOwnerAccountName: "admin"], ofItemAtPath: FanCtlPaths.configFile.path)
+        // R23（P1 修复）：旧实现 Data.write(.atomic) 后按路径 setAttributes——chmod/chown
+        // 跟随符号链接，而 support 目录 root:admin 775（组内用户可自由 unlink/rename），
+        // 攻击者可在 rename→chmod 窗口把 config.json 换成 ln -s /etc/sudoers，
+        // 让 root 把链接目标改成 664 = 本地提权原语。现全部改 fd 级操作：
+        // O_EXCL 建临时文件、fchmod 强制 664、fchown 走 fd、rename 替换符号链接本身
+        // 永不跟随——竞态窗口不存在。
+        // 再审修正：open 的 mode 参数受进程 umask 掩码（umask 022 会把 0664 削成 0644，
+        // 重新引入 v3.6.2 修过的"App 失去写权限"bug）——必须显式 fchmod（不受 umask 影响）。
+        let dir = FanCtlPaths.configFile.deletingLastPathComponent()
+        let tmp = dir.appendingPathComponent(".config.json.\(UUID().uuidString)")
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o664)
+        guard fd >= 0 else { return false }
+        fchmod(fd, 0o664)
+        var written = 0
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard raw.baseAddress != nil else { return }
+            while written < raw.count {
+                let n = write(fd, raw.baseAddress!.advanced(by: written), raw.count - written)
+                if n <= 0 { return }
+                written += n
             }
-            return true
-        } catch {
+        }
+        if getuid() == 0, let grp = getgrnam("admin") {
+            // daemon(root) 写入时把组归 admin——App 用户态写入必然失败，跳过无害（v3.6.2 语义）
+            // uid 传 -1（POSIX"不改属主"）：uid_t 是无符号，用 bitPattern 表达 0xFFFFFFFF
+            fchown(fd, uid_t(bitPattern: -1), grp.pointee.gr_gid)
+        }
+        close(fd)
+        guard written == data.count else {
+            try? FileManager.default.removeItem(at: tmp)
             return false
         }
+        guard rename(tmp.path, FanCtlPaths.configFile.path) == 0 else {
+            try? FileManager.default.removeItem(at: tmp)
+            return false
+        }
+        return true
     }
 
     public static func loadStatus() -> DaemonStatus? {

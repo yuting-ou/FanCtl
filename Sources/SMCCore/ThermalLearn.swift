@@ -181,8 +181,10 @@ public struct ThermalLearn: Equatable {
         }
         // v3.6.3：读出侧钳位——record 双钳 [0,100]，但垃圾解码的持久化文件可携带
         // 越界 output；先验外泄会绕过调用方 min(80) 前馈帽（夺回种子直接吃满）
+        // R23（P3）：钳位对 NaN 无效（Swift max/min 对 NaN 比较恒 false 原样穿透，
+        // 实测 min(max(NaN,0),100)=NaN）——非有限值按"无包络"处理而非透传
         if let r = result {
-            result = min(max(r, 0), 100)
+            result = r.isFinite ? min(max(r, 0), 100) : nil
         }
         return result
     }

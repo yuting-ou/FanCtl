@@ -82,9 +82,12 @@ do {
     exit(1)
 }
 
-guard fans.fanCount > 0 else {
-    log("未检测到风扇（FNum=0），退出")
-    exit(1)
+// R23（P2 修复）：fanCount==0 不再 shell 层 exit(1)——那让 4.0 B1 专门建的 passive
+// 语义（FNum 低频重探 + 无风扇机型模式语义化为 auto，ControlEngine/Fans 双侧实现）
+// 成为死代码，且 KeepAlive+Throttle 下每 10s 重启一次"SMC 初始化→全量扫描→退出"。
+// 无风扇时继续运行：引擎按 passiveMachine 处理，重探覆盖"风扇后接回"场景。
+if fans.fanCount == 0 {
+    log("未检测到风扇（FNum=0）：passive 语义运行，每 30s 低频重探（B1）")
 }
 
 let counts = sensors.sensorCounts

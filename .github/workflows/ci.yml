@@ -36,8 +36,8 @@ jobs:
           swift run -c release --disable-sandbox fanctltests 2>&1 | tee test-output.txt
           N=$(grep -oE '全部通过：[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1)
           echo "断言数: $N"
-          if [ -z "$N" ] || [ "$N" -lt 2499 ]; then
-            echo "::error::断言数 $N 低于契约下限 2499（测试被删/跳过？）"
+          if [ -z "$N" ] || [ "$N" -lt 4400 ]; then
+            echo "::error::断言数 $N 低于契约下限 4400（测试被删/跳过？）"
             exit 1
           fi
           echo "ASSERTIONS=$N" >> "$GITHUB_ENV"
@@ -55,7 +55,12 @@ jobs:
           git push
 
       - name: Release 构建
-        run: swift build -c release --disable-sandbox
+        # R23（P2）：只构建非 UI 目标——test job 不需要 App 二进制；App 目标编译
+        # 归 release job 的 build.sh（含 SwiftUIMacros 探测式钉 SDK）。此前全目标
+        # 直编在 runner 镜像换代（27 SDK 无宏插件的 CLT 形态）时会复现本机 09-11 故障。
+        run: |
+          swift build -c release --disable-sandbox --target fanctld
+          swift build -c release --disable-sandbox --target fanprobe
 
   # v3.4.5（4A）：tag 推送时打包 dist/ 附到 GitHub Release——访客不必自备
   # Swift 工具链源码编译（第一公里）。产物含 daemon 二进制 + 完整 App bundle +
@@ -71,6 +76,16 @@ jobs:
 
       - name: 运行回归测试（tag 也必须全绿才发版）
         run: swift run -c release --disable-sandbox fanctltests
+
+      - name: 发行身份断言（R23：tag == VERSION 主版本）
+        # 资产名/Info.plist 由 VERSION 驱动、下载 URL 由 tag 驱动（SelfUpgrade.assetURL）——
+        # 两者解耦漂移 = 老用户"检查更新"命中后 404/versionMismatch，全体静默断链
+        run: |
+          V=$(head -1 VERSION | awk '{print $1}')
+          if [ "v${V}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} ≠ VERSION v${V}（打 tag 忘了 bump，或 bump 忘了同步 tag）"
+            exit 1
+          fi
 
       - name: 打包（build.sh 从 VERSION 读取版本并组装 App bundle）
         run: ./scripts/build.sh

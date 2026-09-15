@@ -11,11 +11,11 @@
 ## 本地验证
 
 ```bash
-# 回归测试（~2415 断言，失败退出码非 0）
+# 回归测试（断言数以 README 顶部 tests 徽章为准，失败退出码非 0）
 swift run -c release --disable-sandbox fanctltests
 
-# Release 构建
-swift build -c release --disable-sandbox
+# Release 构建（非 UI 目标；App 目标含 SwiftUIMacros 探测式钉 SDK，走 build.sh）
+swift build -c release --disable-sandbox --target fanctld --target fanprobe
 
 # 完整构建（先测试再组装 dist/）
 ./scripts/build.sh

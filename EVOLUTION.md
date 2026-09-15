@@ -153,6 +153,17 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     **排除 R20/R21 回归**，定性为 OS 27 会话对合成事件的呈现限制（ToDesk 远程在场？）。
     面板开合确认仍悬置，移交用户真点一次图标（空白=回滚门禁的约定不变）。
 
+### R23（4.1.3(66)）：全量对抗审查轮——三路静态 + 双消毒器 + 真机/部署/文档对账，修 20+ 项含 2 个 P1 提权原语
+- **形态**：应作者令"全量对抗式审查，各种审查都用上"。三路并行静态审查（daemon 核心 / App+脚本+CI / 文档声明对账）+ 动态（ASan/TSan/fuzz 既有）+ 真机对账（fanprobe vs status.json）+ 部署对账（六处版本串）+ 元审查（文档可验证声明逐条核）。
+- **P1 提权原语 ×2（都源于"root 执行/修改用户可写路径"信任边界误设，非逻辑 bug）**：
+  ① **saveConfig 的 chmod/chown 按路径跟随符号链接**：support 目录 root:admin 775，组内用户可在 rename→setAttributes 窗口把 config.json 换成 `ln -s /etc/sudoers`，让 root 把 sudoers 改 664 = 本地提权。改 fd 级：O_EXCL 建临时文件 + **fchmod 强制 664**（再审抓出：open 的 mode 受 umask 掩码，022 会削成 644 重新引入 v3.6.2 的"App 失去写权限"bug）+ fchown 走 fd + rename 替换符号链接本身永不跟随。
+  ② **升级链 root 执行用户可写的包内 upgrade.sh**：驻留进程篡改 Contents/Resources/upgrade.sh → 用户下次例行升级输密码即静默 root。改：脚本正文构建期 base64 内嵌进二进制（build.sh 生成 UpgradeScript.generated.swift，占位文件同 4E 纪律），经 `echo|base64 -d|bash -s` 直交 root（b64 字母表对 AppleScript/shell 双层引号天然安全，无 check-then-exec 竞态）；并 App 弹窗前算暂存 daemon/App 二进制 sha256 随命令传入，upgrade.sh 在 bootout 前重算比对（闭合"授权确认后偷换暂存包"TOCTOU）；完成标记移到 /tmp 随机路径且比对内容=授权版本（原"用户可写目录里文件存在即完成"可预置伪造）。
+- **P2 修复（控制/观测/发行）**：NaN 转速污染持久化链（FanState 读侧 isFinite 门，非有限=读失败抛错走 allStates 跳过）；曲线/偏移数组长度无上限→每拍排序拖爆看门狗（sanitized 加 ≤64/≤8 上限）；校准退出/超时边沿未重置 AI 控制器（lastTemp 冻结→首拍 D 项按分钟级温漂猛打，reset 与模式切换对齐含 aiIdleActive）；fanCount==0 shell 层 exit(1) 使 B1 passive 语义成死代码（改继续运行，passive 低频重探）；ThermalLearn 包络钳位对 NaN 穿透（Swift max/min 对 NaN 比较恒 false 原样返回，实测坐实，改 isFinite→nil）；uninstall 登录项注销在 root 域执行达不成 4D 目的（su 到控制台用户）；CI test job 全目标直编绕开 R22 SDK 探测（改只编非 UI 目标）+ release job 缺 tag==VERSION 断言（补，防"打 tag 忘 bump→全体老用户 404"）。
+- **P3 批**：损坏 config 备份无保留上限（补 ≤5）；F0A 前缀误入掌托表（F0Ac 是风扇 RPM，起停瞬态 0~119 污染环境谷值，删）；升级失败重试"一次"实为无限链（封顶 3）；deploy pkill -f 误杀面（改 -x）；codesign 失败静默吞（改致命）；探测临时目录泄漏（加 trap）；断言契约下限 2499→4400（原可砍 44% 测试仍发绿，harness+CI 同步）；install bootstrap 失败无声退出（补中间态告警+恢复路径）。
+- **文档对账修正**：SECURITY "v3.1.0"（落后 10 版，去硬编码改引用 Releases）；CONTRIBUTING "~2415 断言"（与自家 CI 下限冲突，去硬编码）；**README "macOS 26 已放弃 Intel" 是外部可证伪的事实错误**（26 是最后支持 Intel 的版本，放弃 Intel 的是 27；arm64-only 是发行约束非 OS 约束，已改口径并消解与 CONTRIBUTING/代码 Intel 通路的三方矛盾）；§2 补 dt-ledger.json、§4.3 深凉 −12°/常规 −8° 绑定纠正、snapshot 清单补 ai/label、源码构建安装路径死路。
+- **未修项（定性记账，非遗漏）**：① 风扇物理故障"夺回↔交还"8 拍振荡（faulted 后 3 拍恢复锁存挡不住"无命令也计恢复进度"）——控制律设计改动，需 VirtualMachine 仿真 + HIL 族扫描验证，列 4.3 候选，本轮不动；② R21 关闭态门禁的 onAppear/onDisappear 生效前提仍悬置（OS 27 合成点击无法上屏，A/B 证非回归，待用户真点）；③ MenuBarLabel 仍随 App body 每拍重算（MenuBarState 挡住了内容光栅、没挡 body 求值；实测 0.55% CPU 可接受，不动）。
+- **元经验**：① 安全审查的富矿是"root 信任边界建立在用户可写文件上"——本轮两个 P1 同根，"同源"≠"同完整性"；② 修复再审真抓到了新引入的 bug（umask 掩码 open mode），印证"改完必再审"；③ 消毒器/对账不是走过场：TSan 复现了 v3.4.5 锁纪律的漏网方法（writeDouble），文档对账揪出外部可证伪的事实错误；④ 历史测量值不自洽时（R20 4.8% vs 8.0%）标注存疑优于静默改数。
+
 ### R21（4.1.2(64)）：R20 修复复验失败 → 根因修正——风暴主体是"关着的面板整树每拍重评"
 - **复验推翻 R20 验收**：4.1.1(63) 进程（跑 2d6h）实测均值 **3.9%**（129 CPU 分/3291 分），
   瞬时突发 50%。"0.23%"验收拍在 daemon 空闲期（20s 拍、温度稳），从未在 AI 控制态
@@ -184,6 +195,9 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
   ImageRenderer 离屏渲染——旧缓存键 Int(温度) 被控制期噪声频繁翻转，每次翻转 ~0.3s
   主线程离屏渲染 + 菜单栏图层 CA 交换。实机验收：4.1.0(62) 均值 4.8%（23:37 CPU/4h54m，
   0.3-0.5s 突发每 10-20s）→ 4.1.1(63) 均值 0.23%，突发消失，**~20× 降幅**。
+  （R23 对账存疑：23:37 CPU 分 ÷ 294 分 = 8.0%，与标称 4.8% 算术不符——要么百分比、
+  要么括号内原始测量值有一处记错，历史测量无法复现，保留原文待作者回查原始采样。
+  不影响结论方向：R21 已独立复测 4.1.1 在控制态仍 3.9%，"根除"结论已被推翻。）
   新增 `--snapshot label` 像素验证通道（常态/高温警示两态并排）。
 - **13 快照矩阵目检 → 三修两撤**：
   ① warn 横幅去 `sudo ./scripts/install.sh` 仓库路径（对 Release 用户是死路）→

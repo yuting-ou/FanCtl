@@ -16,20 +16,22 @@
 
 ![面板预览](assets/panel-preview.png)
 
-**版本**：以 [Releases](https://github.com/yuting-ou/FanCtl/releases) 与仓库根 `VERSION` 文件为准（单一来源） · **断言数**：见上方 tests 徽章（CI 每次推送自动更新，正文不再硬编码） · **语言**：Swift 5.9 · **平台**：macOS 26+（**仅 Apple Silicon**——macOS 26 已放弃 Intel；控制逻辑本身不依赖新系统，欢迎 fork 做 UI 降级移植）
+**版本**：以 [Releases](https://github.com/yuting-ou/FanCtl/releases) 与仓库根 `VERSION` 文件为准（单一来源） · **断言数**：见上方 tests 徽章（CI 每次推送自动更新，正文不再硬编码） · **语言**：Swift 5.9 · **平台**：macOS 26+（**发行二进制仅 Apple Silicon**——arm64 单架构出包；macOS 27 起放弃 Intel，但 26 仍支持 Intel，故源码在 Intel 上可编译、控制逻辑不依赖新系统，欢迎 fork 做 UI 降级移植）
 
 > 本文档后半部分（§7 起）面向 **AI 助手/开发者**：读完即可理解本项目架构、控制逻辑、安全机制与开发流程。普通用户只需读下面的「快速安装」。
 
 ## 快速安装（用户看这里）
 
 ```bash
-# 1) 下载 Release 附件并解压（Releases 页 → FanCtl-vX.Y.Z.zip），cd 进解压目录
-#    或自行源码构建：git clone 后 ./scripts/build.sh
+# 1) 二选一：
+#    a. 下载 Release 附件解压（Releases 页 → FanCtl-vX.Y.Z.zip，cd 进解压目录）——install.sh 在此目录根
+#    b. 源码构建：git clone 后 ./scripts/build.sh（产物在 dist/，install.sh 在 scripts/ 下）
 # 2) 安装（需密码：daemon 装入系统目录 + 菜单栏 App 装入 /Applications）
-sudo ./install.sh
+sudo ./install.sh          # 路径 a（Release 解压目录）
+sudo ./scripts/install.sh  # 路径 b（源码构建，仓库根执行）
 # 3) 菜单栏出现「清风」图标即完成；建议在面板菜单里打开「登录时启动」
 
-# 卸载（完全卸载：登录项 / daemon / App / 数据 / 日志一并清理）
+# 卸载（完全卸载：登录项 / daemon / App / 数据 / 日志一并清理；脚本名同上两处之一）
 sudo ./uninstall.sh
 ```
 
@@ -76,6 +78,7 @@ sudo ./uninstall.sh
 | `ai-learn.json` | 热经验查表(2°C 桶 × 场景桶) |
 | `thermal-model.json` | 散热参数线性模型(a=热阻,b=风量效率) |
 | `ai-metrics.json` | AI 控制质量评测(均温/波动/超温) |
+| `dt-ledger.json` | D 项 dt 账本(4.1-A 独立持久化:快/标称/慢三桶受控秒与斜率权重,生命周期=控制律版本) |
 | `reset-learn.flag` | App 写此文件请求清空学习数据,daemon 检测后重置 |
 
 ## 3. 源码结构
@@ -126,7 +129,7 @@ dist/                    构建产物(FanCtl.app + fanctld)
 - `output += kP·error·dt_nom + kD·slope·(1/dt_nom)`,clamp [0,100];dt 以 3s 为标称拍归一化(自适应间隔下语义恒定)。
 - **斜率死区** ±0.15°C/s(滤传感器噪声被微分放大)、**舒适温区** ±2°C(防积分漂移)、**anti-windup**(饱和跳过同向 P 项)。
 - **功耗前馈双通路**:EMA 慢速通路(渐变负载)+ raw 快速通路(突增 onset)+ **v2.6 分项通路**(powermetrics 采 CPU/GPU 各自功耗,阈值 8W,GPU 突增也能提前介入)。三路 max 合并不叠加。
-- **空闲交还/夺回**:持续低温(目标−8° 深凉 30s/常规 120s)且输出低位 → 交还系统调度(风扇可停转);温度 ≥ 目标连续 2 拍或斜率骤增 → 夺回。60s 宽限防停转瞬态误夺回、10 分钟振荡冷却。
+- **空闲交还/夺回**:持续低温(深凉=目标−12° 只需 30s / 常规=目标−8° 需 120s)且输出低位 → 交还系统调度(风扇可停转);温度 ≥ 目标连续 2 拍或斜率骤增 → 夺回。60s 宽限防停转瞬态误夺回、10 分钟振荡冷却。
 - **曲线锚定**(v9 探测式):稳态时输出向用户曲线收敛——每 25s 迈 ≤1.5% 小步,|error| ≥ 舒适带−1° 即停步;动态时温度主导——调曲线=调 AI 期望转速。
 - **v2.6 环境补偿**:AI 目标 += clamp((环境−25)×0.5, −5, +8),夜间档再 +4°。
 
@@ -171,7 +174,7 @@ sudo /Applications/清风.app/Contents/Resources/uninstall.sh
 swift run -c release --disable-sandbox fanprobe
 ```
 
-日志:`/Library/Logs/FanCtl/fanctld.log`(512KB 轮转)。UI 快照验证:`FanCtlApp --snapshot [curve|auto|manual|hotspots|today|custom] [dark]` 渲染 PNG 到 /tmp。
+日志:`/Library/Logs/FanCtl/fanctld.log`(512KB 轮转)。UI 快照验证:`FanCtlApp --snapshot [curve|auto|manual|ai|hotspots|today|custom|label] [dark] [warn|lens|boost|dead]` 渲染 PNG 到 /tmp（模式取 FanMode 原值 + 附加视图；dark 深色、warn/lens/boost/dead 为排版/状态开关）。
 
 ## 7. 给 AI 助手的注意事项
 
