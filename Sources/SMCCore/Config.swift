@@ -1006,6 +1006,22 @@ public enum ConfigStore {
         return true
     }
 
+    /// R23 打磨（P3-2）：saveConfig 崩溃/断电可能残留 `.config.json.<uuid>` 临时文件
+    /// （失败路径已清理，成功 rename 后无残留；仅进程被 kill 于 open↔rename 之间会漏）。
+    /// 启动时清扫一次，只删 mtime 早于 1 小时的——绝不可能命中任何进程此刻在途的临时文件，
+    /// 规避跨进程（App 与 daemon 都会写）误删竞态。
+    public static func cleanupStaleConfigTemps(olderThan: TimeInterval = 3600) {
+        let dir = FanCtlPaths.configFile.deletingLastPathComponent()
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        let cutoff = Date().addingTimeInterval(-olderThan)
+        for u in items where u.lastPathComponent.hasPrefix(".config.json.") {
+            let mtime = (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? Date.distantFuture
+            if mtime < cutoff { try? FileManager.default.removeItem(at: u) }
+        }
+    }
+
     public static func loadStatus() -> DaemonStatus? {
         guard let data = try? Data(contentsOf: FanCtlPaths.statusFile) else { return nil }
         let decoder = JSONDecoder()

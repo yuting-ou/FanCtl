@@ -98,9 +98,12 @@ public final class FanController {
         // 抛错，saveStatus/saveStats 从此每拍静默失败（观测面全瞎、history 停止归档），
         // 而 lastStatusWrite 照常更新连"3 拍强写"都失效。按"严格读取"设计：非有限值=
         // 读失败，抛错交给 allStates 跳过该风扇 → 走既有写入失败/冷却上报路径。
-        guard actual.isFinite, target.isFinite, limits.min.isFinite, limits.max.isFinite else {
-            throw SMCError.smcResult("F\(fan)Ac", 0xFF)
-        }
+        // R23 打磨（P3-4）：报错键名指向真正异常的那个（原恒报 F0Ac，Tg/Mn/Mx 出 NaN 时误导诊断）。
+        let badKey: String? = !actual.isFinite ? "F\(fan)Ac"
+            : !target.isFinite ? "F\(fan)Tg"
+            : !limits.min.isFinite ? "F\(fan)Mn"
+            : !limits.max.isFinite ? "F\(fan)Mx" : nil
+        if let badKey { throw SMCError.smcResult(badKey, 0xFF) }
         return FanState(id: fan,
                  actualRPM: actual,
                  minRPM: limits.min,

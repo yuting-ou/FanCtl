@@ -118,24 +118,17 @@ struct FanCtlApp: App {
                                      to: "/tmp/fanctl-snapshot-custom.png")
                 case "label":
                     // 4.1.1：菜单栏标签像素验证（常温/高温警示两态并排）。
-                    // 4.1.2（R21）：标签改为订阅 MenuBarState。渲染内容跟随 @AppStorage
-                    // menuBarStyle（用户可能设了 icon 只剩图标），快照通道临时覆写为
-                    // both 并在渲染后恢复——同域 defaults，不恢复会改掉用户真实设置。
-                    let savedStyle = UserDefaults.standard.string(forKey: "menuBarStyle")
-                    UserDefaults.standard.set("both", forKey: "menuBarStyle")
+                    // 4.1.2（R21）：标签改为订阅 MenuBarState。
+                    // R23 打磨 F7：渲染样式经 styleOverride 显式传 both，不再覆写共享
+                    // menuBarStyle 键（原做法会让常驻 App 标签闪现 + 中途被杀丢用户设置）。
                     let normalState = MenuBarState()
                     normalState.update(temp: 62, boost: false, quiet: false, style: "both")
                     let warmState = MenuBarState()
                     warmState.update(temp: 82, boost: false, quiet: false, style: "both")
-                    renderStandalone(VStack(spacing: 10) { MenuBarLabel(state: normalState)
-                                                         MenuBarLabel(state: warmState) }
+                    renderStandalone(VStack(spacing: 10) { MenuBarLabel(state: normalState, styleOverride: "both")
+                                                         MenuBarLabel(state: warmState, styleOverride: "both") }
                                         .background(.white),
                                      to: "/tmp/fanctl-snapshot-label.png")
-                    if let s = savedStyle {
-                        UserDefaults.standard.set(s, forKey: "menuBarStyle")
-                    } else {
-                        UserDefaults.standard.removeObject(forKey: "menuBarStyle")
-                    }
                 default:
                     break
                 }
@@ -191,9 +184,14 @@ struct MenuBarLabel: View {
     // MenuBarExtra 宿主布局/光栅（sample 实锤：MenuBarExtraLayout.sizeThatFits 高频）。
     // 整数温度桶/字形/警示色档不变 → 不发布 → 标签零开销。
     @ObservedObject var state: MenuBarState
-    @AppStorage("menuBarStyle") private var style = "both"  // both | icon | temp
+    @AppStorage("menuBarStyle") private var storedStyle = "both"  // both | icon | temp
+    // R23 打磨 F7：快照通道需强制 both，但直接写 @AppStorage 的键会经 KVO 让常驻 App
+    // 的菜单栏标签在渲染窗口内闪现 both、且中途被杀会永久改掉用户设置。改为显式覆盖，
+    // 不触碰共享 defaults 域。
+    var styleOverride: String? = nil
 
     var body: some View {
+        let style = styleOverride ?? storedStyle
         let d = state.display
         // 图标随状态变：冲刺→闪电、静音→月亮、常态→扇叶（一眼知道当前模式）
         let glyph = d.boostActive ? "bolt.fill"

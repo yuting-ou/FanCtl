@@ -153,6 +153,10 @@ final class FanModel: ObservableObject {
     private func stopCPUSampling() {
         cpuSampleTimer?.invalidate()
         cpuSampleTimer = nil
+        // R23 打磨 F6：停采样即清空榜单——否则重开面板/切回"占用"tab 时，异步首采样
+        // 返回前（<1s 窗口）会拿数小时前的旧榜冒充实时，与项目对 dead 态"诚实表达停更"
+        // 的口径不一致。清空后先空后新鲜，宁可短暂空白也不展示过期数据。
+        topProcesses = []
     }
     // v3.4.5（2D）：ps 采样防重入——ps 子进程若挂起，readDataToEndOfFile 会永久
     // 阻塞采样线程，3s 定时器继续叠加新采样任务。
@@ -695,9 +699,11 @@ final class FanModel: ObservableObject {
             self.hardwareProfile = status.hardwareProfile
             self.calibrating = status.calibrating ?? false
             // v3.7：学习地图只在 daemon 侧样本变化时才变（节流），直接透传；
-            // 数值防御（isFinite/范围）在 LearnedPoint 生成侧已保证，此处仅过滤坏点
+            // 数值防御在 LearnedPoint 生成侧保证，但 status.json 可被手改（同 decisionTrace
+            // 威胁模型）——isFinite 挡不住超大有限值（1e300 撑爆图表 x 域坍成一线），补温度区间。
             self.learnMap = (status.learnMap ?? []).filter {
-                $0.temp.isFinite && $0.percent.isFinite && $0.percent >= 0 && $0.percent <= 100
+                $0.temp.isFinite && $0.temp > 0 && $0.temp < 150
+                    && $0.percent.isFinite && $0.percent >= 0 && $0.percent <= 100
                     && $0.samples > 0
             }
             self.decisionTrace = status.decisionTrace?.sanitized()

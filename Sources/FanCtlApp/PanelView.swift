@@ -368,10 +368,10 @@ struct ContentView: View {
     private var temperatureCards: some View {
         HStack(spacing: 12) {   // 与面板纵向卡间距 12 对齐，横竖节奏统一
             TempGaugeCard(label: "CPU", symbol: "cpu", temp: model.cpuTemp,
-                          history: model.history.suffix(120).map(\.cpu),
+                          history: model.history.suffix(120).map(\.cpu).filter { $0 > 1 },
                           subTemp: model.cpuAverageTemp)
             TempGaugeCard(label: "GPU", symbol: "cpu.fill", temp: model.gpuTemp,
-                          history: model.history.suffix(120).map(\.gpu))
+                          history: model.history.suffix(120).map(\.gpu).filter { $0 > 1 })
         }
     }
 

@@ -16,6 +16,12 @@
 | 断言数 | 4368（v3.8） | fanctltests |
 | 学习地图 | 75°→98.1% / 77°→100% / 79°→100% / 81°→98.5%（R8 对账：高温桶在积累，14 点单调，包络 1.43） | ai-learn.json + status.json |
 
+> **基线口径说明（R23 文档对账）**：本表是 @94e6659（2026-09-05）的**冻结参照点**，值不随
+> 后续轮次改写（改写即失去基线意义）。两点内部不一致已核：① "断言数 4368（v3.8）"实为
+> 09-08 数，@94e6659 当时徽章为 2548——保留原值但标注其来自 v3.8；② 族扫描最坏成员
+> 当前实测 +42.5°（env33/R1.3/τ25/A12），较基线 +42.8° 微降。当前实况以 README 顶部
+> tests 徽章（每次推送自动更新）与最新成功账本条目为准，勿以本冻结表读"现在"。
+
 ## 已证实原则（按 confidence 排序）
 
 - **P1 缓存粒度**（conf: high）[证据 #0-pre：v3.4.1 otherHotspotMax 10s 缓存、#1 电池 3s 控制级]
@@ -176,6 +182,7 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
   - **测试有效性（变异审查）**：saveConfig 的 fchmod/rename/符号链接语义此前零回归质（双次历史回归区！）→ 补 `testSaveConfigPermissions`（断言 mode==664 穿透 umask + rename 替换链接不跟随 victim）；个性序断言 `>=` 允许三档压平（~816 条"绿量"掩盖）→ 补"中间温区至少一处真实分叉 ≥5%"；我上轮写的 `fanOffsets ?? 0 <= 8` 是弱断言 → 改精确 prefix(8)。**未修记账**：root 脚本（upgrade.sh/install.sh）纯 shell 逻辑仍零测试、checks 计数可被"循环虚高/合并虚低"双向失真、54 处 try! 违背自订 R8 纪律——列测试基建债。
   - **元经验（续）**：① 修安全 bug 时"同款原语的其它实例"要全局搜（P1-B：daemon 侧修了、root 脚本两处漏了）；② 给"授权后复核"这类安全机制加测试要测到 shell 层，纯 Swift 单测给了虚假安全感（P1-A 全绿仍漏）；③ 自己引入的"改进"（marker 挪 /tmp）要按威胁模型重推它开的新面（ps 泄露 argv 是本轮才想到的攻击者能力）。
 - **R23 细节打磨（4.1.3(68)，第二轮审查的 P3 记账项收口）**：F2 无效温度读数不清 `hotSince` → 跨传感器故障期误报"已持续高温 30 秒"（清零判定基准）；F4 风扇健康 6h 冷却由全局单值改 per-fan（否则左风扇报警后右风扇被压 6h、且 anomalySince 不清零致 6h 后发过期事件）；F5 风扇图标停转时 model transform 从未提交 → removeAnimation 后 presentation 跳回旧值"弹"一下（停转切换也结算相位 + model 对齐 lastAngle）；变异审查点名的测试质量：`expect(true,...)` 恒真断言改实质（错误类型 + 绝不写 Tg）、补 F0A 掌托误计回归测试、补损坏 config 备份 ≤5 测试（预置 7 个不同秒戳避免碰撞空转）；CI test job 补回 App 目标编译校验（此前只编非 UI 目标，PR 阶段丢失 SelfUpgradeService/视图的编译覆盖）。**未收口（记账）**：F1 同族 aiMetrics/stats 视图 Int() 需先确认 loadStats/loadAIMetrics 是否已消毒再定（避免重复改）；F6 面板重开陈旧进程榜、F7 快照覆写实时 defaults、F8 学习地图 temp x 域/GPU 死传感器 0 值折线——均为展示层 P3，留后续。4521 断言全绿、ASan/TSan 0 报告。
+- **R23 细节打磨（续，4.1.3(69)，把上条"留后续"清空）**：F1 同族核实——DailyStats.sanitized 已钳标量（视图 stats Int() 本就安全），AIControlMetrics 无消毒 → 补 `sanitized()`（temp/secs 双口径钳位）+ loadAIMetrics 套用（合法 JSON 的 1e300 不被解码器拒、视图 Int 会 trap）；F8 learnMap filter 补温度区间（isFinite 挡不住超大有限值撑爆 x 域）+ GPU/CPU sparkline 过滤 ≤1 死传感器读数（全死则样本<2、不画，比假跳水诚实）；F6 stopCPUSampling 清空 topProcesses（重开先空后新鲜，不拿旧榜冒充实时）；F7 快照 label 改 `styleOverride` 显式传值，不再覆写共享 menuBarStyle 键（消除常驻 App 标签闪现 + 中途被杀丢设置）；P3-4 NaN 抛错键名指向真正异常的键；P3-2 启动清扫 >1h 的 `.config.json.<uuid>` 残留（年龄门槛规避跨进程在途竞态）；文档：EVOLUTION 基线表加"冻结锚点"口径注（4368/+42.8 保留原值不篡改、标注当前 4521/+42.5）、README §3 源码树补全 18 SMCCore 文件+fanctld 拆分。**再审自抓**：cleanupStaleConfigTemps 插入时漏了 loadStatus 签名行 → 编译门红（改完必编译再次奏效）。4521 全绿、ASan/TSan 0 报告。
 
 ### R21（4.1.2(64)）：R20 修复复验失败 → 根因修正——风暴主体是"关着的面板整树每拍重评"
 - **复验推翻 R20 验收**：4.1.1(63) 进程（跑 2d6h）实测均值 **3.9%**（129 CPU 分/3291 分），

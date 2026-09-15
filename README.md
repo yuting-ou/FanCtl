@@ -89,19 +89,34 @@ Sources/
 ├── SMCCore/            核心库(纯逻辑,无 UI,可测试)
 │   ├── SMC.swift           AppleSMC IOKit 通信层(SMCIO 协议抽象,测试用 MockSMC 注入)
 │   ├── Fans.swift          FanController(读写/强制/交还) + TemperatureSensors(热点追踪/分类) + 健康检测
-│   ├── Config.swift        数据模型:FanConfig/CurvePreset/DaemonStatus/DailyStats/ControlReason + ConfigStore 持久化
+│   ├── ControlEngine.swift 控制主循环编排(读温→决策→写扇→持久化→校准/故障/唤醒状态机)
+│   ├── Config.swift        数据模型:FanConfig/CurvePreset/DaemonStatus/DailyStats/ControlReason/DecisionTrace + ConfigStore 持久化
+│   ├── ControlMetrics.swift AI 控制质量评测 + D 项 dt 账本(DTLedgerState)
 │   ├── FanControlLaw.swift 平滑(升快降慢 EMA + 坏读剔除) + shape/slew(升降速限速 + 死区)
 │   ├── FanPipeline.swift   决策管线:基础模式 < 静音封顶 < SSD 托底 < 高温兜底(纯函数)
-│   ├── FanAIController.swift  AI 增量式 PD 控制器(目标温度 + 趋势/功耗双通路前馈 + 空闲交还/夺回 + 曲线锚定)
-│   ├── ThermalLearn.swift  热经验查表(2°C 桶 EMA,场景桶,时间衰减,污染清洗)
+│   ├── FanAIController.swift AI 增量式 PD 控制器(目标温度 + 趋势/功耗双通路前馈 + 空闲交还/夺回 + 曲线锚定)
+│   ├── ThermalLearn.swift  热经验查表(2°C 桶 EMA,场景桶,时间衰减,污染清洗) + 学习/指标持久化
 │   ├── ThermalModel.swift  散热参数辨识(在线梯度下降拟合 温度=环境+a·功耗−b·风量)
-│   ├── CurveOptimizer.swift  AI 曲线优化(温度分布分位数 → 个性化三档曲线)
-│   └── StatsSampler.swift  每日统计采样(跨天归档)
-├── fanctld/main.swift   root 守护进程:自适应主循环、文件监控、睡眠/唤醒、故障恢复
-├── FanCtlApp/           SwiftUI 菜单栏 App(面板/曲线编辑器/通知)
-├── fanprobe/main.swift  只读诊断工具(无需 root)
-└── fanctltests/main.swift  纯逻辑测试(自带断言 harness,2500+)
-scripts/                 build.sh / install.sh / deploy.sh / uninstall.sh
+│   ├── CurveOptimizer.swift AI 曲线优化(温度分布分位数 → 个性化三档曲线)
+│   ├── StatsSampler.swift  每日统计采样(跨天归档)
+│   ├── PowerMetricsParser.swift powermetrics 分项功耗解析(纯函数,daemon 与测试共用)
+│   ├── StuckSensorDetector.swift 卡死传感器检测(长期恒定值识别)
+│   ├── HardwareProfile.swift 机型/传感器画像采集与分级
+│   ├── SelfUpgrade.swift   一键升级纯决策(tag 消毒/暂存包校验门/sha256,可单测)
+│   ├── VersionCheck.swift  版本比较(tag vs 本地)
+│   └── AliveDebouncer.swift 守护进程存活去抖(App 侧判 daemon 在线)
+├── fanctld/            root 守护进程
+│   ├── main.swift          启动/主循环/信号处理/看门狗/故障恢复
+│   ├── ConfigWatch.swift   config.json 文件监控(DispatchSource)
+│   ├── PowerCompositionSampler.swift powermetrics 采样器(超时强杀/降级)
+│   ├── SleepHandler.swift  睡眠/唤醒回调
+│   └── Version.generated.swift  版本常量(build.sh 从 VERSION 生成)
+├── FanCtlApp/          SwiftUI 菜单栏 App(FanCtlApp/FanModel/PanelView/CurveViews/
+│                       GaugeViews/MonitorViews/MenuBarState/FanControlActions/
+│                       NotificationService/SelfUpgradeService + UpgradeScript.generated)
+├── fanprobe/main.swift 只读诊断工具(无需 root)
+└── fanctltests/        纯逻辑测试(自带断言 harness;断言数见顶部 tests 徽章)
+scripts/                 build.sh / install.sh / deploy.sh / uninstall.sh / upgrade.sh
 dist/                    构建产物(FanCtl.app + fanctld)
 ```
 

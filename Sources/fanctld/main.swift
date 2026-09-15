@@ -99,6 +99,8 @@ log("启动: fanctld \(fanctldVersion) — 风扇 x\(fans.fanCount), CPU x\(coun
 // 而 status 却显示"系统自动调度"——与唤醒回调的无条件恢复对齐。
 fans.restoreAutoAll()
 log("启动: 已恢复系统自动调度（清理异常退出残留的强制模式）")
+// R23 打磨（P3-2）：清扫上次崩溃/断电残留的 .config.json.<uuid> 临时文件（仅 >1h 者）
+ConfigStore.cleanupStaleConfigTemps()
 
 // 上次异常退出原因（看门狗写入的标记）：让"它为什么自己重启过"可回答
 if let data = try? Data(contentsOf: FanCtlPaths.exitReasonFile),

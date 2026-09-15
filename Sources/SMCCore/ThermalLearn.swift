@@ -500,7 +500,8 @@ extension ConfigStore {
     }
 
     public static func loadAIMetrics() -> AIControlMetrics? {
-        loadCorruptionAware(AIControlMetrics.self, from: FanCtlPaths.aiMetricsFile, name: "ai-metrics")
+        loadCorruptionAware(AIControlMetrics.self, from: FanCtlPaths.aiMetricsFile, name: "ai-metrics")?
+            .sanitized()   // R23 打磨（F1 同族）：合法 JSON 的超大有限值不被解码器拒，视图 Int() 前须钳位
     }
 
     @discardableResult

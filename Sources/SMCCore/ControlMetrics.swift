@@ -167,6 +167,27 @@ public struct AIControlMetrics: Codable, Equatable {
         self.updatedAt = Date()
     }
 
+    /// R23 打磨（F1 同族）：ai-metrics.json 在组可写目录、视图对 targetTemp/maxOvershoot/
+    /// activeSeconds 等直接 `Int()`——合法 JSON 里的超大有限值（1e300）不被 JSONDecoder 拒，
+    /// `Int(1e300)` 是 fatal trap 会崩常驻 App。与 DailyStats.sanitized 同口径钳位（load 处套用）。
+    public func sanitized() -> AIControlMetrics {
+        var m = self
+        func temp(_ v: Double) -> Double { v.isFinite && abs(v) < 1e6 ? v : 0 }
+        func secs(_ v: Double) -> Double { v.isFinite && v >= 0 && v < 1e12 ? v : 0 }
+        m.targetTemp = temp(m.targetTemp)
+        m.userTargetTemp = m.userTargetTemp.map(temp)
+        m.peakTemp = temp(m.peakTemp)
+        m.maxOvershoot = temp(m.maxOvershoot)
+        m.lastOutput = m.lastOutput.map { $0.isFinite && abs($0) < 1e6 ? $0 : 0 }
+        m.activeSeconds = secs(m.activeSeconds)
+        m.highTempSeconds = secs(m.highTempSeconds)
+        m.temperatureSum = secs(m.temperatureSum)
+        m.temperatureSquaredSum = secs(m.temperatureSquaredSum)
+        m.outputSum = secs(m.outputSum)
+        m.outputChangeMagnitude = secs(m.outputChangeMagnitude)
+        return m
+    }
+
     /// dDelta/pDelta：本拍实际生效的 P/D 增量（anti-windup 跳过时 pDelta 记 0）。
     /// nil = 该拍未走 PD 路径（首拍播种/空闲交还）——样本仍计入时长分布，增量记 0。
     public mutating func record(temp: Double, output: Double, seconds: Double,
