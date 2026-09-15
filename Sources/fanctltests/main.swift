@@ -7,8 +7,9 @@ import SMCCore
 var checks = 0
 var failures = 0
 var currentGroup = ""
+var seenGroups = Set<String>()   // R23 测试基建：distinct group 数作第二道契约门槛
 
-func group(_ name: String) { currentGroup = name }
+func group(_ name: String) { currentGroup = name; seenGroups.insert(name) }
 
 func expect(_ cond: Bool, _ msg: String) {
     checks += 1
@@ -537,12 +538,20 @@ print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
 // R23：2499→4400——原下限是 4496 实际值的 55%，砍掉近半测试仍发绿徽章，契约形同虚设
 let minAssertions = 4400
+// R23 测试基建：第二道门槛——distinct group 数。断言总数可被循环刷量虚高
+// （如 expectPersonalityOrdered 单次产 ~816 条），删掉整段测试但保留循环类断言时
+// 总数不降、覆盖却净损；group 数是粗粒度结构量，删函数即少一个 group，刷不出来。
+let minGroups = 70
 if failures == 0 {
     if checks < minAssertions {
         print("❌ 断言数 \(checks) 低于契约下限 \(minAssertions)（测试被删/跳过？）")
         exit(1)
     }
-    print("✅ 全部通过：\(checks) 项断言")
+    if seenGroups.count < minGroups {
+        print("❌ distinct group 数 \(seenGroups.count) 低于契约下限 \(minGroups)（整段测试被删/合并？）")
+        exit(1)
+    }
+    print("✅ 全部通过：\(checks) 项断言（\(seenGroups.count) 个测试组）")
     exit(0)
 } else {
     print("❌ \(failures)/\(checks) 项断言失败")

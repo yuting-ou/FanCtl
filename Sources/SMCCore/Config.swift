@@ -985,7 +985,12 @@ public enum ConfigStore {
             guard raw.baseAddress != nil else { return }
             while written < raw.count {
                 let n = write(fd, raw.baseAddress!.advanced(by: written), raw.count - written)
-                if n <= 0 { return }
+                if n <= 0 {
+                    // R23 审查（P3-2）：root daemon 有信号活动（watchdog/SIGTERM），
+                    // write 可能被 EINTR 打断——须重试，否则配置静默保存失败
+                    if n < 0, errno == EINTR { continue }
+                    return
+                }
                 written += n
             }
         }

@@ -82,8 +82,9 @@ public enum SelfUpgrade {
     }
 
     /// 暂存二进制文件的 sha256 十六进制（R23：授权命令携带，upgrade.sh root 侧复核）。
-    /// 文件不可读返回 nil——调用方按"无法复核"处理（nil 传入脚本=跳过该门，
-    /// 与旧版行为一致，不给新门制造假失败）。
+    /// 文件不可读返回 nil。R23 审查（P3-4）：调用方 SelfUpgradeService 已改为 fail-CLOSED
+    /// ——nil 即拒绝升级、不弹窗（"读不到=无法校验完整性=不装"）。**新调用方切勿把 nil
+    /// 当"跳过该门"传空串给脚本**（脚本 `-n` 判空会静默跳门，正是被堵死的旁路）。
     public static func sha256Hex(of url: URL) -> String? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()

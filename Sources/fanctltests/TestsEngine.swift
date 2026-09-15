@@ -1297,10 +1297,12 @@ func testControlEngine() {
         let clock = FakeClock()
         let col = EngineCollector()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
-        for _ in 0..<40 { engine.beat(); clock.advance(3) }   // 真实拍级（3s）
+        for _ in 0..<60 { engine.beat(); clock.advance(3) }   // 真实拍级（3s），跨多轮试探
         let handbacks = smc.writes.filter { $0.key == "F0Md" && $0.value == 0 }.count
         expect(ConfigStore.loadStatus()?.controlFault == true, "坏风扇 controlFault 持续锁存（不振荡进出）")
-        expect(handbacks >= 1, "坏风扇会交还系统（不永久卡强制模式，得 \(handbacks) 次）")
+        // R23 审查（P1-1）回归：修复前 probe 不置 forcedModeActive → 第 1 轮交还后再不
+        // 交还（健康风扇被永久钉在强制 RPM），handbacks 恒 =1；修复后每轮试探都交还 → ≥2。
+        expect(handbacks >= 2, "坏风扇每轮试探都交还（不卡死强制；修复前恒 1 次，得 \(handbacks)）")
     }
 }
 

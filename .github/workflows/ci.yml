@@ -54,6 +54,20 @@ jobs:
           git diff --cached --quiet || git commit -m "CI: 更新断言数徽章 ($N)"
           git push
 
+      - name: 内嵌升级脚本同步校验（占位 == scripts/upgrade.sh）
+        # R23 审查（P3-5）：UpgradeScript.generated.swift 是 build.sh 从 upgrade.sh 生成的
+        # base64 内嵌正文；改 upgrade.sh 忘重生成 → 裸 swift build / CI App 编译校验用的
+        # 是旧占位，发布虽经 build.sh 再生成安全，但开发期静默用错脚本。此门堵漂移。
+        run: |
+          python3 - <<'PY'
+          import base64, sys
+          emb = open('Sources/FanCtlApp/UpgradeScript.generated.swift').read().split('"')[1]
+          cur = open('scripts/upgrade.sh', 'rb').read()
+          if base64.b64decode(emb) != cur:
+              sys.stderr.write("UpgradeScript.generated.swift 占位与 scripts/upgrade.sh 漂移（跑 ./scripts/build.sh 重生成）\n")
+              sys.exit(1)
+          PY
+
       - name: Release 构建
         # R23（P2）：daemon/工具用非 UI 目标直编。App 目标（FanCtlApp）单独一步编译校验
         # （R23 续轮 P3-3：不跑、只编——恢复 PR 阶段对 SelfUpgradeService/FanModel/视图的

@@ -993,6 +993,12 @@ public final class ControlEngine {
                     }
                     writeHealth.record(loopSuccess: probeOK)
                     if probeOK {
+                        // R23 审查修复（P1-1）：试探写 setForcedRPM 即已把风扇切入强制模式
+                        // （Md=1），必须置 forcedModeActive=true——否则第 1 轮交还把它置 false 后，
+                        // 后续每轮 probe 夺权却不置位 → 验证失败的交还分支（`if forcedModeActive`）
+                        // 永不触发 → 健康风扇被永久钉在上次试探的强制 RPM（v2.6.2 明令消灭的旧洞）、
+                        // 且退避计数不再递增。
+                        forcedModeActive = true
                         // 设 4：本拍末尾 -=1 后剩 3，保证注释承诺的完整 3 拍严格验证窗
                         probeVerifyLoops = 4
                         hooks.log("故障试探写入成功，进入跟随验证（3 拍）…")

@@ -52,6 +52,14 @@ if [[ -n "$SHA_APPBIN" ]]; then
     fi
 fi
 
+# R23 审查（P3-1）：marker 已是符号链接时在 bootout 之前快速失败——否则装完 daemon、
+# 杀完旧 App、替换完 bundle 才在末尾守卫 exit 4，语义是"系统已升级却回报失败、新 App
+# 无人重启"。末尾写前的守卫仍保留（防"检查后、写入前"抢建链接的 TOCTOU 跟随截断）。
+if [[ -L "$MARKER" ]]; then
+    echo "完成标记是符号链接，拒绝升级（防跟随截断）" >&2
+    exit 4
+fi
+
 PLIST=/Library/LaunchDaemons/com.fanctl.daemon.plist
 SUPPORT="/Library/Application Support/FanCtl"
 

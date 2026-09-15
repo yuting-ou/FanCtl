@@ -261,22 +261,29 @@ public struct FanFeedbackHealth: Equatable {
             return
         }
         var mismatch = false
-        var matched = false   // 本拍有"高目标命令且确实在跟随"的风扇 = 真实健康证据
+        var matched = false   // 本拍有"命令且确实在跟随"的风扇 = 真实健康证据
         for st in states {
             guard let target = commandedRPM[st.id] else { continue }
-            guard target > st.minRPM + 150 else { continue }
-            let stalled = st.actualRPM < 100
-            if stalled {
-                mismatch = true
-                continue
+            if target > st.minRPM + 150 {
+                // 高需求：不跟随才判故障（检测侧门槛，怠速低目标不误伤）
+                let stalled = st.actualRPM < 100
+                if stalled {
+                    mismatch = true
+                    continue
+                }
+                let lagging = abs(st.actualRPM - target) > max(300, target * 0.35)
+                // 升速宽限：本拍目标高于上拍 → 风扇在物理追赶中，滞后不判故障。
+                // daemon 的故障试探验证期传 risingGrace: false——probe 目标通常高于
+                // 旧值，若仍宽限则验证永远"通过"，探测不到真实故障
+                let rising = risingGrace && (lastCommanded[st.id].map { target > $0 + 50 } ?? false)
+                if lagging && !rising { mismatch = true }
+                else { matched = true }   // 未 stalled 且（跟上 或 升速追赶中）= 风扇在响应命令
+            } else {
+                // R23 审查修复（P2-1）：低目标（怠速/凉机/夜间）不判故障，但"实际跟上低命令"
+                // 是风扇在响应的健康证据——否则锁存后系统转凉、试探只命令低目标，matched 恒 false
+                // → 已恢复的风扇要等温度爬升才能解除。仍要求实际≈命令（真停转 actual≈0 偏离命令 → 不算）。
+                if abs(st.actualRPM - target) <= max(300, target * 0.35) { matched = true }
             }
-            let lagging = abs(st.actualRPM - target) > max(300, target * 0.35)
-            // 升速宽限：本拍目标高于上拍 → 风扇在物理追赶中，滞后不判故障。
-            // daemon 的故障试探验证期传 risingGrace: false——probe 目标通常高于
-            // 旧值，若仍宽限则验证永远"通过"，探测不到真实故障
-            let rising = risingGrace && (lastCommanded[st.id].map { target > $0 + 50 } ?? false)
-            if lagging && !rising { mismatch = true }
-            else { matched = true }   // 未 stalled 且（跟上 或 升速追赶中）= 风扇在响应命令
         }
         // 记录本拍命令（无命令的交还期保留旧值，重新接管时首拍目标高于旧值会走宽限）
         for st in states {
