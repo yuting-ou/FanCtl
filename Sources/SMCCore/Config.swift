@@ -335,6 +335,21 @@ public struct DecisionTrace: Codable, Equatable {
         self.target = target; self.temp = temp; self.error = error; self.learned = learned
         self.idle = idle; self.hysteresisHold = hysteresisHold; self.guardSeconds = guardSeconds
     }
+
+    /// R23（P2，UI 审查 F1）：status.json 可被损坏/手改含超大有限值（JSON 合法、
+    /// JSONDecoder 不拒），而视图对 target/temp/error/learned/guardSeconds 直接
+    /// `Int(...)`——Double→Int 越界在 Swift 是 fatal trap，会崩掉常驻菜单栏 App。
+    /// 与同文件 learnMap/appliedPercent 的消毒口径对齐：非有限或幅度过大→nil（视图显 "-"）。
+    /// 阈值 1e6 远大于任何合法温度/百分比/秒数，Int(1e6) 安全。
+    public func sanitized() -> DecisionTrace {
+        func ok(_ v: Double?) -> Double? {
+            guard let v, v.isFinite, abs(v) < 1e6 else { return nil }
+            return v
+        }
+        return DecisionTrace(target: ok(target), temp: ok(temp), error: ok(error),
+                             learned: ok(learned), idle: idle,
+                             hysteresisHold: hysteresisHold, guardSeconds: ok(guardSeconds))
+    }
 }
 
 public struct DaemonStatus: Codable {
@@ -960,7 +975,11 @@ public enum ConfigStore {
         let tmp = dir.appendingPathComponent(".config.json.\(UUID().uuidString)")
         let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o664)
         guard fd >= 0 else { return false }
-        fchmod(fd, 0o664)
+        // R23 再审（P3-2）：fchmod 失败则 mode 回落 open 的 umask 掩码值（可能 644），
+        // 静默复发"App 失去写权限"——失败必须显式中止并清理，不留半态
+        if fchmod(fd, 0o664) != 0 {
+            close(fd); try? FileManager.default.removeItem(at: tmp); return false
+        }
         var written = 0
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard raw.baseAddress != nil else { return }

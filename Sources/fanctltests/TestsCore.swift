@@ -1,6 +1,7 @@
 // 测试按模块拆分（v3.3.1）：本文件为各模块共享的 harness 与主入口。
 // 断言 harness 见 main.swift，共享构造（MockSMC/FakeClock/makeEngine）见 TestsEngine.swift 头部。
 import Foundation
+import Darwin
 import SMCCore
 
 // MARK: - 曲线插值
@@ -194,7 +195,9 @@ func testConfigAndCodable() {
         expectEqual(s.curve, CurvePreset.balanced.points, "超长曲线精确回退均衡预设")
         let offsets = Array(repeating: 5.0, count: 500)
         let s2 = FanConfig(mode: .ai, fanOffsets: offsets).sanitized()
-        expect((s2.fanOffsets?.count ?? 0) <= 8, "超长 fanOffsets（500）截断到 ≤8")
+        // R23 再审（A2）：精确断言保留的是"前 8 个"（prefix 语义）——`?? 0`/仅查 count
+        // 会让"置 nil"或"截到 6 个"两个变异存活
+        expectEqual(s2.fanOffsets, Array(repeating: 5.0, count: 8), "超长 fanOffsets 截断保留前 8 个")
     }
 
     group("Codable")
@@ -247,6 +250,37 @@ func testConfigAndCodable() {
     } catch {
         expect(false, "Codable 抛错: \(error)")
     }
+}
+
+// R23 再审（变异审查 B1，P1）：saveConfig 的 fd 级写 + fchmod + rename 语义此前零测试——
+// 本轮刚修的 umask 掩码回归（open mode 被削成 644 → App 失去写权限）与 P1 提权修复
+// （rename 替换符号链接而非跟随）都无回归质。锁三条不变量：正常写 mode==664；config.json
+// 是符号链接时 rename 替换链接本身、目标文件纹丝不动；成功路径无临时残留。
+func testSaveConfigPermissions() {
+    group("saveConfig 权限/符号链接")
+    let dir = engineTestEnv()
+    defer {
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+    let fm = FileManager.default
+    expect(ConfigStore.saveConfig(FanConfig(mode: .curve, curve: CurvePreset.balanced.points, preset: .balanced)),
+           "saveConfig 成功")
+    let mode = ((try? fm.attributesOfItem(atPath: FanCtlPaths.configFile.path))?[.posixPermissions]) as? Int
+    expectEqual(mode ?? -1, 0o664, "config.json mode==664（fchmod 穿透 umask；删 fchmod 且 umask 022 则 644→红）")
+    // 符号链接场景：把 config.json 换成指向 victim 的软链，saveConfig 的 rename 必须替换
+    // 链接本身而非跟随写进 victim——否则 root 把任意文件改 664 就是提权原语
+    let victim = dir.appendingPathComponent("victim.txt")
+    try? "SECRET".data(using: .utf8)!.write(to: victim)
+    try? fm.removeItem(at: FanCtlPaths.configFile)
+    symlink(victim.path, FanCtlPaths.configFile.path)
+    expect(ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced)), "符号链接场景 saveConfig 成功")
+    let victimText = (try? Data(contentsOf: victim)).flatMap { String(data: $0, encoding: .utf8) }
+    expectEqual(victimText ?? "?", "SECRET", "rename 未跟随符号链接：victim 内容未被覆盖（提权闭合）")
+    expectEqual(ConfigStore.loadConfig().mode, .ai, "config.json 已是本次写入的常规文件（loadConfig 读到）")
+    let leftovers = (try? fm.contentsOfDirectory(atPath: dir.path))?
+        .filter { $0.hasPrefix(".config.json.") } ?? []
+    expect(leftovers.isEmpty, "无 .config.json.<uuid> 临时残留")
 }
 
 

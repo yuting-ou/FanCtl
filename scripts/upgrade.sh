@@ -71,7 +71,7 @@ echo "==> 配置/日志目录权限对齐..."
 mkdir -p "$SUPPORT" /Library/Logs/FanCtl
 chown root:admin "$SUPPORT"; chmod 775 "$SUPPORT"
 chown root:wheel /Library/Logs/FanCtl; chmod 755 /Library/Logs/FanCtl
-[[ -f "$SUPPORT/config.json" ]] && chown root:admin "$SUPPORT/config.json" && chmod 664 "$SUPPORT/config.json" || true
+[[ -f "$SUPPORT/config.json" && ! -L "$SUPPORT/config.json" ]] && chown root:admin "$SUPPORT/config.json" && chmod 664 "$SUPPORT/config.json" || true
 
 echo "==> 注册 LaunchDaemon..."
 if [[ ! -f "$PLIST" ]]; then
@@ -108,14 +108,19 @@ xattr -dr com.apple.quarantine "/Applications/清风.app" 2>/dev/null || true
 chown -R "$LOGIN_USER:staff" "/Applications/清风.app" 2>/dev/null || true
 
 sleep 2
-[[ -f "$SUPPORT/config.json" ]] && chown root:admin "$SUPPORT/config.json" && chmod 664 "$SUPPORT/config.json" || true
+[[ -f "$SUPPORT/config.json" && ! -L "$SUPPORT/config.json" ]] && chown root:admin "$SUPPORT/config.json" && chmod 664 "$SUPPORT/config.json" || true
 
 # 重启菜单栏 App 不在本脚本做（R10 设计裁决）：root 上下文 open 实测静默失败、
 # submit 的进程域归属存疑（菜单栏 App 若落 system 域等于 root 运行，不可接受）。
 # 重启由 App 启动的用户态 watcher 负责——它轮询本标记（被 launchd 收养（App 已
-# pkill）后以登录用户身份 open，与手动打开完全同路）。R23：标记写授权版本作
-# 内容（watcher 比对内容而非仅存在性），且 App 侧把标记放 /tmp 随机路径——
-# 用户可写暂存目录里"存在性即完成"可被预置伪造。
+# pkill）后以登录用户身份 open，与手动打开完全同路）。R23：标记写授权版本作内容
+# （watcher 比对内容而非仅存在性），且 App 侧把标记放其私有 700 暂存目录内的随机
+# 路径（非 /tmp，避免 argv→ps 泄露路径后被抢建符号链接）。R23 再审（P2-B）：root
+# 的 `> marker` 会跟随符号链接，故写前显式拒绝符号链接（同 uid 抢建兜底）。
+if [[ -L "$MARKER" ]]; then
+    echo "完成标记是符号链接，拒绝写入（防跟随截断）" >&2
+    exit 4
+fi
 if [[ -n "$TAG" ]]; then
     printf '%s' "$TAG" > "$MARKER"
 else

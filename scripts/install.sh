@@ -37,7 +37,8 @@ chmod 775 "$SUPPORT"
 chown root:wheel /Library/Logs/FanCtl
 chmod 755 /Library/Logs/FanCtl
 # 已有配置/日志文件则保留权限一致
-[[ -f "$SUPPORT/config.json" ]] && chown root:admin "$SUPPORT/config.json" && chmod 664 "$SUPPORT/config.json" || true
+# R23（P1-B）：config.json 属性操作按路径会跟随符号链接，加 `! -L` 拒绝（同 upgrade.sh）
+[[ -f "$SUPPORT/config.json" && ! -L "$SUPPORT/config.json" ]] && chown root:admin "$SUPPORT/config.json" && chmod 664 "$SUPPORT/config.json" || true
 [[ -f "/Library/Logs/FanCtl/fanctld.log" ]] && chown root:wheel "/Library/Logs/FanCtl/fanctld.log" || true
 [[ -f "/Library/Logs/FanCtl/fanctld.err.log" ]] && chown root:wheel "/Library/Logs/FanCtl/fanctld.err.log" || true
 [[ -f "/Library/Logs/FanCtl/fanctld.out.log" ]] && chown root:wheel "/Library/Logs/FanCtl/fanctld.out.log" || true
@@ -96,7 +97,7 @@ fi
 
 # 确保守护进程已生成配置文件并放开组写权限（App 需要写它）
 sleep 2
-if [[ -f "$SUPPORT/config.json" ]]; then
+if [[ -f "$SUPPORT/config.json" && ! -L "$SUPPORT/config.json" ]]; then
     chown root:admin "$SUPPORT/config.json"
     chmod 664 "$SUPPORT/config.json"
 fi

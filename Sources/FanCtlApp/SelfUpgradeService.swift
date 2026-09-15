@@ -130,24 +130,38 @@ final class SelfUpgradeService: ObservableObject {
             guard !embeddedUpgradeScriptBase64.isEmpty else {
                 throw Failure("App 内缺内嵌升级脚本（打包问题）")
             }
-            let shaDaemon = SelfUpgrade.sha256Hex(of: innerDir.appendingPathComponent("fanctld")) ?? ""
-            let shaAppBin = SelfUpgrade.sha256Hex(
-                of: appDir.appendingPathComponent("Contents/MacOS/FanCtl")) ?? ""
+            // R23 再审（变异审查 B2）：哈希读不到必须 fail-closed——原 `?? ""` 会在
+            // 暂存二进制被同 uid 竞态改成不可读时传空串，而脚本的 `[[ -n ]]` 门对空串
+            // 是"跳过复核"→ 整道 sha256 防线被静默旁路。缺哈希即拒绝升级，不带着洞弹窗。
+            guard let shaDaemon = SelfUpgrade.sha256Hex(of: innerDir.appendingPathComponent("fanctld")) else {
+                throw Failure("暂存 daemon 二进制不可读，无法校验完整性，已中止升级")
+            }
+            guard let shaAppBin = SelfUpgrade.sha256Hex(
+                of: appDir.appendingPathComponent("Contents/MacOS/FanCtl")) else {
+                throw Failure("暂存 App 二进制不可读，无法校验完整性，已中止升级")
+            }
             phase = .installing(tag: tag)
+            // R23 再审（P1-A）：传给 root 脚本与 watcher 比对的必须是剥掉 v 前缀的规范
+            // tag——Info.plist 的 CFBundleShortVersionString 无 v（"4.1.3"），而 GitHub
+            // tag / 本参数带 v（"v4.1.3"），脚本按 STAGED_VER 比对若用原始 tag 必不等
+            // →每次升级输完密码后 100% exit 3。App 侧所有校验都走 sanitizeTag，此处对齐。
+            let normTag = SelfUpgrade.sanitizeTag(tag) ?? tag
             // 遗言 watcher（R10 设计裁决）：重启不能由 root 做——root 上下文 open
             // 实测静默失败，submit 域归属存疑（system 域=菜单栏 App root 运行，不可接受）。
             // 改为 osascript 前以用户态拉起独立 shell：App 被 pkill 后该进程被 launchd
             // 收养（parent 1），轮询到脚本末尾写的完成标记后以登录用户身份 open——
             // 与手动打开完全同路。120s 超时自杀防孤儿堆积；取消授权时 watcher 空转到
             // 超时退出（标记永不存在，无副作用）。
-            // R23：标记移到 /tmp 随机路径且比对内容为授权版本（原先"用户可写暂存目录
-            // 里文件存在即完成"可被预置伪造提前触发 open）。
-            let marker = URL(fileURLWithPath: "/tmp/fanctl-upgrade-\(UUID().uuidString).done")
+            // R23 再审（P2-B）：marker 放 App 私有的 700 暂存目录内（$TMPDIR 下，他用户
+            // 不可达）+ 随机名，而非 /tmp——/tmp 世界可读且路径会随 osascript argv 进 ps
+            // 泄露，攻击者可抢先在该路径建符号链接，令 root 的 `printf > marker` 跟随截断
+            // 任意 root 文件（新引入的破坏/提权面）。脚本侧再加 `[[ -L ]]` 守卫兜底。
+            let marker = innerDir.appendingPathComponent(".upgrade-done-\(UUID().uuidString)")
             try? FileManager.default.removeItem(at: marker)
             let quotedMarker = marker.path.replacingOccurrences(of: "'", with: "'\\''")
             let watcherScript = """
             for i in $(seq 1 120); do
-                [ "$(cat '\(quotedMarker)' 2>/dev/null)" = '\(tag)' ] && sleep 1 && open '/Applications/清风.app' && exit 0
+                [ "$(cat '\(quotedMarker)' 2>/dev/null)" = '\(normTag)' ] && sleep 1 && open '/Applications/清风.app' && exit 0
                 sleep 1
             done
             exit 1
@@ -160,7 +174,7 @@ final class SelfUpgradeService: ObservableObject {
             let prompt = SelfUpgrade.authorizationPrompt(tag: tag)
             let appleScript =
                 "do shell script \"echo \(embeddedUpgradeScriptBase64) | base64 -d | bash -s -- "
-                + "'\(quotedStage)' '\(quotedMarker)' '\(tag)' '\(shaDaemon)' '\(shaAppBin)'\""
+                + "'\(quotedStage)' '\(quotedMarker)' '\(normTag)' '\(shaDaemon)' '\(shaAppBin)'\""
                 + " with administrator privileges with prompt \"\(prompt)\""
             let (osaStatus, osaErr) = try await Task.detached(priority: .userInitiated) {
                 let osa = Process()

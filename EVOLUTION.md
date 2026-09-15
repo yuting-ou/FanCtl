@@ -163,6 +163,14 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
 - **文档对账修正**：SECURITY "v3.1.0"（落后 10 版，去硬编码改引用 Releases）；CONTRIBUTING "~2415 断言"（与自家 CI 下限冲突，去硬编码）；**README "macOS 26 已放弃 Intel" 是外部可证伪的事实错误**（26 是最后支持 Intel 的版本，放弃 Intel 的是 27；arm64-only 是发行约束非 OS 约束，已改口径并消解与 CONTRIBUTING/代码 Intel 通路的三方矛盾）；§2 补 dt-ledger.json、§4.3 深凉 −12°/常规 −8° 绑定纠正、snapshot 清单补 ai/label、源码构建安装路径死路。
 - **未修项（定性记账，非遗漏）**：① 风扇物理故障"夺回↔交还"8 拍振荡（faulted 后 3 拍恢复锁存挡不住"无命令也计恢复进度"）——控制律设计改动，需 VirtualMachine 仿真 + HIL 族扫描验证，列 4.3 候选，本轮不动；② R21 关闭态门禁的 onAppear/onDisappear 生效前提仍悬置（OS 27 合成点击无法上屏，A/B 证非回归，待用户真点）；③ MenuBarLabel 仍随 App body 每拍重算（MenuBarState 挡住了内容光栅、没挡 body 求值；实测 0.55% CPU 可接受，不动）。
 - **元经验**：① 安全审查的富矿是"root 信任边界建立在用户可写文件上"——本轮两个 P1 同根，"同源"≠"同完整性"；② 修复再审真抓到了新引入的 bug（umask 掩码 open mode），印证"改完必再审"；③ 消毒器/对账不是走过场：TSan 复现了 v3.4.5 锁纪律的漏网方法（writeDouble），文档对账揪出外部可证伪的事实错误；④ 历史测量值不自洽时（R20 4.8% vs 8.0%）标注存疑优于静默改数。
+- **R23 续轮（4.1.3(67)，第二轮三路对抗审查：审我自己 R23 改动 + UI 视图层 + 测试有效性）**：
+  - **P1-A（我引入的确定性回归）**：升级链传给 root 脚本的是带 `v` 前缀的原始 tag（`v4.1.3`），而 Info.plist 版本无 v（`4.1.3`），脚本 `[[ STAGED_VER != TAG ]]` → 每次一键升级输完密码后 100% exit 3；且我新加的 CI `tag==v${VERSION}` 断言恰恰保证了这个前缀必然出现。修：App 侧统一传 `sanitizeTag(tag)`（剥 v）给脚本与 watcher 比对。8 个新断言全绿也拦不住——因为没有任何测试覆盖 root 脚本的 tag 比对（见下"未修：脚本侧零测试"）。
+  - **P1-B（P1 修复只做了一半）**：`upgrade.sh`/`install.sh` 里 `chown/chmod config.json` 仍按路径操作、跟随符号链接——与 saveConfig 刚消灭的同款提权原语，却留在每轮升级必执行的 root 脚本里（$SUPPORT 是 root:admin 775 无 sticky，`-f` 测试也跟随链接挡不住）。修：加 `[[ ! -L ]]` 守卫拒绝符号链接（三处）。
+  - **P2-B（我把 marker 挪 /tmp 引入的新面）**：`osascript -e` 全文进 `ps`，任意本地用户 grep 即得 marker 随机路径 → 抢建符号链接 → root `printf > marker` 跟随截断任意 root 文件。修：marker 挪回 App 私有 700 暂存目录 + root 写前 `[[ -L ]]` 拒绝。
+  - **P2-A（fail-open）**：App 侧 `sha256Hex ?? ""` 在暂存二进制不可读时传空串→脚本 `-n` 判假静默跳过复核。修：读不到哈希即拒绝升级（fail-closed，弹窗前）。**残余（记账不修）**：整链无信任根（zip 无固定摘要、二进制仅 ad-hoc 签名不验签），"哈希前偷换暂存内容"仍无解——根治需 Developer ID 验签，属 plan 明确砍掉的公证/签名范围，接受为已知残余风险。
+  - **F1（UI 审查 P2）**：`decisionTrace` 是全链路唯一未消毒直通视图 `Int()` 的 status.json 字段，坏文件超大有限值（JSON 合法、解码器不拒）→ `Int(1e300)` fatal trap 崩常驻 App。修：加 `DecisionTrace.sanitized()`（与 learnMap/appliedPercent 同口径，非有限/≥1e6→nil）。同族 aiMetrics/stats/learnedNow 的视图 `Int()` 记为 P3 待办。
+  - **测试有效性（变异审查）**：saveConfig 的 fchmod/rename/符号链接语义此前零回归质（双次历史回归区！）→ 补 `testSaveConfigPermissions`（断言 mode==664 穿透 umask + rename 替换链接不跟随 victim）；个性序断言 `>=` 允许三档压平（~816 条"绿量"掩盖）→ 补"中间温区至少一处真实分叉 ≥5%"；我上轮写的 `fanOffsets ?? 0 <= 8` 是弱断言 → 改精确 prefix(8)。**未修记账**：root 脚本（upgrade.sh/install.sh）纯 shell 逻辑仍零测试、checks 计数可被"循环虚高/合并虚低"双向失真、54 处 try! 违背自订 R8 纪律——列测试基建债。
+  - **元经验（续）**：① 修安全 bug 时"同款原语的其它实例"要全局搜（P1-B：daemon 侧修了、root 脚本两处漏了）；② 给"授权后复核"这类安全机制加测试要测到 shell 层，纯 Swift 单测给了虚假安全感（P1-A 全绿仍漏）；③ 自己引入的"改进"（marker 挪 /tmp）要按威胁模型重推它开的新面（ps 泄露 argv 是本轮才想到的攻击者能力）。
 
 ### R21（4.1.2(64)）：R20 修复复验失败 → 根因修正——风暴主体是"关着的面板整树每拍重评"
 - **复验推翻 R20 验收**：4.1.1(63) 进程（跑 2d6h）实测均值 **3.9%**（129 CPU 分/3291 分），

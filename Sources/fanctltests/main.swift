@@ -61,13 +61,18 @@ func expectPersonalityOrdered(_ r: CurveOptimizer.Result, _ label: String) {
           let a = r.presetCurves[.aggressive] else {
         expect(false, "\(label) 缺预设曲线"); return
     }
+    var diverged = false
     for t in stride(from: 45.0, through: 95.0, by: 1.0) {
         let pq = FanConfig.percent(temp: t, curve: q)
         let pb = FanConfig.percent(temp: t, curve: b)
         let pa = FanConfig.percent(temp: t, curve: a)
         expect(pa + 1e-6 >= pb, "\(label) @\(Int(t))°: 强劲(\(Int(pa)))<均衡(\(Int(pb)))")
         expect(pb + 1e-6 >= pq, "\(label) @\(Int(t))°: 均衡(\(Int(pb)))<安静(\(Int(pq)))")
+        if pa - pq >= 5 { diverged = true }
     }
+    // R23 再审（变异审查 A1）：仅 `>=` 允许三档完全相等——把 aggressive 的 shift 改成 0
+    // （"强劲"个性静默消失）时全 4504 条仍绿。断言中间温区至少一处真实分叉 ≥5%。
+    expect(diverged, "\(label): 三档个性必须真实分叉（防 aggressive/quiet 被压平成同一条曲线）")
 }
 
 func expectAllPresetsGood(_ r: CurveOptimizer.Result, _ label: String) {
@@ -459,6 +464,7 @@ testInterpolation()
 testHistogram()
 testOptimizer()
 testConfigAndCodable()
+testSaveConfigPermissions()
 testControlLaw()
 testControlLawRegression()
 testDateChain()

@@ -700,7 +700,7 @@ final class FanModel: ObservableObject {
                 $0.temp.isFinite && $0.percent.isFinite && $0.percent >= 0 && $0.percent <= 100
                     && $0.samples > 0
             }
-            self.decisionTrace = status.decisionTrace
+            self.decisionTrace = status.decisionTrace?.sanitized()
             self.targetUnreachable = status.targetUnreachable ?? false
             if let pts = status.learnedPoints { self.learnedPoints = pts }
             self.currentLoopInterval = status.loopInterval

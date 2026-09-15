@@ -70,11 +70,17 @@ EOF
 # 内嵌升级脚本正文（R23 P1 修复）：upgrade.sh base64 进 App 二进制——被授权执行的
 # 内容与二进制同源同版，root 不再读用户可写的包内副本（篡改包内脚本=静默提权通道）。
 # 提交的占位文件供裸 swift build 使用；打包构建时严格同步（与 4E 版本常量同一纪律）。
+# R23 再审（P3-1）：base64 失败/空必须红——否则静默产生空常量，发行版要到用户点升级才炸。
+_UPGRADE_B64="$(base64 -i "$ROOT/scripts/upgrade.sh" | tr -d '\n')"
+if [ -z "$_UPGRADE_B64" ]; then
+    echo "❌ upgrade.sh 内嵌失败（base64 为空——文件不可读？）" >&2
+    exit 1
+fi
 cat > "$ROOT/Sources/FanCtlApp/UpgradeScript.generated.swift" <<EOF
 // 由 scripts/build.sh 从 scripts/upgrade.sh 重新生成（勿手改）。
 // 占位值供裸 \`swift build\` 使用；打包构建时与 upgrade.sh 严格同步（R23 P1 修复：
 // 被授权执行的脚本正文内嵌进二进制，root 不再读用户可写的包内副本）。
-let embeddedUpgradeScriptBase64 = "$(base64 -i "$ROOT/scripts/upgrade.sh" | tr -d '\n')"
+let embeddedUpgradeScriptBase64 = "$_UPGRADE_B64"
 EOF
 
 echo "==> 编译 release（非 UI 目标：默认系统 SDK）..."
