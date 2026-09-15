@@ -55,12 +55,15 @@ jobs:
           git push
 
       - name: Release 构建
-        # R23（P2）：只构建非 UI 目标——test job 不需要 App 二进制；App 目标编译
-        # 归 release job 的 build.sh（含 SwiftUIMacros 探测式钉 SDK）。此前全目标
-        # 直编在 runner 镜像换代（27 SDK 无宏插件的 CLT 形态）时会复现本机 09-11 故障。
+        # R23（P2）：daemon/工具用非 UI 目标直编。App 目标（FanCtlApp）单独一步编译校验
+        # （R23 续轮 P3-3：不跑、只编——恢复 PR 阶段对 SelfUpgradeService/FanModel/视图的
+        # 编译覆盖，此前只编非 UI 目标会让 App 侧语法/类型回归漏到 tag 触发的 release job
+        # 才暴露）。macos runner 始终带完整 Xcode，SwiftUIMacros 插件在场，App 可编。
         run: |
           swift build -c release --disable-sandbox --target fanctld
           swift build -c release --disable-sandbox --target fanprobe
+      - name: App 目标编译校验（不跑，仅编）
+        run: swift build -c release --disable-sandbox --target FanCtlApp
 
   # v3.4.5（4A）：tag 推送时打包 dist/ 附到 GitHub Release——访客不必自备
   # Swift 工具链源码编译（第一公里）。产物含 daemon 二进制 + 完整 App bundle +

@@ -26,7 +26,7 @@ final class NotificationService {
 
     // 风扇健康状态
     private var fanAnomalySince: [Int: Date] = [:]
-    private var lastFanAlertAt: Date = .distantPast
+    private var lastFanAlertAt: [Int: Date] = [:]   // R23 打磨 F4：per-fan 冷却——原全局单值会让左风扇报警后右风扇即使早已满足判据也被压 6h（且其 anomalySince 不清零，6h 后发的是过期事件）
 
     // 过热状态
     private var hotSince: Date? = nil
@@ -50,8 +50,8 @@ final class NotificationService {
             guard let since = fanAnomalySince[f.id] else { fanAnomalySince[f.id] = now; continue }
             let need: TimeInterval = stalled ? 30 : 90
             guard now.timeIntervalSince(since) >= need,
-                  now.timeIntervalSince(lastFanAlertAt) > 6 * 3600 else { continue }
-            lastFanAlertAt = now
+                  now.timeIntervalSince(lastFanAlertAt[f.id] ?? .distantPast) > 6 * 3600 else { continue }
+            lastFanAlertAt[f.id] = now
             fanAnomalySince[f.id] = nil
             ensureAuthorized()
             notifyFanIssue(f, stalled: stalled, fanCount: entries.count)
@@ -73,7 +73,11 @@ final class NotificationService {
     // MARK: - 发烧元凶通知
 
     func checkOverheat(_ temp: Double) {
-        guard canNotify, temp > 1 else { return }
+        guard canNotify else { return }
+        // R23 打磨 F2：temp≤1（传感器毛刺被采信为 0）此前直接 return，既不设也不清
+        // hotSince → 一次 91° 尖峰把 hotSince 停在故障前，数分钟后新的 90° 尖峰首拍即
+        // 满足"持续 30s"→ 发出失实的"已持续高温 30 秒"。无效读数须清零判定基准。
+        guard temp > 1 else { hotSince = nil; return }
         if temp >= 90 {
             if hotSince == nil { hotSince = Date() }
             if let since = hotSince,

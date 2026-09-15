@@ -184,7 +184,10 @@ func testFanControllerMock() {
             try fc.setForcedRPM(state: bad, rpm: 5000)
             expect(false, "min/max 无效应抛错")
         } catch {
-            expect(true, "min/max 无效抛错（不写 Tg=0）")
+            // R23 打磨（变异审查）：原 `expect(true,...)` 是恒真断言，"先写 Tg=0 再抛错"
+            // 的变异能溜过——实质断言错误类型 + 本块 F0Tg 从未被写入
+            expect(error is SMCError, "无效 min/max 抛的是 SMCError（非任意错误掩盖）")
+            expect(smc.lastWrite("F0Tg") == nil, "无效 min/max 时绝不写 Tg（含不写 Tg=0）")
         }
 
         // offsetForFan 边界条件
@@ -715,6 +718,28 @@ func testAdversarialFixes() {
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
     }
 
+    // —— R23 打磨（变异审查 B7）：config.json 损坏自愈的备份保留上限 ≤5 ——
+    // 此前无上限，组内用户高频写非法 config 可让 root 在组可写目录持续落盘撑爆磁盘。
+    // 预置 7 个不同秒级时间戳的旧备份（避免碰撞使测试空转），再触发一次损坏自愈，
+    // 断言裁剪后 ≤5。
+    do {
+        var envDirs: [URL] = [engineTestEnv()]
+        FanCtlPaths.ensureDirectories()
+        let base = Int(Date().timeIntervalSince1970) - 100   // 都早于本次新备份
+        for i in 0..<7 {
+            try? "x".write(to: FanCtlPaths.supportDir
+                .appendingPathComponent("config.corrupted.\(base + i).json"), atomically: true, encoding: .utf8)
+        }
+        try? "{\"broken\":true}".write(to: FanCtlPaths.configFile, atomically: true, encoding: .utf8)
+        _ = ConfigStore.loadConfig()   // catch → 备份 + dropFirst(5) 清理
+        let cfgBackups = ((try? FileManager.default.contentsOfDirectory(atPath: FanCtlPaths.supportDir.path)) ?? [])
+            .filter { $0.hasPrefix("config.corrupted.") && $0.hasSuffix(".json") }
+        expect(cfgBackups.count <= 5, "损坏 config 备份保留上限 5（实际 \(cfgBackups.count)）")
+        expect(cfgBackups.contains("config.corrupted.\(base + 6).json"), "保留的是最新的（未被误删新者）")
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    }
+
     // —— F4：reclaim 确认窗秒基（dt=3 与旧 2 拍等价；dt=1 不缩水）——
     do {
         // dt=3：过线第 1 拍（3s < 5s）不夺回，第 2 拍（6s ≥ 5s）夺回 = 旧行为
@@ -868,6 +893,15 @@ func testSensorsMock() {
     expectEqual(ts2.cpuTemperature, 65, "Intel 经典键兜底")
     expectEqual(ts2.gpuTemperature, 55, "Intel GPU 键兜底")
     expect(ts2.systemPowerWatts == nil, "无功耗键返回 nil")
+
+    // R23 打磨（变异审查 B8）：F0A 前缀已从掌托表删除——F0Ac 是风扇当前 RPM（flt），
+    // 起转/停转瞬间 0~119 的值会被误当掌托温度污染环境谷值。锁住"F0Ac 不计入掌托"。
+    let smc3 = MockSMC()
+    smc3.set("Tp01", 55)
+    smc3.set("F0Ac", 30)        // 风扇 RPM 键，值恰落在掌托温度区间
+    smc3.set("Ts0P", 40)        // 真掌托键
+    let ts3 = try! makeTemperatureSensors(smc: smc3, clock: { Date() })
+    expectEqual(ts3.sensorCounts.palm, 1, "F0Ac 不被误计入掌托（前缀 F0A 已删；回归则=2）")
 }
 
 

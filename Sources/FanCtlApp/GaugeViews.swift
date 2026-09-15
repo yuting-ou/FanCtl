@@ -336,8 +336,11 @@ final class FanSpinnerView: NSView {
         let stopped = rpm < 50
         // 先按旧转速结算到此刻的相位，再以新转速续转（无缝、无跳变）。
         // 与动画速率一致：max(rpm/1200, 0.05)（否则 RPM∈[50,60) 时结算慢于动画，
-        // 长时间后换挡相位漂移可见）
-        if currentRPM >= 50, !stopped {
+        // 长时间后换挡相位漂移可见）。
+        // R23 打磨 F5：原守卫 `!stopped` 使"运行→停转"跳过结算，随后 removeAnimation
+        // 让 presentation 从当前角瞬跳回从未提交的 model transform（叶片可见地"弹"一下）——
+        // 停转切换也要结算相位。
+        if currentRPM >= 50 {
             let elapsed = Date().timeIntervalSince(lastAngleAt)
             if elapsed > 0, elapsed < 120 {
                 let turns = max(currentRPM / 1200.0, 0.05) * elapsed
@@ -347,6 +350,8 @@ final class FanSpinnerView: NSView {
         currentRPM = rpm
         lastAngleAt = Date()
         iconLayer.opacity = stopped ? 0.3 : 1.0
+        // model transform 对齐结算后的相位：removeAnimation 后 presentation 落回此处，无跳变
+        iconLayer.transform = CATransform3DMakeRotation(lastAngle, 0, 0, 1)
         guard !stopped else {
             iconLayer.removeAnimation(forKey: "spin")
             return
