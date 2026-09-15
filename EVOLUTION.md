@@ -140,6 +140,18 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
   `-target-sdk-version`。
 - **元经验**：workaround 的钉住范围应收窄到"受影响的最小目标集"——全局 env 钉 SDK 宽了
   一个量级，把真实 27 SDK 的编译期契约漂移全挡在盲区里。
+- **R22 审查轮（4.1.2(65)，同日对抗审查）**：
+  - **P3 修复**：启动恢复有效冲刺/静音直改 `boostEndDate/quietEndDate` 字段、不走
+    startBoost/endQuiet 入口 → 字形停在扇叶直到第一拍 status。FanModel init 恢复块尾
+    补 `syncMenuBarState()`（R16"新状态字段必须进变化感知清单"的同类缺口）。
+  - **build.sh 加固**：SDK 发现循环 `ls|sort` 换 glob+while-read（xcode-select 指向含
+    空格路径的 Xcode 时不再词分割炸）；realpath 去重计算。
+  - **面板验证受阻（重要环境发现，非代码回归）**：本会话显示会话在场（WindowServer 正常、
+    yu 在 console），但合成点击（System Events AXPress 与 CGEvent HID 双路）+激活后，
+    MenuBarExtra 面板窗口**创建但永不上屏**（CGWindowList：340×908 layer=101
+    onscreen=false）。A/B 对照：4.1.0(62)（B4a 09-12 真机点开过的版本）同症状 →
+    **排除 R20/R21 回归**，定性为 OS 27 会话对合成事件的呈现限制（ToDesk 远程在场？）。
+    面板开合确认仍悬置，移交用户真点一次图标（空白=回滚门禁的约定不变）。
 
 ### R21（4.1.2(64)）：R20 修复复验失败 → 根因修正——风暴主体是"关着的面板整树每拍重评"
 - **复验推翻 R20 验收**：4.1.1(63) 进程（跑 2d6h）实测均值 **3.9%**（129 CPU 分/3291 分），

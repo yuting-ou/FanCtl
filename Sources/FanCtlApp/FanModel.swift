@@ -379,6 +379,9 @@ final class FanModel: ObservableObject {
         } else {
             UserDefaults.standard.removeObject(forKey: Self.quietEndKey)
         }
+        // 4.1.2（R22 审查轮）：恢复出的有效冲刺/静音是直改字段、不走 startBoost/startQuiet
+        // 入口，补一次标签同步——否则重启后带活跃冲刺时字形停在扇叶，直到第一拍 status。
+        syncMenuBarState()
 
         // 开机对账：config.json 与 App 状态同步
         if cfg.curve != points(for: preset)
