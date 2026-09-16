@@ -1285,7 +1285,9 @@ func testControlEngine() {
 
     // —— 场景 11（R24 非锁存退避）：坏风扇长跑必须"交还↔重申"循环，绝不卡死任一态 ——
     // 真机教训：删自解版会把"空闲→负载起转"的试探误判永久锁存（controlFault 恒真、不接管）。
-    // 本版保留自解 → 断言多轮交还+重申（handbacks/takeovers 均 ≥2），即不锁存、不卡强制。
+    // 注意：handbacks/takeovers≥2 alone 不够——30s 试探协议在永久锁存下同样会
+    // 写 Md=1→验证失败→Md=0，计数照样 ≥2。必须观测 status.controlFault 曾变回
+    // 非 true（自解真发生），才能抓住"删自解"类回归。
     do {
         envDirs.append(engineTestEnv())
         ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
@@ -1295,9 +1297,25 @@ func testControlEngine() {
         let clock = FakeClock()
         let col = EngineCollector()
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
-        for _ in 0..<80 { engine.beat(); clock.advance(3) }
+        var sawFault = false
+        var sawSelfClear = false
+        var reappliedAfterFault = false
+        for _ in 0..<80 {
+            engine.beat()
+            let st = ConfigStore.loadStatus()
+            let faulted = st?.controlFault == true
+            if faulted { sawFault = true }
+            else if sawFault { sawSelfClear = true }
+            if sawSelfClear, let p = st?.appliedPercent, p > 0 { reappliedAfterFault = true }
+            clock.advance(3)
+        }
         let handbacks = smc.writes.filter { $0.key == "F0Md" && $0.value == 0 }.count
         let takeovers = smc.writes.filter { $0.key == "F0Md" && $0.value == 1 }.count
+        expect(sawFault, "坏风扇必须进入 controlFault（前置）")
+        expect(sawSelfClear,
+               "自解真发生：controlFault 曾变回非 true（永久锁存/删自解回归会挂这里）")
+        expect(reappliedAfterFault,
+               "自解后恢复接管（appliedPercent>0），未卡在交还态")
         expect(handbacks >= 2 && takeovers >= 2,
                "坏风扇反复交还↔重申（自解在，不永久锁存/不卡强制）：交还 \(handbacks) 重申 \(takeovers)")
     }
