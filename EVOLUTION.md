@@ -163,6 +163,10 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R24c（4.1.3(74)）：streak 归零 OR→AND + 封顶单测
+- 收口 R24b 审查记账：多风扇 `matched` 原为 OR，一坏一好机上健康扇会顶掉坏扇退避。改为**全部高目标风扇均 matched（AND）**才归零；空命令拍不归零（恢复进度 ≠ 跟随证据）。
+- 补 streak=1..6 阈值序列单测（锁 3/6/12/24/48/48 封顶）与双风扇 AND 回归。4558 断言 / 75 组全绿。
+
 ### R24b（4.1.3(73)）：非锁存退避——振荡抑制改走「自解永在 + streak 指数退避」
 - **形态**：compose-next 规格化交付（`docs/compose/spec/r24-nonallocking-backoff.md`）。承接 71 回退后的振荡待办，不再删自解、不再收紧试探判据。
 - **设计**：`FanFeedbackHealth.faultStreak` 每进入新一轮 fault +1；`effectiveRecoverThreshold = 3 << min(streak-1, 4)` → 3/6/12/24/48；自解（交还/匹配计拍）永在 → **结构上不可能永久锁存**；仅非 faulted 且 `matched` 时 streak 归零（空拍自解不归零）。ControlEngine 试探协议保持 72 状态（30s 固定）。

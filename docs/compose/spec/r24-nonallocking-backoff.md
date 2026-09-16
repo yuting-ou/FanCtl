@@ -44,7 +44,7 @@ commits: 181f542..e24351d
    - `effectiveRecoverThreshold = recoverThreshold << min(max(faultStreak - 1, 0), recoverMaxShift)`
    - 序列：3 → 6 → 12 → 24 → 48（`recoverThreshold=3`，`recoverMaxShift=4`），封顶 48 拍。
 3. **自解永不移除**：need 有上限 → 结构上不可能永久锁存。首次/低 streak 假故障最多 3 拍即解（保住 71 真机教训）。
-4. **streak 归零条件**：仅在**非 faulted** 且本拍 `matched == true` 时清零。空拍自解不归零（避免坏风扇每轮立刻回到 3 拍基准）；健康风扇重新接管后一旦真实跟随即归零。
+4. **streak 归零条件**：仅在**非 faulted** 且本拍**所有高目标风扇均 matched（AND）**时清零。空拍自解不归零；健康风扇重新接管后一旦全部高目标风扇真实跟随即归零。R24c：从 OR（任一 matched）收严为 AND——否则一坏一好机上健康扇会顶掉坏扇退避。
 5. **`matched` 不门控恢复**：升速追赶中（rising grace 分支）与高目标已跟上都算 matched；恢复仍走原「无 mismatch 即 +1」路径。
 6. **ControlEngine 不变**：`controlBlocked` / 30s probe / `probeVerifyLoops` / handback 语义保持 72 回退后状态。振荡抑制完全由解除阈值增长完成。
 

@@ -238,7 +238,9 @@ public struct WriteHealth: Equatable {
 //   2. 故障锁存：faulted 后需连续 effectiveRecoverThreshold 拍"匹配或无命令"才解除。
 //      自解路径（交还/匹配都计）永不移除 → 结构上不可能永久锁存（71 真机教训：删自解
 //      会把健康风扇起转误判锁成 P1 失控）。解除阈值随 faultStreak 退避 3→6→12→24→48，
-//      坏风扇重接管频率指数下降；确认真实跟随（非 faulted 且 matched）即归零。
+//      坏风扇重接管频率指数下降；确认真实跟随（非 faulted 且所有高目标风扇均 matched）即归零。
+//      R24c：streak 归零从「任一风扇 matched（OR）」改为「全部高目标风扇 matched（AND）」——
+//      否则一坏一好机上健康扇会顶掉坏扇的退避，振荡抑制被静默削弱。
 public struct FanFeedbackHealth: Equatable {
     public static let faultThreshold = 5
     public static let recoverThreshold = 3      // 故障后连续匹配/交还拍数（首次故障的基准）
@@ -271,10 +273,12 @@ public struct FanFeedbackHealth: Equatable {
             return
         }
         var mismatch = false
-        var matched = false   // 高目标命令下确实在跟随（用于退避归零，不门控恢复）
+        var highTargetCount = 0     // 本拍被高目标命令的风扇数
+        var matchedCount = 0        // 其中确认在跟随的个数（含升速追赶中）
         for st in states {
             guard let target = commandedRPM[st.id] else { continue }
             guard target > st.minRPM + 150 else { continue }
+            highTargetCount += 1
             let stalled = st.actualRPM < 100
             if stalled {
                 mismatch = true
@@ -287,9 +291,9 @@ public struct FanFeedbackHealth: Equatable {
                 // 旧值，若仍宽限则验证永远"通过"，探测不到真实故障
                 let rising = risingGrace && (lastCommanded[st.id].map { target > $0 + 50 } ?? false)
                 if !rising { mismatch = true }
-                else { matched = true }   // 升速追赶中 = 在响应，算跟随证据
+                else { matchedCount += 1 }   // 升速追赶中 = 在响应，算跟随证据
             } else {
-                matched = true            // 高目标且未滞后未停转 = 确实跟上
+                matchedCount += 1            // 高目标且未滞后未停转 = 确实跟上
             }
         }
         // 记录本拍命令（无命令的交还期保留旧值，重新接管时首拍目标高于旧值会走宽限）
@@ -315,7 +319,11 @@ public struct FanFeedbackHealth: Equatable {
             }
         } else {
             consecutiveFailures = 0
-            if matched { faultStreak = 0 }   // 确认跟随：退避归零，下次故障回到 3 拍基准
+            // R24c：全部高目标风扇都跟上才归零（AND）。OR 会让一坏一好机上健康扇
+            // 顶掉坏扇退避；无高目标命令（空拍/交还）也不归零——那是恢复进度，不是跟随证据。
+            if highTargetCount > 0 && matchedCount == highTargetCount {
+                faultStreak = 0
+            }
         }
     }
     /// 仅更新命令基线（fastConfigApply 拍专用，不计 mismatch）：

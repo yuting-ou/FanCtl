@@ -236,6 +236,47 @@ func testOffsetsAndReadings() {
         expect(fh.faultStreak == 0, "确认跟随 → 退避归零（下次故障回 3 拍基准）")
     }
 
+    // R24c 封顶：streak≥5 时阈值钉在 48，不再指数上溢
+    do {
+        var fh = FanFeedbackHealth()
+        let bad = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [bad], commandedRPM: cmd)
+        for n in 1...6 {
+            for _ in 0..<FanFeedbackHealth.faultThreshold { fh.record(states: [bad], commandedRPM: cmd) }
+            expect(fh.faultStreak == n, "第 \(n) 轮故障 streak=\(n)")
+            let need = fh.effectiveRecoverThreshold
+            let expected = n <= 5 ? (3 << (n - 1)) : 48
+            expect(need == expected, "streak=\(n) 阈值 \(need) == \(expected)")
+            for _ in 0..<need { fh.record(states: [bad], commandedRPM: [:]) }
+            expect(!fh.faulted, "streak=\(n) 自解后解除")
+        }
+        expect(fh.faultStreak == 6 && fh.effectiveRecoverThreshold == 48, "封顶 48 生效")
+    }
+
+    // R24c 多风扇 AND：一坏一好时健康扇不得顶掉坏扇退避（旧 OR 会归零）
+    do {
+        var fh = FanFeedbackHealth()
+        let bad = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let good = FanState(id: 1, actualRPM: 3900, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0, 1: 4000.0]
+        fh.record(states: [bad, good], commandedRPM: cmd)   // 热身
+        for _ in 0..<FanFeedbackHealth.faultThreshold { fh.record(states: [bad, good], commandedRPM: cmd) }
+        expect(fh.faulted && fh.faultStreak == 1, "双风扇前置：坏扇触发故障")
+        for _ in 0..<3 { fh.record(states: [bad, good], commandedRPM: [:]) }
+        expect(!fh.faulted, "自解仍走空拍路径")
+        expect(fh.faultStreak == 1, "空拍自解不归零 streak")
+        // 双扇均有高目标：仅好扇跟上 → 不得归零
+        fh.record(states: [bad, good], commandedRPM: cmd, risingGrace: false)
+        expect(fh.faultStreak == 1, "OR 已修：好扇单侧跟随不顶掉坏扇退避")
+        // 无高目标命令（交还）同样不归零
+        fh.record(states: [bad, good], commandedRPM: [:])
+        expect(fh.faultStreak == 1, "空命令拍不归零（那是恢复进度非跟随证据）")
+        // 仅好扇被高目标命令且跟上 → 可归零（无坏扇被考核）
+        fh.record(states: [bad, good], commandedRPM: [1: 4000.0], risingGrace: false)
+        expect(fh.faultStreak == 0, "仅考核好扇且跟上 → 归零")
+    }
+
     // controlFault 字段往返 + 旧 status 兼容
     do {
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
