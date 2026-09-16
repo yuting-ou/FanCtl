@@ -163,6 +163,12 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R24d（4.1.3(75)）：root 脚本门禁可测化——upgrade.sh/install.sh 零测试债务收口
+- **动机**：R23 P1-A（tag 带 v → 一键升级 100% exit 3）8 个 Swift 断言全绿仍漏，根因是 shell 层零覆盖；R23 续轮点名「root 脚本纯 shell 逻辑零测试」为基建债。
+- **实现**：`upgrade.sh` 加 `FANCTL_TEST_GATES_ONLY=1`（跳过 EUID，只跑授权前门禁后 exit 0，不碰 launchctl/系统路径）；`install.sh` 抽 `fanctl_config_perm_safe` + `FANCTL_TEST_CONFIG_GUARD=1`。`scripts/test-root-scripts.sh` 21 条：暂存完整性 exit2、P1-A v 前缀 exit3、版本不符、sha256 双侧+偷换 TOCTOU、marker 符号链接 exit4+victim 不截断、config 符号链接/悬空/缺失谓词、内联 `! -L` 静态锁、bootstrap 失败致命。由 fanctltests `testRootScriptGates` 以 Process 调起（断言 ≥15 用例、失败数 0，防脚本被掏空）。
+- **测试当轮抓到真 bug**：`$TAG（授权…）` 全角括号被 macOS bash 并进变量名 → `set -u` 下 mismatch 路径变成 `TAG\xef: unbound` exit 1（**而非设计的 exit 3**）。生产因 P1-A 修复后恒传匹配 tag，此路径从未触发，潜伏至今。修 `${TAG}`；deploy.sh 同类 `$LEGACY（` 一并修。元经验：**shell 里 `$VAR` 后紧跟全角标点必须写 `${VAR}`**。
+- **验证**：test-root-scripts.sh 21/21；fanctltests 4562 断言 / 76 组全绿；UpgradeScript 占位与 upgrade.sh 严格同步。
+
 ### R24c（4.1.3(74)）：streak 归零 OR→AND + 封顶单测
 - 收口 R24b 审查记账：多风扇 `matched` 原为 OR，一坏一好机上健康扇会顶掉坏扇退避。改为**全部高目标风扇均 matched（AND）**才归零；空命令拍不归零（恢复进度 ≠ 跟随证据）。
 - 补 streak=1..6 阈值序列单测（锁 3/6/12/24/48/48 封顶）与双风扇 AND 回归。4558 断言 / 75 组全绿。

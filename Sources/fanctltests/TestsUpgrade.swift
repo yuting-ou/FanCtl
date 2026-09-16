@@ -183,3 +183,51 @@ func testSelfUpgradeFuzz() {
     expect(violations.isEmpty, "模糊性质违例: \(violations.prefix(5))")
 }
 
+// R24 脚本基建债收口：root 脚本门禁此前零回归（P1-A 全绿仍漏 v 前缀）。
+// 以 Process 调 scripts/test-root-scripts.sh（无 root、gates-only 钩子），
+// 把 upgrade.sh 的 tag/sha/marker 门与 install.sh 的 config 符号链接谓词锁进同一 CI 门。
+func testRootScriptGates() {
+    group("root 脚本门禁")
+    let here = URL(fileURLWithPath: #filePath)
+    // Sources/fanctltests/TestsUpgrade.swift → 仓库根
+    let root = here
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let script = root.appendingPathComponent("scripts/test-root-scripts.sh")
+    expect(FileManager.default.isExecutableFile(atPath: script.path)
+           || FileManager.default.fileExists(atPath: script.path),
+           "test-root-scripts.sh 在场：\(script.path)")
+    guard FileManager.default.fileExists(atPath: script.path) else { return }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+    proc.arguments = [script.path]
+    proc.currentDirectoryURL = root
+    let out = Pipe()
+    proc.standardOutput = out
+    proc.standardError = out
+    do {
+        try proc.run()
+    } catch {
+        expect(false, "无法启动 test-root-scripts.sh: \(error)")
+        return
+    }
+    proc.waitUntilExit()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    let text = String(data: data, encoding: .utf8) ?? ""
+    expect(proc.terminationStatus == 0,
+           "root 脚本门禁全绿（exit \(proc.terminationStatus)）\n\(text.suffix(800))")
+    // 解析 "root 脚本门禁：N 通过 / M 失败" —— 禁止 0 通过的空跑假绿
+    if let line = text.split(separator: "\n").last(where: { $0.contains("通过") && $0.contains("失败") }) {
+        let nums = line.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+        if nums.count >= 2 {
+            expect(nums[0] >= 15, "门禁用例数 ≥15（got \(nums[0])）——防脚本被掏空")
+            expect(nums[1] == 0, "失败数必须为 0（got \(nums[1])）")
+        } else {
+            expect(false, "无法解析门禁计数行: \(line)")
+        }
+    } else {
+        expect(false, "输出缺少「通过/失败」汇总行")
+    }
+}
+

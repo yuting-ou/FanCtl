@@ -26,7 +26,7 @@ if [[ -d "$APP" ]]; then
     if ! rm -rf "$APP" 2>/dev/null; then
         LEGACY="/tmp/清风.app.legacy.$(date +%s)"
         mv "$APP" "$LEGACY"
-        echo "   旧的 root 属主 bundle 已移至 $LEGACY（系统会自动清理 /tmp）"
+        echo "   旧的 root 属主 bundle 已移至 ${LEGACY}（系统会自动清理 /tmp）"
     fi
 fi
 cp -R "$DIST_APP" "$APP"

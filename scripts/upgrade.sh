@@ -9,7 +9,10 @@
 # 关闭"授权弹窗确认之后偷换暂存包"的 TOCTOU（校验与安装同在 root 时间线）。
 set -euo pipefail
 
-if [[ $EUID -ne 0 ]]; then
+# FANCTL_TEST_GATES_ONLY=1：无 root 回归钩子——跳过 EUID 检查，只执行下方授权前
+# 门禁（暂存完整性 / tag 比对 / sha256 复核 / marker 符号链接）后退出 0，绝不触碰
+# launchctl/文件系统安装路径。scripts/test-root-scripts.sh 靠它锁 P1-A/P1-B/P2/marker。
+if [[ $EUID -ne 0 && "${FANCTL_TEST_GATES_ONLY:-}" != "1" ]]; then
     echo "此脚本须以管理员身份运行（由 App 的升级流程调起）" >&2
     exit 1
 fi
@@ -33,7 +36,7 @@ if [[ -n "$TAG" ]]; then
     STAGED_VER=$(plutil -extract CFBundleShortVersionString raw \
         "$STAGING/FanCtl.app/Contents/Info.plist" 2>/dev/null || true)
     if [[ "$STAGED_VER" != "$TAG" ]]; then
-        echo "暂存包版本 $STAGED_VER ≠ 授权版本 $TAG（授权后被篡改？）" >&2
+        echo "暂存包版本 ${STAGED_VER} ≠ 授权版本 ${TAG}（授权后被篡改？）" >&2
         exit 3
     fi
 fi
@@ -58,6 +61,11 @@ fi
 if [[ -L "$MARKER" ]]; then
     echo "完成标记是符号链接，拒绝升级（防跟随截断）" >&2
     exit 4
+fi
+
+if [[ "${FANCTL_TEST_GATES_ONLY:-}" == "1" ]]; then
+    echo "gates-ok"
+    exit 0
 fi
 
 PLIST=/Library/LaunchDaemons/com.fanctl.daemon.plist

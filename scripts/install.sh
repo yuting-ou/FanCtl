@@ -5,6 +5,18 @@
 #   - 创建配置目录（admin 组可写，App 无需特权即可改配置；v2.8 起组由 staff 收紧为 admin）
 set -euo pipefail
 
+# 可单测谓词（R23 P1-B）：config.json 仅在「普通文件且非符号链接」时才允许 root
+# chown/chmod——按路径操作会跟随链接，把权限/属主打到任意目标上。
+# FANCTL_TEST_CONFIG_GUARD=1：无 root 回归钩子，对 $1 求谓词后退出（0=会修权限，1=跳过）。
+fanctl_config_perm_safe() {
+    local p="$1"
+    [[ -f "$p" && ! -L "$p" ]]
+}
+if [[ "${FANCTL_TEST_CONFIG_GUARD:-}" == "1" ]]; then
+    fanctl_config_perm_safe "${1:-}"
+    exit $?
+fi
+
 if [[ $EUID -ne 0 ]]; then
     echo "请用 sudo 运行: sudo ./scripts/install.sh"
     exit 1
@@ -37,8 +49,11 @@ chmod 775 "$SUPPORT"
 chown root:wheel /Library/Logs/FanCtl
 chmod 755 /Library/Logs/FanCtl
 # 已有配置/日志文件则保留权限一致
-# R23（P1-B）：config.json 属性操作按路径会跟随符号链接，加 `! -L` 拒绝（同 upgrade.sh）
-[[ -f "$SUPPORT/config.json" && ! -L "$SUPPORT/config.json" ]] && chown root:admin "$SUPPORT/config.json" && chmod 664 "$SUPPORT/config.json" || true
+# R23（P1-B）：config.json 属性操作按路径会跟随符号链接，经 fanctl_config_perm_safe 拒绝
+if fanctl_config_perm_safe "$SUPPORT/config.json"; then
+    chown root:admin "$SUPPORT/config.json"
+    chmod 664 "$SUPPORT/config.json"
+fi
 [[ -f "/Library/Logs/FanCtl/fanctld.log" ]] && chown root:wheel "/Library/Logs/FanCtl/fanctld.log" || true
 [[ -f "/Library/Logs/FanCtl/fanctld.err.log" ]] && chown root:wheel "/Library/Logs/FanCtl/fanctld.err.log" || true
 [[ -f "/Library/Logs/FanCtl/fanctld.out.log" ]] && chown root:wheel "/Library/Logs/FanCtl/fanctld.out.log" || true
@@ -97,7 +112,7 @@ fi
 
 # 确保守护进程已生成配置文件并放开组写权限（App 需要写它）
 sleep 2
-if [[ -f "$SUPPORT/config.json" && ! -L "$SUPPORT/config.json" ]]; then
+if fanctl_config_perm_safe "$SUPPORT/config.json"; then
     chown root:admin "$SUPPORT/config.json"
     chmod 664 "$SUPPORT/config.json"
 fi
