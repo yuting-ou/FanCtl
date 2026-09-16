@@ -235,19 +235,29 @@ public struct WriteHealth: Equatable {
 //   1. 升速宽限：目标正在上升（刚下令提速）时风扇物理爬升需 1-3s，滞后是预期而非故障，
 //      该风扇不计入 mismatch——否则高温兜底/SSD 危急的瞬时全速（LOOP_INTERVAL_MIN=1s，
 //      爬升 >5 拍）会被误判"闭环失效"，UI 报假故障且阻塞学习采样。
-//   2. 故障锁存：faulted 后需连续 recoverThreshold 拍"匹配或无命令"才解除。此前单拍无命令
-//      （restoreAutoAll 清空 lastWrittenRPM）即清零 fault，daemon 下一拍 mustReassert 立即
-//      重新写回，形成"交还→夺回"每 ~6 拍一轮的振荡，Md 翻转还打断 EC 升速斜坡自我延长。
+//   2. 故障锁存：faulted 后需连续 effectiveRecoverThreshold 拍"匹配或无命令"才解除。
+//      自解路径（交还/匹配都计）永不移除 → 结构上不可能永久锁存（71 真机教训：删自解
+//      会把健康风扇起转误判锁成 P1 失控）。解除阈值随 faultStreak 退避 3→6→12→24→48，
+//      坏风扇重接管频率指数下降；确认真实跟随（非 faulted 且 matched）即归零。
 public struct FanFeedbackHealth: Equatable {
     public static let faultThreshold = 5
-    public static let recoverThreshold = 3      // 故障后连续匹配拍数，达到才解除
+    public static let recoverThreshold = 3      // 故障后连续匹配/交还拍数（首次故障的基准）
+    static let recoverMaxShift = 4              // 连续故障退避上限：3<<4=48 拍
     public private(set) var consecutiveFailures = 0
     public private(set) var faulted = false
+    public private(set) var faultStreak = 0     // 连续故障次数（每多一次，解除所需拍数翻倍）
     private var recoverCount = 0
     private var lastCommanded: [Int: Double] = [:]
     // v2.6.2 启动宽限：daemon 重启后首拍 lastCommanded 为空，升速宽限失效，
     // 从 auto 接管到新目标时风扇爬升会被误判故障——首拍只记录命令不计数
     private var warmedUp = false
+
+    /// 当前解除所需拍数：首次 3，反复故障按 3→6→12→24→48（封顶）退避。
+    /// 关键安全性质：自解路径始终存在（交还/匹配都计 recoverCount），need 有上限 48 →
+    /// **不可能永久锁存**——坏风扇的重接管频率被封顶间隔约束，健康风扇/假故障最多 3 拍即解。
+    public var effectiveRecoverThreshold: Int {
+        Self.recoverThreshold << min(max(faultStreak - 1, 0), Self.recoverMaxShift)
+    }
 
     public init() {}
 
@@ -261,6 +271,7 @@ public struct FanFeedbackHealth: Equatable {
             return
         }
         var mismatch = false
+        var matched = false   // 高目标命令下确实在跟随（用于退避归零，不门控恢复）
         for st in states {
             guard let target = commandedRPM[st.id] else { continue }
             guard target > st.minRPM + 150 else { continue }
@@ -276,6 +287,9 @@ public struct FanFeedbackHealth: Equatable {
                 // 旧值，若仍宽限则验证永远"通过"，探测不到真实故障
                 let rising = risingGrace && (lastCommanded[st.id].map { target > $0 + 50 } ?? false)
                 if !rising { mismatch = true }
+                else { matched = true }   // 升速追赶中 = 在响应，算跟随证据
+            } else {
+                matched = true            // 高目标且未滞后未停转 = 确实跟上
             }
         }
         // 记录本拍命令（无命令的交还期保留旧值，重新接管时首拍目标高于旧值会走宽限）
@@ -285,18 +299,23 @@ public struct FanFeedbackHealth: Equatable {
         if mismatch {
             consecutiveFailures += 1
             recoverCount = 0
-            if consecutiveFailures >= Self.faultThreshold { faulted = true }
+            if consecutiveFailures >= Self.faultThreshold && !faulted {
+                faulted = true
+                faultStreak += 1   // 新一轮故障：解除所需拍数翻倍（封顶 48）
+            }
         } else if faulted {
-            // 锁存：交还（无命令）或匹配都算恢复进度，连续达标才解除，
-            // 避免"交还→单拍即恢复→立即夺回"的振荡
+            // 锁存：交还（无命令）或匹配都算恢复进度，连续达标才解除。R24：所需拍数随
+            // 连续故障次数退避，但自解路径永不移除 → 假故障最多 3 拍即解、坏风扇退避封顶，
+            // 结构上不可能锁存（这是与"删自解"版的关键区别）。
             recoverCount += 1
-            if recoverCount >= Self.recoverThreshold {
+            if recoverCount >= effectiveRecoverThreshold {
                 faulted = false
                 consecutiveFailures = 0
                 recoverCount = 0
             }
         } else {
             consecutiveFailures = 0
+            if matched { faultStreak = 0 }   // 确认跟随：退避归零，下次故障回到 3 拍基准
         }
     }
     /// 仅更新命令基线（fastConfigApply 拍专用，不计 mismatch）：

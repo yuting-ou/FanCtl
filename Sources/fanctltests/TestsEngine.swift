@@ -1282,6 +1282,25 @@ func testControlEngine() {
         engine.beat()
         expect(engine.aiMetrics.sampleCount >= 1, "解除静音后恢复评测")
     }
+
+    // —— 场景 11（R24 非锁存退避）：坏风扇长跑必须"交还↔重申"循环，绝不卡死任一态 ——
+    // 真机教训：删自解版会把"空闲→负载起转"的试探误判永久锁存（controlFault 恒真、不接管）。
+    // 本版保留自解 → 断言多轮交还+重申（handbacks/takeovers 均 ≥2），即不锁存、不卡强制。
+    do {
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC()
+        smc.set("Tp01", 85); smc.set("PSTR", 30)
+        smc.set("F0Ac", 0)          // 坏风扇：实际转速恒 0，永不跟随
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        for _ in 0..<80 { engine.beat(); clock.advance(3) }
+        let handbacks = smc.writes.filter { $0.key == "F0Md" && $0.value == 0 }.count
+        let takeovers = smc.writes.filter { $0.key == "F0Md" && $0.value == 1 }.count
+        expect(handbacks >= 2 && takeovers >= 2,
+               "坏风扇反复交还↔重申（自解在，不永久锁存/不卡强制）：交还 \(handbacks) 重申 \(takeovers)")
+    }
 }
 
 // MARK: - v3.7 信任三角：学习地图 / 冻结曲线 / 决策透镜

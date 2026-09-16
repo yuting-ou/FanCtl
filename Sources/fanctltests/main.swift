@@ -209,6 +209,33 @@ func testOffsetsAndReadings() {
         expect(!fh.faulted, "交还 3 拍后解除（daemon 据此恢复正常接管）")
     }
 
+    // R24（非锁存退避）：反复故障 → 解除所需拍数 3→6→12 退避，但自解路径永在（绝不锁存）；
+    // 一次确认跟随即归零。这是"振荡有界"与"假故障可自解"两个目标的合一。
+    do {
+        var fh = FanFeedbackHealth()
+        let bad = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let good = FanState(id: 0, actualRPM: 3900, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        func fault() { for _ in 0..<FanFeedbackHealth.faultThreshold { fh.record(states: [bad], commandedRPM: cmd) } }
+        fh.record(states: [bad], commandedRPM: cmd)   // 启动宽限热身拍
+        fault()
+        expect(fh.faulted && fh.faultStreak == 1 && fh.effectiveRecoverThreshold == 3, "首故障 streak=1 退避 3")
+        for _ in 0..<3 { fh.record(states: [bad], commandedRPM: [:]) }
+        expect(!fh.faulted, "自解保留：交还 3 拍解除（不锁存）")
+        fault()
+        expect(fh.faulted && fh.faultStreak == 2 && fh.effectiveRecoverThreshold == 6, "二故障 streak=2 退避 6")
+        for _ in 0..<5 { fh.record(states: [bad], commandedRPM: [:]) }
+        expect(fh.faulted, "退避生效：5 拍(<6)仍锁存")
+        fh.record(states: [bad], commandedRPM: [:])
+        expect(!fh.faulted, "第 6 拍解除（退避后仍自解，非永久锁存）")
+        fault()   // streak=3 → 退避 12
+        expect(fh.faultStreak == 3 && fh.effectiveRecoverThreshold == 12, "三故障 streak=3 退避 12")
+        for _ in 0..<12 { fh.record(states: [bad], commandedRPM: [:]) }
+        expect(!fh.faulted, "退避 12 拍后仍自解")
+        fh.record(states: [good], commandedRPM: cmd, risingGrace: false)   // 非故障态确认跟随
+        expect(fh.faultStreak == 0, "确认跟随 → 退避归零（下次故障回 3 拍基准）")
+    }
+
     // controlFault 字段往返 + 旧 status 兼容
     do {
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601

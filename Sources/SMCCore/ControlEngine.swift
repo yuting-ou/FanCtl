@@ -961,8 +961,9 @@ public final class ControlEngine {
             // v2.6.2 试探协议（写-验证-交还，30s 时间基准）：
             //   1. 试探拍：写入目标（SMC 保持强制模式）→ 验证期 3 拍让风扇物理爬升，
             //      feedbackHealth.record 用 lastWrittenRPM 检查跟随；
-            //   2. 连续 3 拍匹配 → fault 解除 → 恢复正常控制；
-            //   3. 验证失败 → 交还系统，30s 后再试探。
+            //   2. 验证期结束仍 faulted → 交还系统；解除走 FanFeedbackHealth 自解
+            //      （交还/匹配计拍），阈值随 faultStreak 退避 3→48（R24，非锁存）；
+            //   3. 30s 后再试探。试探间隔本身不退避（控制律回退后保持 72 状态）。
             // 此前 probe 后不交还，SMC 被钉在过期强制 RPM 上（status 却报"已交还"），
             // 且周期按拍数（idle 20s/拍时 6 分钟才探一次）。
             let controlBlocked = writeHealth.faulted || feedbackHealth.faulted
