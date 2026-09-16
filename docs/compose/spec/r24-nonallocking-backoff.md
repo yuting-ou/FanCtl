@@ -1,14 +1,24 @@
 ---
 feature: r24-nonallocking-backoff
-status: in-progress
+status: delivered
 updated: 2026-09-16
 branch: compose/r24-nonallocking-backoff
-commits: 181f542..HEAD
+commits: 181f542..e24351d
 ---
 
 # R24 非锁存退避（保留自解 + 故障 streak 指数退避）
 
 ## Report
+
+**What was built** — 在 `FanFeedbackHealth` 内落地非锁存指数退避：保留「交还/匹配都计恢复」的自解路径（结构上不可能永久锁存），新增 `faultStreak` 使解除阈值按 3→6→12→24→48 退避；仅在非 faulted 且本拍真实 `matched` 时归零 streak。ControlEngine 试探协议保持 4.1.3(72) 回退后状态（30s 固定间隔、无 probe 间隔退避）。坏风扇重接管频率指数下降；健康风扇假故障首 3 拍即解，确认跟随后回 3 拍基准。README/Fans/ControlEngine 注释与实现语义对齐。
+
+**Verification** — `swift run -c release --disable-sandbox fanctltests` → PASS 4533 断言 / 75 组（≥70 门槛）；`swift build -c release --disable-sandbox --target fanctld --target fanprobe --target SMCCore` → PASS。独立审查（fresh subagent，diff `181f542..e24351d`）Spec compliance 7/7 PASS、Correctness 无 critical、Codebase consistency 无问题 → Overall PASS。
+
+**Journey log** —
+1. 71 真机证伪「删自解」方案后，振荡待办的正确方向不是收紧恢复判据，而是**保留自解 + 让重接管间隔有界增长**——假故障代价封顶在 48 拍，真坏风扇振荡频率递减。
+2. 引擎级「不锁存」测试勿只数 Md 写：30s 试探协议在永久锁存下同样翻转 F0Md，`handbacks≥2 && takeovers≥2` 恒真。有效探针是 `status.controlFault` 曾变回非 true（自解真发生）+ 自解后 `appliedPercent>0`。本 feature 审查前自抓并修掉该假绿。
+3. `faultStreak` 纯内存、daemon 重启归零；多风扇 `matched` 为 OR——一坏一好机上健康扇会顶掉 streak，振荡抑制弱化但不会重新引入永久锁存。记账，未做 per-fan。
+4. 真机部署观察仍是控制律改动的必需闸门（71 教训）；本 feature 交付闸门为全量单测/族扫描绿 + 独立审查，部署后请盯「空闲↔负载」时 controlFault 是否自清。
 
 ## [S1] Problem
 
@@ -58,10 +68,11 @@ commits: 181f542..HEAD
 - 不实现「区分起转中 vs 真停转」的 stall 语义重设计（仍 `actualRPM < 100` 即 mismatch）。
 - 不改 ControlEngine probe 间隔退避（那是 R23 已回退方案）。
 - 不做真机部署验收（本 feature 以全量单测/族扫描绿为交付闸门；真机观察留给作者部署后）。
+- 不做 per-fan faultStreak 持久化（内存 struct，重启归零；多风扇 matched 为 OR）。
 
 ## Tasks
 
 - [x] T1: 落地 FanFeedbackHealth 非锁存退避（faultStreak / effectiveRecoverThreshold / matched 归零）— acceptance: 单测覆盖 3→6→12 退避、空拍自解保留、跟随归零 (covers: S2)
-- [x] T2: 引擎场景 11 端到端锁「坏风扇长跑 handbacks≥2 且 takeovers≥2」（不永久锁存/不卡强制）— acceptance: fanctltests 场景 11 通过 (covers: S2; depends: T1)
+- [x] T2: 引擎场景 11 端到端锁「坏风扇长跑 controlFault 自清 + 恢复接管 + handbacks≥2 且 takeovers≥2」（不永久锁存/不卡强制）— acceptance: fanctltests 场景 11 通过 (covers: S2; depends: T1)
 - [x] T3: 文档同步（Fans 注释 + README 闭环故障段 + ControlEngine 试探协议注释）— acceptance: README 与实现语义一致，无「固定 3 拍」过时表述 (covers: S2)
-- [ ] T4: 全量回归 + 编译门 — acceptance: `swift run -c release --disable-sandbox fanctltests` 全绿；非 UI 目标 release 编译通过 (covers: S2; depends: T1,T2,T3)
+- [x] T4: 全量回归 + 编译门 — acceptance: `swift run -c release --disable-sandbox fanctltests` 全绿；非 UI 目标 release 编译通过 (covers: S2; depends: T1,T2,T3)

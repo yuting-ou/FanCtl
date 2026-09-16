@@ -163,6 +163,13 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R24b（4.1.3(73)）：非锁存退避——振荡抑制改走「自解永在 + streak 指数退避」
+- **形态**：compose-next 规格化交付（`docs/compose/spec/r24-nonallocking-backoff.md`）。承接 71 回退后的振荡待办，不再删自解、不再收紧试探判据。
+- **设计**：`FanFeedbackHealth.faultStreak` 每进入新一轮 fault +1；`effectiveRecoverThreshold = 3 << min(streak-1, 4)` → 3/6/12/24/48；自解（交还/匹配计拍）永在 → **结构上不可能永久锁存**；仅非 faulted 且 `matched` 时 streak 归零（空拍自解不归零）。ControlEngine 试探协议保持 72 状态（30s 固定）。
+- **测试有效性自抓（审查前）**：场景 11 原断言 `handbacks≥2 && takeovers≥2` 在永久锁存下**恒真**（30s 试探协议本身就翻转 F0Md）——改为观测 `status.controlFault` 曾变回非 true（自解真发生）+ 自解后 `appliedPercent>0`（恢复接管）。教训：engine 级「不锁存」测试勿只数 Md 写。
+- **独立审查**：fresh subagent 扫 `181f542..e24351d`，7/7 验收 PASS、无 critical。记账：faultStreak 不持久化（重启回 3 拍）；多风扇 matched 为 OR（健康扇可顶掉 streak，弱化但不引入锁存）；stalled(<100) 仍无视 rising grace（71 同源，靠自解兜底）。
+- **验证**：4533 断言 / 75 组全绿；非 UI release 编译过。真机部署观察留给作者（盯空闲↔负载时 controlFault 自清）。
+
 ### R24（4.1.3(71)）：累计改动独立对抗审查 + 真机回退——振荡修复被证伪，回退控制律、保留独立安全/基建修复
 - **形态**：应作者令"大胆做、做完再审稳"。测试基建加第二道契约门槛（distinct group 数≥70，防循环刷量掩盖覆盖损失——断言总数可被 `expectPersonalityOrdered` 这类循环虚高）；再起一路独立审查 agent 扫 `git diff 31f69f7..HEAD`（66 提交），专攻安全链/控制律/跨进程组合的集成 bug。
 - **独立审查抓到 R23 振荡修复的两个 P1/P2 组合洞**：P1-1 试探 `probeOK` 写 Md=1 却不置 `forcedModeActive`，交还/退避全锁在 `if forcedModeActive` 里 → 第 2 轮起不交还、健康风扇被钉强制 RPM；P2-1 恢复唯一证据 `matched` 沿用 `target>min+150` 高门槛 → 凉机/夜间锁存后试探只命令低目标 → matched 恒 false → 死锁。我按此修（probeOK 置位 + 恢复侧接受低目标跟随）。
