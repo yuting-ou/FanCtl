@@ -1319,6 +1319,35 @@ func testControlEngine() {
         expect(handbacks >= 2 && takeovers >= 2,
                "坏风扇反复交还↔重申（自解在，不永久锁存/不卡强制）：交还 \(handbacks) 重申 \(takeovers)")
     }
+
+    // —— 场景 12（R25）：空闲停转→负载起转，物理 RPM 爬升不得触发 controlFault ——
+    // 回归锚：命令稳定在高目标时，旧实现对「滞后但在爬升」的风扇逐拍 mismatch，
+    // 5 拍内 fault；R25 将 RPM 上升视为响应证据。真停转仍由场景 11 覆盖。
+    do {
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC()
+        smc.set("Tp01", 85); smc.set("PSTR", 30)
+        smc.set("F0Ac", 0)          // 空闲停转
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        var sawFault = false
+        var sawHighCommand = false
+        // 前 2 拍仍在 0（命令基线热身），随后物理斜坡爬向目标
+        let ramp = [0.0, 0, 400, 900, 1600, 2400, 3200, 4000, 4500, 4500, 4500, 4500, 4500]
+        for rpm in ramp {
+            smc.set("F0Ac", rpm)
+            engine.beat()
+            let st = ConfigStore.loadStatus()
+            if let p = st?.appliedPercent, p > 20 { sawHighCommand = true }
+            if st?.controlFault == true { sawFault = true }
+            clock.advance(3)
+        }
+        expect(sawHighCommand, "场景 12 前置：高目标已施加")
+        expect(!sawFault,
+               "起转斜坡（RPM 上升）期间不得 controlFault（R25 回归：旧实现在稳定高目标下 5 拍误 fault）")
+    }
 }
 
 // MARK: - v3.7 信任三角：学习地图 / 冻结曲线 / 决策透镜

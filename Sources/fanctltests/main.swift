@@ -277,6 +277,103 @@ func testOffsetsAndReadings() {
         expect(fh.faultStreak == 0, "仅考核好扇且跟上 → 归零")
     }
 
+    // R25 起转宽限：71 场景——空闲停转（RPM0）→ 高目标，试探窗 risingGrace=false
+    // 下物理 RPM 爬升必须给宽限（不 fault）；恒 0 / 恒低速 / 升后停住仍 fault。
+    do {
+        // —— 71：起转序列，命令恒 4500；滞后窗内连续多拍（预 R25 会凑满阈值）——
+        // ramp 故意保持在 lagging 区（actual < 4500-1575≈2925）足够多拍，
+        // 使删除 rpmRising 宽限时单测即红，不依赖引擎场景兜底。
+        var fh = FanFeedbackHealth()
+        let ramp = [0.0, 200, 400, 600, 800, 1000, 1200, 1600, 2000, 2500, 2800, 3200, 4000, 4500]
+        let cmd = [0: 4500.0]
+        fh.record(states: [FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
+                  commandedRPM: cmd)
+        for rpm in ramp.dropFirst() {
+            fh.record(states: [FanState(id: 0, actualRPM: rpm, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
+                      commandedRPM: cmd, risingGrace: false)
+            expect(!fh.faulted, "71 起转中 RPM=\(Int(rpm)) 不得 fault（预 R25 在滞后窗会累计 mismatch）")
+        }
+        expect(!fh.faulted && fh.consecutiveFailures == 0, "71 场景：整段斜坡无故障残留")
+    }
+    do {
+        // —— 试探窗：RPM 物理爬升给宽限（risingGrace=false）——
+        var fh = FanFeedbackHealth()
+        let cmd = [0: 4500.0]
+        func frame(_ rpm: Double, grace: Bool) {
+            fh.record(states: [FanState(id: 0, actualRPM: rpm, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
+                      commandedRPM: cmd, risingGrace: grace)
+        }
+        frame(2000, grace: true)   // 热身
+        for rpm in [2400.0, 2800, 3200, 3600, 4000, 4400] {
+            frame(rpm, grace: false)
+            expect(!fh.faulted, "试探窗 RPM 上升=\(Int(rpm)) 不 fault")
+        }
+    }
+    do {
+        // —— 真停转：恒 0，高目标，risingGrace=false ——
+        var fh = FanFeedbackHealth()
+        let dead = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [dead], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [dead], commandedRPM: cmd, risingGrace: false)
+        }
+        expect(fh.faulted, "真停转：RPM 恒 0 无上升 → 仍 fault")
+    }
+    do {
+        // —— 卡死低速：恒 500，目标 4000，无上升，risingGrace=false ——
+        var fh = FanFeedbackHealth()
+        let stuck = FanState(id: 0, actualRPM: 500, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [stuck], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [stuck], commandedRPM: cmd, risingGrace: false)
+        }
+        expect(fh.faulted, "卡死低速：恒 RPM 无上升 → 仍 fault")
+    }
+    do {
+        // —— 升后停住：0→300→600→600… 停止上升后应 fault ——
+        var fh = FanFeedbackHealth()
+        let cmd = [0: 4000.0]
+        func frame(_ rpm: Double) {
+            fh.record(states: [FanState(id: 0, actualRPM: rpm, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)],
+                      commandedRPM: cmd, risingGrace: false)
+        }
+        frame(0)
+        frame(300); frame(600)   // 爬升中，不 fault
+        expect(!fh.faulted, "升后停住：爬升拍不 fault（前置）")
+        for _ in 0..<FanFeedbackHealth.faultThreshold { frame(600) }
+        expect(fh.faulted, "升后停住：停止上升后按阈值 fault")
+    }
+    do {
+        // —— 试探窗恒 RPM 滞后（非起转）仍必须可探测 ——
+        var fh = FanFeedbackHealth()
+        let st = FanState(id: 0, actualRPM: 2000, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)
+        let cmd = [0: 4500.0]
+        fh.record(states: [st], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [st], commandedRPM: cmd, risingGrace: false)
+        }
+        expect(fh.faulted, "试探窗：RPM 恒定且滞后（无起转斜坡）→ 仍 fault")
+    }
+    do {
+        // —— 停转→起转中 matched 归零 streak：fault 后起转跟上应清 streak ——
+        var fh = FanFeedbackHealth()
+        let dead = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [dead], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [dead], commandedRPM: cmd)
+        }
+        expect(fh.faulted && fh.faultStreak == 1, "前置：真停转 fault")
+        for _ in 0..<3 { fh.record(states: [dead], commandedRPM: [:]) }
+        expect(!fh.faulted, "自解路径仍保留")
+        // 重新高目标且 RPM 真跟上 → streak 归零
+        let good = FanState(id: 0, actualRPM: 4000, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        fh.record(states: [good], commandedRPM: cmd, risingGrace: false)
+        expect(fh.faultStreak == 0, "确认跟随后 streak 归零（R24c 语义未破）")
+    }
+
     // controlFault 字段往返 + 旧 status 兼容
     do {
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601

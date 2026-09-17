@@ -241,15 +241,21 @@ public struct WriteHealth: Equatable {
 //      坏风扇重接管频率指数下降；确认真实跟随（非 faulted 且所有高目标风扇均 matched）即归零。
 //      R24c：streak 归零从「任一风扇 matched（OR）」改为「全部高目标风扇 matched（AND）」——
 //      否则一坏一好机上健康扇会顶掉坏扇的退避，振荡抑制被静默削弱。
+// R25 起转宽限：actualRPM < 100 不再无条件 mismatch——若相对上拍上升超过 spinUpDeltaRPM，
+//      视为物理起转中（空闲停转→负载爬升），与真停转区分；滞后路径同样接受 RPM 斜坡为
+//      响应证据（即使试探窗 risingGrace=false）。恒 <100 / 恒低速不升 / 升后停住仍 fault。
 public struct FanFeedbackHealth: Equatable {
     public static let faultThreshold = 5
     public static let recoverThreshold = 3      // 故障后连续匹配/交还拍数（首次故障的基准）
+    /// 起转判定：actualRPM 较上拍上升超过该值 → 物理在爬升，不判停转/不因滞后计 mismatch。
+    public static let spinUpDeltaRPM: Double = 50
     static let recoverMaxShift = 4              // 连续故障退避上限：3<<4=48 拍
     public private(set) var consecutiveFailures = 0
     public private(set) var faulted = false
     public private(set) var faultStreak = 0     // 连续故障次数（每多一次，解除所需拍数翻倍）
     private var recoverCount = 0
     private var lastCommanded: [Int: Double] = [:]
+    private var lastActualRPM: [Int: Double] = [:]
     // v2.6.2 启动宽限：daemon 重启后首拍 lastCommanded 为空，升速宽限失效，
     // 从 auto 接管到新目标时风扇爬升会被误判故障——首拍只记录命令不计数
     private var warmedUp = false
@@ -269,36 +275,42 @@ public struct FanFeedbackHealth: Equatable {
             warmedUp = true
             for st in states {
                 if let cmd = commandedRPM[st.id] { lastCommanded[st.id] = cmd }
+                lastActualRPM[st.id] = st.actualRPM
             }
             return
         }
         var mismatch = false
         var highTargetCount = 0     // 本拍被高目标命令的风扇数
-        var matchedCount = 0        // 其中确认在跟随的个数（含升速追赶中）
+        var matchedCount = 0        // 其中确认在跟随的个数（含升速/起转追赶中）
         for st in states {
             guard let target = commandedRPM[st.id] else { continue }
             guard target > st.minRPM + 150 else { continue }
             highTargetCount += 1
-            let stalled = st.actualRPM < 100
-            if stalled {
-                mismatch = true
+            let rpmRising = lastActualRPM[st.id]
+                .map { st.actualRPM > $0 + Self.spinUpDeltaRPM } ?? false
+            if st.actualRPM < 100 {
+                // R25：真停转 = 低于 100 且相对上拍未在爬升；起转中给宽限
+                if rpmRising { matchedCount += 1 } else { mismatch = true }
                 continue
             }
             let lagging = abs(st.actualRPM - target) > max(300, target * 0.35)
             if lagging {
                 // 升速宽限：本拍目标高于上拍 → 风扇在物理追赶中，滞后不判故障。
                 // daemon 的故障试探验证期传 risingGrace: false——probe 目标通常高于
-                // 旧值，若仍宽限则验证永远"通过"，探测不到真实故障
-                let rising = risingGrace && (lastCommanded[st.id].map { target > $0 + 50 } ?? false)
-                if !rising { mismatch = true }
-                else { matchedCount += 1 }   // 升速追赶中 = 在响应，算跟随证据
+                // 旧值，若仍宽限则验证永远"通过"，探测不到真实故障。
+                // R25：物理 RPM 斜坡（rpmRising）在试探窗内同样算响应——活风扇在爬升
+                // 与死风扇恒低速可分；命令侧 risingGrace 语义保持不变。
+                let cmdRising = risingGrace && (lastCommanded[st.id].map { target > $0 + 50 } ?? false)
+                if cmdRising || rpmRising { matchedCount += 1 }
+                else { mismatch = true }
             } else {
                 matchedCount += 1            // 高目标且未滞后未停转 = 确实跟上
             }
         }
-        // 记录本拍命令（无命令的交还期保留旧值，重新接管时首拍目标高于旧值会走宽限）
+        // 记录本拍命令/RPM（无命令的交还期保留旧命令基线；RPM 基线每拍刷新）
         for st in states {
             if let cmd = commandedRPM[st.id] { lastCommanded[st.id] = cmd }
+            lastActualRPM[st.id] = st.actualRPM
         }
         if mismatch {
             consecutiveFailures += 1
@@ -326,7 +338,7 @@ public struct FanFeedbackHealth: Equatable {
             }
         }
     }
-    /// 仅更新命令基线（fastConfigApply 拍专用，不计 mismatch）：
+    /// 仅更新命令/RPM 基线（fastConfigApply 拍专用，不计 mismatch）：
     /// 拖动滑块时 App 每秒可写十余次 config，30ms 防抖后连发 fast apply 拍——
     /// shape/slew 的 6-8%/拍 限速是"每次调用"语义，数百 ms 内目标即可走完全程，
     /// 而实际 RPM 物理回落需 1-3s。若在 fast 拍上照常计 mismatch，快速下拖会
@@ -335,6 +347,7 @@ public struct FanFeedbackHealth: Equatable {
     public mutating func recordCommandOnly(states: [FanState], commandedRPM: [Int: Double]) {
         for st in states {
             if let cmd = commandedRPM[st.id] { lastCommanded[st.id] = cmd }
+            lastActualRPM[st.id] = st.actualRPM
         }
     }
 }
