@@ -1,14 +1,25 @@
 ---
 feature: r25-stall-spinup-grace
-status: in-progress
+status: delivered
 updated: 2026-09-17
 branch: compose/r25-stall-spinup
-commits: 79c5c4a..<head>
+commits: 79c5c4a..9aac9eb
 ---
 
 # R25 起转宽限（stalled 判据：RPM 上升不判停转）
 
 ## Report
+
+**What was built** — `FanFeedbackHealth` 增加物理起转宽限：`lastActualRPM` + `spinUpDeltaRPM=50`。高目标风扇若 `actualRPM` 较上拍上升超过 50，则不判 stalled，滞后路径在试探窗（`risingGrace=false`）下同样把 RPM 斜坡计为响应证据。恒 <100、恒低速不升、升后停住仍按原语义 fault。R24b 自解永在 / streak 3→6→12→24→48 / R24c AND 归零一律未动。版本载体 4.1.3(76)。
+
+**Verification** — `swift run -c release --disable-sandbox fanctltests` → PASS **4592 断言 / 76 组**；`swift build -c release --disable-sandbox --target fanctld --target fanprobe --target SMCCore` → PASS（仅既有 ThermalLearn unused-var 警告）。独立审查（general-1，diff `79c5c4a..9aac9eb`）：Spec compliance 6/6 PASS、Correctness 无 critical、Codebase consistency 无阻塞 → **PASS-WITH-NOTES**。F1（单测 71 原 ramp 预 R25 只累计 4 拍 mismatch、单测门偏弱）已修：ramp 拉长为滞后窗内 200…2800 连续爬升 + 逐步 `expect(!faulted)`，并补独立试探窗 rising RPM 用例。
+
+**Journey log** —
+1. Grill 钉死方向：不采用「试探窗全面 risingGrace」（削弱真故障探测）与时间基宽限；只做 RPM 斜坡证据。71 真机教训的正确补丁是区分物理响应，不是收紧或删除自解。
+2. 审查证明引擎场景 12 才是预 R25 的真门：85°C balanced 首拍即写满速（smooth 冷启动=raw、shape 首写无限速），旧实现在恒高目标下 stall+4 拍滞后共 5 拍 mismatch → controlFault。单测若 ramp 太短会在进入非滞后区后 `consecutiveFailures` 归零，给出虚假安全感。
+3. `lastActualRPM` 必须三条路径都写：热身拍、`record` 评估后全量、`recordCommandOnly`——漏任一条会关掉宽限或留下陈旧基线。
+4. Family 清洁路径假故障风险只会下降（只增宽限）；停转注入恒 0 无上升仍被抓住。
+5. 真机 dogfood（4.2-A）仍开放：本机 App 仍停在 4.1.3(72)，需部署 76 后观察空闲↔负载时 controlFault 是否从误报变为少报/不报。
 
 ## [S1] Problem
 
@@ -93,9 +104,9 @@ R24b spec 已将「起转中 vs 真停转」列为 Out of Scope；本 feature �
 
 ## Tasks
 
-- [ ] T1: `FanFeedbackHealth` 实现 `lastActualRPM` + `spinUpDeltaRPM` 起转宽限 — acceptance: 契约 S2 路径全覆盖；既有 FanFeedbackHealth 单测不改语义仍绿 (covers: S2)
-- [ ] T2: 单测——71 起转序列不 fault；恒 0 / 恒低速 / 升后停住仍 fault；试探窗 `risingGrace:false` 下 RPM 上升给宽限、恒 RPM 滞后仍 fault — acceptance: main.swift 新增用例全过 (covers: S2)
-- [ ] T3: 引擎场景——空闲 RPM0 → 负载/高目标 → RPM 爬升，controlFault 不应被打上；坏扇恒 0 场景 11 仍通过 — acceptance: TestsEngine 新增/扩展场景过；场景 11 保持 (covers: S2)
-- [ ] T4: 族扫描清洁路径无新增 feedbackFaulted；停转成员仍 stallCaught — acceptance: TestsFamily 防御段通过 (covers: S2)
-- [ ] T5: 文档同步（Fans 注释 + README §5 + VERSION 76）— acceptance: 注释与实现一致 (covers: S2)
-- [ ] T6: `fanctltests` 全绿 + 非 UI release 编译 — acceptance: 断言/组数不低于契约下限；`fanctld`/`fanprobe`/`SMCCore` release 编译过 (covers: S2)
+- [x] T1: `FanFeedbackHealth` 实现 `lastActualRPM` + `spinUpDeltaRPM` 起转宽限 — acceptance: 契约 S2 路径全覆盖；既有 FanFeedbackHealth 单测不改语义仍绿 (covers: S2)
+- [x] T2: 单测——71 起转序列不 fault（滞后窗多拍逐步断言）；试探窗 rising RPM 独立用例；恒 0 / 恒低速 / 升后停住仍 fault — acceptance: main.swift 新增用例全过 (covers: S2)
+- [x] T3: 引擎场景——空闲 RPM0 → 负载/高目标 → RPM 爬升，controlFault 不应被打上；坏扇恒 0 场景 11 仍通过 — acceptance: TestsEngine 场景 12 过；场景 11 保持 (covers: S2)
+- [x] T4: 族扫描清洁路径无新增 feedbackFaulted；停转成员仍 stallCaught — acceptance: TestsFamily 防御段通过（套件内）(covers: S2)
+- [x] T5: 文档同步（Fans 注释 + README §5 + VERSION 76）— acceptance: 注释与实现一致 (covers: S2)
+- [x] T6: `fanctltests` 全绿 + 非 UI release 编译 — acceptance: 4592 断言 / 76 组；`fanctld`/`fanprobe`/`SMCCore` release 编译过 (covers: S2)

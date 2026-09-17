@@ -280,21 +280,34 @@ func testOffsetsAndReadings() {
     // R25 起转宽限：71 场景——空闲停转（RPM0）→ 高目标，试探窗 risingGrace=false
     // 下物理 RPM 爬升必须给宽限（不 fault）；恒 0 / 恒低速 / 升后停住仍 fault。
     do {
-        // —— 71：起转序列 0→200→500→1200→2500，命令恒高 ——
+        // —— 71：起转序列，命令恒 4500；滞后窗内连续多拍（预 R25 会凑满阈值）——
+        // ramp 故意保持在 lagging 区（actual < 4500-1575≈2925）足够多拍，
+        // 使删除 rpmRising 宽限时单测即红，不依赖引擎场景兜底。
         var fh = FanFeedbackHealth()
-        let ramp = [0.0, 200, 500, 1200, 2500, 4000]
+        let ramp = [0.0, 200, 400, 600, 800, 1000, 1200, 1600, 2000, 2500, 2800, 3200, 4000, 4500]
         let cmd = [0: 4500.0]
         fh.record(states: [FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
                   commandedRPM: cmd)
         for rpm in ramp.dropFirst() {
             fh.record(states: [FanState(id: 0, actualRPM: rpm, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
                       commandedRPM: cmd, risingGrace: false)
+            expect(!fh.faulted, "71 起转中 RPM=\(Int(rpm)) 不得 fault（预 R25 在滞后窗会累计 mismatch）")
         }
-        expect(!fh.faulted, "71 场景：起转斜坡（RPM 上升）不判停转/不因滞后 fault")
-        // 跟上后保持健康
-        fh.record(states: [FanState(id: 0, actualRPM: 4500, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
-                  commandedRPM: cmd, risingGrace: false)
-        expect(!fh.faulted && fh.consecutiveFailures == 0, "跟上后无故障残留")
+        expect(!fh.faulted && fh.consecutiveFailures == 0, "71 场景：整段斜坡无故障残留")
+    }
+    do {
+        // —— 试探窗：RPM 物理爬升给宽限（risingGrace=false）——
+        var fh = FanFeedbackHealth()
+        let cmd = [0: 4500.0]
+        func frame(_ rpm: Double, grace: Bool) {
+            fh.record(states: [FanState(id: 0, actualRPM: rpm, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
+                      commandedRPM: cmd, risingGrace: grace)
+        }
+        frame(2000, grace: true)   // 热身
+        for rpm in [2400.0, 2800, 3200, 3600, 4000, 4400] {
+            frame(rpm, grace: false)
+            expect(!fh.faulted, "试探窗 RPM 上升=\(Int(rpm)) 不 fault")
+        }
     }
     do {
         // —— 真停转：恒 0，高目标，risingGrace=false ——
