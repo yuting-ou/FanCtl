@@ -163,6 +163,12 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R26（4.1.3(77) 细节打磨）：战报温度门 + powermetrics 日志诚实化 + 包络观察关闭
+- **数据驱动选题（真机 76 dogfood 快照）**：①学习表 trusted 桶**无**非单调污染（更高温桶输出未显著更低）——4.2-B 关闭，gap=2.09 是冷启动双峰重建非污染，**不手术**；②日志见 powermetrics 反复「连续 1 次」失败（信息量与实现颠倒：首败才打日志、真过期反而静默）；③今日战报 maxTemp≈101.9°C（05:59Z）——控制路径红线另算，但曲线优化器吃 stats 分位数，坏点会污染底座。
+- **StatsSampler 温度合理性门**：`tempPlausible` = 有限且 (0,125]°C；门外跳过 maxTemp/高温秒/直方图/均温分母，功耗/转数/调速计数照旧。单测锁门外读数不抬峰值、不进分母、转数仍计。
+- **PowerCompositionSampler 日志**：只在「双侧连续 3 次失败 → 分项过期」边沿打日志，恢复时打恢复条；删除首败「连续 1 次」误导文案。静默降级可以，静默失效不可以——但**日志应对准失效边沿**。
+- **验证**：fanctltests 全绿（工作树）；安装走 osascript 提权（用户无终端）。
+
 ### R25-L2（4.1.3(76) 真机已装 + 变异测试门）：对抗式审查第一层落地
 - **升级**：osascript `administrator privileges` 把产物装到 /tmp 后安装（Documents 下 elevatd shell 被 TCC 拒：`Operation not permitted`）。真机 App+daemon 均为 **4.1.3(76)**，fanctld pid 已换新。验收快照：`controlFault=None`，但 fans `targetRPM≈3k` / `actualRPM=0`——正是 R25 目标场景（高目标+停转中），**未见假 controlFault**（dogfood 观察窗仍开放）。
 - **L2 定向变异（基线 main@37d22f6，套件 4592→补测后 4595）**：

@@ -17,7 +17,7 @@ final class PowerCompositionSampler {
     private var consecutiveFailures = 0
     private var cpuNilStreak = 0         // 单侧连续无有效读数计数（GPU 空载报 0 mW 是
     private var gpuNilStreak = 0         // 常态，旧高值不应无限期滞留污染前馈基线）
-    private var failureLogged = false    // 首次失败打一条日志：静默降级可以，静默失效不可以
+    private var feedforwardExpired = false // R26：双侧连续失败已过期（日志只报真实降级/恢复）
     private var interval: TimeInterval = 20
 
     // #6: 自适应采样间隔（高温/AI 模式 → 10s，idle → 60s，默认 20s）
@@ -39,25 +39,28 @@ final class PowerCompositionSampler {
                 DispatchQueue.global(qos: .utility).async { [weak self] in
                     guard let self else { return }
                     let (c, g) = Self.runPowermetrics()
-                    var shouldLogFailure = false
-                    var failureCount = 0
+                    var logEvent: String? = nil
                     self.lock.lock()
                     if c == nil && g == nil {
                         self.consecutiveFailures += 1
+                        // R26：真正需要日志的是「分项前馈不可用」的边沿，不是单次采样噪声。
+                        // 旧实现只在 streak 首败打「连续 1 次」，过期时反而静默——文案与
+                        // 信息量颠倒。连续 3 次双侧失败才让旧值过期并记一条。
                         if self.consecutiveFailures >= 3 {
-                            // 连续失败 3 次后让旧值过期：避免恢复后首个样本产生
-                            // 跨长时间窗的假增量（AI 分项前馈误触发）
                             self.cpuPower = nil
                             self.gpuPower = nil
-                        }
-                        if !self.failureLogged {
-                            self.failureLogged = true
-                            shouldLogFailure = true
-                            failureCount = self.consecutiveFailures
+                            if !self.feedforwardExpired {
+                                self.feedforwardExpired = true
+                                logEvent = "powermetrics 连续 \(self.consecutiveFailures) 次采样失败，分项功耗已过期，分项前馈降级"
+                            }
                         }
                     } else {
+                        let recovered = self.feedforwardExpired
                         self.consecutiveFailures = 0
-                        self.failureLogged = false
+                        self.feedforwardExpired = false
+                        if recovered {
+                            logEvent = "powermetrics 分项功耗采样恢复，分项前馈重新可用"
+                        }
                     }
                     // 单侧过期：某侧连续 3 次无有效读数（量化 0/解析失败）即弃用旧值。
                     // 若只靠双侧同时失败，空载 GPU 的陈旧高值会滞留数小时——
@@ -78,9 +81,7 @@ final class PowerCompositionSampler {
                     }
                     self.samplingInFlight = false
                     self.lock.unlock()
-                    if shouldLogFailure {
-                        log("powermetrics 分项功耗采样失败（连续 \(failureCount) 次），分项前馈不可用")
-                    }
+                    if let logEvent { log(logEvent) }
                 }
             }
         }

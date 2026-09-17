@@ -933,6 +933,24 @@ func testStatsSampler() {
     _ = w.record(temp: 90, totalRPM: 0, seconds: 3, now: Date())
     expectClose(w.stats.avgTemp, 85, 1e-9, "秒加权均温 (70×1+90×3)/4")
 
+    // R26：温度类累计物理合理性门——坏点不得进 maxTemp/直方图/均温分母
+    expect(StatsSampler.tempPlausible(85), "85° 合理")
+    expect(!StatsSampler.tempPlausible(.nan), "NaN 门外")
+    expect(!StatsSampler.tempPlausible(.infinity), "Inf 门外")
+    expect(!StatsSampler.tempPlausible(0), "0° 门外")
+    expect(!StatsSampler.tempPlausible(-5), "负温门外")
+    expect(!StatsSampler.tempPlausible(200), ">125° 门外")
+    var gp = StatsSampler(now: Date())
+    _ = gp.record(temp: 80, totalRPM: 1000, seconds: 3, now: Date())
+    _ = gp.record(temp: 1e300, totalRPM: 1000, seconds: 3, now: Date())
+    _ = gp.record(temp: .nan, totalRPM: 1000, seconds: 3, now: Date())
+    _ = gp.record(temp: 200, totalRPM: 1000, seconds: 3, now: Date())
+    expectEqual(gp.stats.maxTemp, 80, "门外读数不抬升当日峰值")
+    expectEqual(gp.stats.tempCount, 1, "门外读数不进均温分母")
+    expectClose(gp.stats.revolutions, 200, 1e-9, "门外读数仍计转数（4×1000RPM×3s/60）")
+    expect(gp.stats.tempHistogram?[TempHistogram.bucketIndex(for: 80)] == 3,
+           "直方图仅含合理读数秒数")
+
     // 跨天：返回前一天战报供归档，新账从零开始
     let future = now.addingTimeInterval(25 * 3600)
     let day2 = DailyStats.dayString(for: future)
