@@ -163,6 +163,14 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R25（4.1.3(76)）：起转宽限——stalled 判据区分「起转中」与「真停转」
+- **形态**：compose-next（`docs/compose/spec/r25-stall-spinup-grace.md`）。Grill 方向：RPM 上升即不判 stalled/不计 mismatch；**不**做试探窗全面 risingGrace（削弱真故障探测）、**不**做时间基宽限。
+- **设计**：`FanFeedbackHealth.lastActualRPM` + `spinUpDeltaRPM=50`。高目标风扇若 `actualRPM` 较上拍上升 >50 → 不算 stalled；滞后路径在 `risingGrace=false`（试探窗）下同样把 RPM 斜坡计为响应。恒 <100 / 恒低速不升 / 升后停住仍 fault。R24b 自解、streak 3→48、R24c AND 归零一律未动。
+- **动机**：71 真机证伪后 R24b 只保证「假故障可自解」，空闲停转→负载起转仍会误打 controlFault（交还、学习中断、噪声）。根因是 stalled 与 lagging 在试探窗内无法区分物理爬升与真死扇。
+- **测试有效性（审查 F1 收口）**：初版单测 71 ramp（200→4000）在预 R25 下只累计 4 拍 mismatch 后进入非滞后区、`consecutiveFailures` 归零——删宽限单测仍绿。审查指出后把 ramp 拉进滞后窗（200…2800）逐步 `expect(!faulted)`，并补独立试探窗 rising RPM 用例。**引擎场景 12 才是真门**：85°C balanced 首拍即满速（smooth 冷启动=raw、shape 首写无限速），旧实现恒高目标下 stall+4 拍滞后共 5 拍 → controlFault。
+- **验证**：fanctltests **4592 断言 / 76 组全绿**；非 UI release 编译过；独立审查 PASS-WITH-NOTES、无 critical。`lastActualRPM` 三路径齐写（热身/record 后全量/recordCommandOnly）。
+- **元经验**：① 单测「不 fault」若 ramp 太短会在滞后窗结束后被「跟上」清零计数，必须让有害帧数 ≥ faultThreshold 才构成回归门；② 控制律类改动的审查要问「删除本改动后哪些测试会红」——绿套件本身不能证明门有效；③ 4.2-A dogfood 仍开放：真机此前停在 72，合并 76 后才谈部署观察。
+
 ### R24d（4.1.3(75)）：root 脚本门禁可测化——upgrade.sh/install.sh 零测试债务收口
 - **动机**：R23 P1-A（tag 带 v → 一键升级 100% exit 3）8 个 Swift 断言全绿仍漏，根因是 shell 层零覆盖；R23 续轮点名「root 脚本纯 shell 逻辑零测试」为基建债。
 - **实现**：`upgrade.sh` 加 `FANCTL_TEST_GATES_ONLY=1`（跳过 EUID，只跑授权前门禁后 exit 0，不碰 launchctl/系统路径）；`install.sh` 抽 `fanctl_config_perm_safe` + `FANCTL_TEST_CONFIG_GUARD=1`。`scripts/test-root-scripts.sh` 21 条：暂存完整性 exit2、P1-A v 前缀 exit3、版本不符、sha256 双侧+偷换 TOCTOU、marker 符号链接 exit4+victim 不截断、config 符号链接/悬空/缺失谓词、内联 `! -L` 静态锁、bootstrap 失败致命。由 fanctltests `testRootScriptGates` 以 Process 调起（断言 ≥15 用例、失败数 0，防脚本被掏空）。
