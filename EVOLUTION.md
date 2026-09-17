@@ -163,6 +163,20 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R25-L2（4.1.3(76) 真机已装 + 变异测试门）：对抗式审查第一层落地
+- **升级**：osascript `administrator privileges` 把产物装到 /tmp 后安装（Documents 下 elevatd shell 被 TCC 拒：`Operation not permitted`）。真机 App+daemon 均为 **4.1.3(76)**，fanctld pid 已换新。验收快照：`controlFault=None`，但 fans `targetRPM≈3k` / `actualRPM=0`——正是 R25 目标场景（高目标+停转中），**未见假 controlFault**（dogfood 观察窗仍开放）。
+- **L2 定向变异（基线 main@37d22f6，套件 4592→补测后 4595）**：
+  | 变异体 | 结果 | 杀手 |
+  |---|---|---|
+  | M1 stall 路径去掉 rpmRising | 初版 **SURVIVED** → 补「停转区 0→80」用例后 **KILLED** | 新单测 |
+  | M2 lagging 路径去掉 rpmRising | KILLED | 引擎场景 12 |
+  | M3 recordCommandOnly 不写 lastActualRPM | KILLED | 升后停住 fault |
+  | M4 热身拍不写 lastActualRPM | 初版 **SURVIVED** → 与 M1 同门 **KILLED** | 新单测 |
+  | M5 spinUpDeltaRPM=10000（永不宽限） | KILLED | 引擎场景 12 |
+  | M6 rpmRising 语义反转 | KILLED | 族扫描真停转捕获 |
+- **净分：6/6 变异体被杀**（补测后）。教训：**「删除本改动后哪些测试会红」是控制律 PR 的必答题**；M1/M4 存活说明「有 71 场景单测」≠「stalled/热身路径有门」。
+- **对抗式审查策略（升级后）**：不做第四轮全库静态扫（边际 < ε）。三层 = L1 真机 dogfood 预注册裁决（主闸门）+ L2 变异门（本轮已闭环）+ L3 等真机数据后再审 23..R25 交互面。
+
 ### R25（4.1.3(76)）：起转宽限——stalled 判据区分「起转中」与「真停转」
 - **形态**：compose-next（`docs/compose/spec/r25-stall-spinup-grace.md`）。Grill 方向：RPM 上升即不判 stalled/不计 mismatch；**不**做试探窗全面 risingGrace（削弱真故障探测）、**不**做时间基宽限。
 - **设计**：`FanFeedbackHealth.lastActualRPM` + `spinUpDeltaRPM=50`。高目标风扇若 `actualRPM` 较上拍上升 >50 → 不算 stalled；滞后路径在 `risingGrace=false`（试探窗）下同样把 RPM 斜坡计为响应。恒 <100 / 恒低速不升 / 升后停住仍 fault。R24b 自解、streak 3→48、R24c AND 归零一律未动。

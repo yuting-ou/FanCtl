@@ -310,6 +310,22 @@ func testOffsetsAndReadings() {
         }
     }
     do {
+        // —— 停转区起转：actual<100 且上升 → 必须宽限（杀 M1/M4）——
+        // 热身在 0；下一拍 80（+80>50）仍在停转区：无宽限/热身未记 RPM 都会 mismatch。
+        var fh = FanFeedbackHealth()
+        let cmd = [0: 4000.0]
+        fh.record(states: [FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)],
+                  commandedRPM: cmd)
+        expect(fh.consecutiveFailures == 0, "热身拍不计数（前置）")
+        fh.record(states: [FanState(id: 0, actualRPM: 80, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)],
+                  commandedRPM: cmd, risingGrace: false)
+        expect(!fh.faulted && fh.consecutiveFailures == 0,
+               "停转区起转 0→80：stalled 宽限生效且热身 RPM 基线可用（M1/M4 变异体会挂此断言）")
+        fh.record(states: [FanState(id: 0, actualRPM: 200, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)],
+                  commandedRPM: cmd, risingGrace: false)
+        expect(!fh.faulted, "0→80→200 继续爬升仍不 fault")
+    }
+    do {
         // —— 真停转：恒 0，高目标，risingGrace=false ——
         var fh = FanFeedbackHealth()
         let dead = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
