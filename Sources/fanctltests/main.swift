@@ -277,6 +277,90 @@ func testOffsetsAndReadings() {
         expect(fh.faultStreak == 0, "仅考核好扇且跟上 → 归零")
     }
 
+    // R25 起转宽限：71 场景——空闲停转（RPM0）→ 高目标，试探窗 risingGrace=false
+    // 下物理 RPM 爬升必须给宽限（不 fault）；恒 0 / 恒低速 / 升后停住仍 fault。
+    do {
+        // —— 71：起转序列 0→200→500→1200→2500，命令恒高 ——
+        var fh = FanFeedbackHealth()
+        let ramp = [0.0, 200, 500, 1200, 2500, 4000]
+        let cmd = [0: 4500.0]
+        fh.record(states: [FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
+                  commandedRPM: cmd)
+        for rpm in ramp.dropFirst() {
+            fh.record(states: [FanState(id: 0, actualRPM: rpm, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
+                      commandedRPM: cmd, risingGrace: false)
+        }
+        expect(!fh.faulted, "71 场景：起转斜坡（RPM 上升）不判停转/不因滞后 fault")
+        // 跟上后保持健康
+        fh.record(states: [FanState(id: 0, actualRPM: 4500, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)],
+                  commandedRPM: cmd, risingGrace: false)
+        expect(!fh.faulted && fh.consecutiveFailures == 0, "跟上后无故障残留")
+    }
+    do {
+        // —— 真停转：恒 0，高目标，risingGrace=false ——
+        var fh = FanFeedbackHealth()
+        let dead = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [dead], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [dead], commandedRPM: cmd, risingGrace: false)
+        }
+        expect(fh.faulted, "真停转：RPM 恒 0 无上升 → 仍 fault")
+    }
+    do {
+        // —— 卡死低速：恒 500，目标 4000，无上升，risingGrace=false ——
+        var fh = FanFeedbackHealth()
+        let stuck = FanState(id: 0, actualRPM: 500, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [stuck], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [stuck], commandedRPM: cmd, risingGrace: false)
+        }
+        expect(fh.faulted, "卡死低速：恒 RPM 无上升 → 仍 fault")
+    }
+    do {
+        // —— 升后停住：0→300→600→600… 停止上升后应 fault ——
+        var fh = FanFeedbackHealth()
+        let cmd = [0: 4000.0]
+        func frame(_ rpm: Double) {
+            fh.record(states: [FanState(id: 0, actualRPM: rpm, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)],
+                      commandedRPM: cmd, risingGrace: false)
+        }
+        frame(0)
+        frame(300); frame(600)   // 爬升中，不 fault
+        expect(!fh.faulted, "升后停住：爬升拍不 fault（前置）")
+        for _ in 0..<FanFeedbackHealth.faultThreshold { frame(600) }
+        expect(fh.faulted, "升后停住：停止上升后按阈值 fault")
+    }
+    do {
+        // —— 试探窗恒 RPM 滞后（非起转）仍必须可探测 ——
+        var fh = FanFeedbackHealth()
+        let st = FanState(id: 0, actualRPM: 2000, minRPM: 1000, maxRPM: 5000, targetRPM: 4500)
+        let cmd = [0: 4500.0]
+        fh.record(states: [st], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [st], commandedRPM: cmd, risingGrace: false)
+        }
+        expect(fh.faulted, "试探窗：RPM 恒定且滞后（无起转斜坡）→ 仍 fault")
+    }
+    do {
+        // —— 停转→起转中 matched 归零 streak：fault 后起转跟上应清 streak ——
+        var fh = FanFeedbackHealth()
+        let dead = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [dead], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [dead], commandedRPM: cmd)
+        }
+        expect(fh.faulted && fh.faultStreak == 1, "前置：真停转 fault")
+        for _ in 0..<3 { fh.record(states: [dead], commandedRPM: [:]) }
+        expect(!fh.faulted, "自解路径仍保留")
+        // 重新高目标且 RPM 真跟上 → streak 归零
+        let good = FanState(id: 0, actualRPM: 4000, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        fh.record(states: [good], commandedRPM: cmd, risingGrace: false)
+        expect(fh.faultStreak == 0, "确认跟随后 streak 归零（R24c 语义未破）")
+    }
+
     // controlFault 字段往返 + 旧 status 兼容
     do {
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
