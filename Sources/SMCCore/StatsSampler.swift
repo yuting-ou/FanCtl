@@ -29,6 +29,12 @@ public struct StatsSampler {
     /// 计入一个采样点（温度、总转速、采样时长、功耗、是否发生显著调速）。
     /// 若与当前统计跨天：先把前一天战报返回给调用方归档，再以新日期开账；
     /// 返回值 nil 表示同一天。
+    ///
+    /// R26：温度类累计（峰值/直方图/均温分母）只收物理合理读数
+    /// （有限且 (0, 125]°C，与传感器发现层 1...120 同量级并留边界）。
+    /// 真机战报曾出现 maxTemp≈101.9 的边角读数——控制路径 failsafe 用 rawTemp
+    /// 另有红线，但曲线优化器吃 stats 分位数，坏点会直接污染学习底座。
+    /// 门外跳过温度累计；功耗/转数/调速/循环抑制等计数照旧。
     @discardableResult
     public mutating func record(temp: Double, totalRPM: Double,
                                 seconds: Double, now: Date,
@@ -43,19 +49,21 @@ public struct StatsSampler {
             archived = stats
             stats = DailyStats(date: day)
         }
-        if temp > stats.maxTemp {
-            stats.maxTemp = temp
-            stats.maxTempAt = now
+        if StatsSampler.tempPlausible(temp) {
+            if temp > stats.maxTemp {
+                stats.maxTemp = temp
+                stats.maxTempAt = now
+            }
+            if temp >= 80 { stats.highTempSeconds += seconds }
+            // v2.6.2:温度按秒加权累计(与直方图/avgPower 同一时间口径)。
+            // 此前 tempSum 每拍 +temp、tempCount 每拍 +1,自适应间隔(1~20s)下
+            // 均温被高频采样时段等权扭曲
+            stats.tempSum += temp * seconds
+            stats.tempCount += 1
+            stats.tempSeconds += seconds
+            // 温度分布直方图：AI 曲线优化的数据底座（按 2°C 桶累计秒数）
+            stats.addTempSample(temp, seconds: seconds)
         }
-        if temp >= 80 { stats.highTempSeconds += seconds }
-        // v2.6.2:温度按秒加权累计(与直方图/avgPower 同一时间口径)。
-        // 此前 tempSum 每拍 +temp、tempCount 每拍 +1,自适应间隔(1~20s)下
-        // 均温被高频采样时段等权扭曲
-        stats.tempSum += temp * seconds
-        stats.tempCount += 1
-        stats.tempSeconds += seconds
-        // 温度分布直方图：AI 曲线优化的数据底座（按 2°C 桶累计秒数）
-        stats.addTempSample(temp, seconds: seconds)
         // 功耗分布直方图（v3.3）：负载分布与曲线无关，优化器功耗锚定的数据底座
         stats.addPowerSample(powerWatts ?? 0, seconds: seconds)
         stats.revolutions += totalRPM * seconds / 60
@@ -75,5 +83,10 @@ public struct StatsSampler {
         // 过冲峰值（v3.2：当日温度超出 AI 有效目标的最大值，τ 自适应的数据门槛）
         if let o = overshoot, o.isFinite, o > stats.overshootPeak { stats.overshootPeak = o }
         return archived
+    }
+
+    /// 战报温度采样是否物理合理（R26）。
+    public static func tempPlausible(_ temp: Double) -> Bool {
+        temp.isFinite && temp > 1.0 && temp <= 125.0
     }
 }
