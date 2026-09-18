@@ -1,6 +1,10 @@
 {
   "schemaVersion": 1,
   "label": "tests",
+<<<<<<< HEAD
   "message": "4616 assertions",
+=======
+  "message": "4562 assertions",
+>>>>>>> origin/main
   "color": "success"
 }
