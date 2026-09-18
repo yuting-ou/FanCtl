@@ -1235,7 +1235,10 @@ public final class ControlEngine {
             // v3.8 硬件画像：启动时采集一次，恒定下发
             hardwareProfile: hardwareProfile,
             // 4.0 B2 冷启动校准：观察期标记（App 显示"校准中"而非误导性的自动调速）
-            calibrating: calibrating ? true : nil
+            calibrating: calibrating ? true : nil,
+            thermalModelUsable: thermalModel.isMature,
+            thermalModelB: thermalModel.b,
+            thermalModelSamples: thermalModel.sampleCount
         )
 
         let summary = statusChangeSummary(status)

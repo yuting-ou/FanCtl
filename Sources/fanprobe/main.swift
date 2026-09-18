@@ -40,6 +40,19 @@ do {
     // AI 热经验学习进度
     if let learn = ConfigStore.loadLearn() {
         print("AI 热经验: \(learn.sampleTotal) 样本 / \(learn.learnedBucketCount) 个温度点")
+        // R31：生效查表（含 R27 单调包络）vs 桶 raw EMA——展示与控制可能不同
+        print("学习生效查表 percent(for:)（raw=同桶 samples≥min 的 EMA）:")
+        for t in [55.0, 65.0, 70.0, 73.0, 75.0, 80.0] {
+            let eff = learn.percent(for: t)
+            let effStr = eff.map { String(format: "%.0f%%", $0) } ?? "nil"
+            print(String(format: "  %.0f°C → %@", t, effStr))
+        }
+        let pts = learn.learnedPoints()
+        let rawParts = pts.filter { $0.samples >= ThermalLearn.minSamples }
+            .map { String(format: "%.0f°C:%.0f%%(n=%d)", $0.temp, $0.percent, $0.samples) }
+        if !rawParts.isEmpty {
+            print("  raw 采信桶: " + rawParts.joined(separator: " · "))
+        }
     } else {
         print("AI 热经验: 尚无数据")
     }
@@ -83,6 +96,13 @@ do {
     // v3.8 硬件画像（陌生机器 issue 首问）
     if let s = ConfigStore.loadStatus(), let hp = s.hardwareProfile {
         print("硬件画像: \(hp.oneLine)")
+    }
+    // R31：热模型诊断（status 下发；usable 与 predictedPercent 同门 b>2.5）
+    if let s = ConfigStore.loadStatus() {
+        if let usable = s.thermalModelUsable {
+            let b = s.thermalModelB.map { String(format: "%.2f", $0) } ?? "-"
+            print("热模型: \(usable ? "可用" : "不可用（预测回退查表）") | b=\(b) | 样本 \(s.thermalModelSamples ?? 0)")
+        }
     }
 } catch {
     print("SMC 访问失败: \(error)")

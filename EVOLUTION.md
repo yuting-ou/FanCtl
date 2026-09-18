@@ -163,6 +163,11 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R31（4.1.3(82) 观测）：status 热模型诊断 + fanprobe 生效查表
+- **背景**：R29/R30 已让 isMature 诚实、启动重置贴地模型；诊断仍要读磁盘 JSON。dt 账本受控仍 <7 天，形式确认未开。
+- **改动**：DaemonStatus 可选字段 thermalModelUsable/B/Samples（decodeIfPresent 兼容旧包）；ControlEngine 每拍下发；fanprobe 打印热模型可用性 + percent(for:) 生效查表与 raw 采信桶。
+- **决策不变**：磨损控制律延后；dogfood 继续。
+
 ### R30（4.1.3(81) 自主决策）：热模型卫生重置；磨损控制律明确延后
 - **真机采样（约 20×4s）**：loopInterval 为 3s/10s/20s 混合（AI 空闲已自动拉长），applied 可降到 0（交还）。**不支持**立刻为降 speedChanges 改 AI 死区/拍频——绝对次数受日间高拍时段影响，当前空闲拍并不密。
 - **决策**：批次 B 控制律（舒适带死区/更长拍）**延后**；先看 80/81 dogfood 与 `speedChangesPerMinute` 趋势。遵守失败账本与「无预注册不动控制律」。

@@ -433,6 +433,16 @@ func testOffsetsAndReadings() {
         let back = try dec.decode(DaemonStatus.self, from: try enc.encode(st))
         expect(back.controlFault == true, "controlFault 往返")
         expect(back.faultReason == .smcWriteFailed, "faultReason 往返")
+        // R31：热模型诊断字段可选往返；旧 status 无字段 → nil
+        let st2 = DaemonStatus(sensors: SensorReadings(cpuDie: 60, gpuDie: 50),
+                               mode: .ai, appliedPercent: 20, fans: [],
+                               thermalModelUsable: false, thermalModelB: 1.0, thermalModelSamples: 2576)
+        let enc2 = JSONEncoder(); enc2.dateEncodingStrategy = .iso8601
+        let dec2 = JSONDecoder(); dec2.dateDecodingStrategy = .iso8601
+        let back2 = try! dec2.decode(DaemonStatus.self, from: try! enc2.encode(st2))
+        expect(back2.thermalModelUsable == false && back2.thermalModelB == 1.0
+               && back2.thermalModelSamples == 2576, "热模型诊断字段往返")
+        expect(back.thermalModelUsable == nil, "旧 status 无热模型字段 → nil")
         expect(back.baseTargetPercent == nil && back.safetyFloorPercent == nil,
                "旧状态目标分解字段缺省兼容")
         let legacy = #"{"cpuTemp":70,"gpuTemp":55,"mode":"curve","appliedPercent":45,"fans":[],"timestamp":"2026-07-31T10:00:00Z"}"#.data(using: .utf8)!
