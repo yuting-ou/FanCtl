@@ -18,6 +18,8 @@ final class PowerCompositionSampler {
     private var cpuNilStreak = 0         // 单侧连续无有效读数计数（GPU 空载报 0 mW 是
     private var gpuNilStreak = 0         // 常态，旧高值不应无限期滞留污染前馈基线）
     private var feedforwardExpired = false // R26：双侧连续失败已过期（日志只报真实降级/恢复）
+    private var cpuHadValue = false      // R29：单侧日志只在「曾有值 → 过期」边沿打，空载 GPU 不刷屏
+    private var gpuHadValue = false
     private var interval: TimeInterval = 20
 
     // #6: 自适应采样间隔（高温/AI 模式 → 10s，idle → 60s，默认 20s）
@@ -67,25 +69,34 @@ final class PowerCompositionSampler {
                     // GPU 真实回落到 0 后再拉起时，rise 会拿陈旧基线算出假前馈。
                     if let c {
                         self.cpuPower = c
+                        self.cpuHadValue = true
                         self.cpuNilStreak = 0
                     } else {
                         self.cpuNilStreak += 1
                         if self.cpuNilStreak == 3 {
                             self.cpuPower = nil
-                            if logEvent == nil {
-                                logEvent = "powermetrics CPU 分项连续 3 次无有效读数，CPU 分项前馈已过期"
+                            if self.cpuHadValue {
+                                self.cpuHadValue = false
+                                if logEvent == nil {
+                                    logEvent = "powermetrics CPU 分项连续 3 次无有效读数，CPU 分项前馈已过期"
+                                }
                             }
                         }
                     }
                     if let g {
                         self.gpuPower = g
+                        self.gpuHadValue = true
                         self.gpuNilStreak = 0
                     } else {
                         self.gpuNilStreak += 1
                         if self.gpuNilStreak == 3 {
                             self.gpuPower = nil
-                            if logEvent == nil {
-                                logEvent = "powermetrics GPU 分项连续 3 次无有效读数，GPU 分项前馈已过期"
+                            // GPU 空载常报无效/0：仅在「曾有分项值」后过期才记日志
+                            if self.gpuHadValue {
+                                self.gpuHadValue = false
+                                if logEvent == nil {
+                                    logEvent = "powermetrics GPU 分项连续 3 次无有效读数，GPU 分项前馈已过期"
+                                }
                             }
                         }
                     }

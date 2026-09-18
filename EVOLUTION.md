@@ -163,6 +163,14 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R29（4.1.3(80) 批次A 快赢）：诚实化 + 升级门禁 fail-closed + 工程债
+- **ThermalModel.isMature**：改为 `sampleCount≥min && b>2.5`（与 predictedPercent 同门）；真机 b=1.0、样本 2500+ 时不得再称「模型成熟」。单测锁收敛模型 mature + b 贴下限 not mature。
+- **upgrade.sh fail-closed**：缺 TAG/daemon-sha/app-sha 一律 exit 3，禁止手动路径跳过门禁；test-root-scripts +2 条。
+- **install.sh App 属主**：无 SUDO_USER 时取 console 用户 chown，恢复 deploy.sh 免密通道（osascript 安装曾把 App 留在 root:admin）。
+- **powermetrics 单侧日志**：仅「曾有分项值 → 过期」才打日志（GPU 空载无效读不再刷屏）。
+- **README** 断言文案改引徽章；契约下限 4400/70 → **4550/75**。
+- **DailyStats.speedChangesPerMinute**：磨损速率口径（次/受控分钟），供对比不同拍频时段。
+
 ### R28（4.1.3(79) 安全 P1）：损坏备份 O_EXCL|O_NOFOLLOW——闭合 admin 组符号链接静默提权
 - **全维度巡查发现**：support 目录 `root:admin 775`，损坏备份用路径式 `Data.write` 会跟随符号链接；admin 组进程可预置 `config.corrupted.<epoch>.json` 等链接 + 弄脏 config → root 把任意字节写进链接目标（LaunchDaemon/cron 等），绕过 Authorization Services。saveConfig 已是 fd 纪律，**备份路径是同源原语的漏网实例**。
 - **修复**：`FanCtlPaths.writeNewFileExclusive`——`O_CREAT|O_EXCL|O_NOFOLLOW` + `fchmod` + EINTR 重试 write；目标为链接或已存在则失败（只损失备份可观测性，主路径仍回默认配置）。`loadConfig` 与 `loadCorruptionAware` 全部改走该原语。

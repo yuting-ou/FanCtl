@@ -1218,12 +1218,27 @@ func testThermalModel() {
     expect(m.sampleCount >= ThermalModel.minSamples, "样本数达标")
     expect(abs(m.a - 40) < 6, "热阻参数收敛到物理 0.8（归一化得 \(m.a)）")
     expect(abs(m.b - 15) < 3, "风量降温参数收敛到物理 0.3（归一化得 \(m.b)）")
+    // R29：isMature 与 predictedPercent 同门槛（b>2.5）
+    expect(m.isMature && m.b > 2.5, "收敛模型 isMature=true 且 b>2.5")
 
     // 预测一致性：模型学到的参数应能回答"压到目标需要多少风量"
     if let pred = m.predictedPercent(for: 25, power: 40, targetTemp: 45) {
         // 真值：45 = 25 + 0.8·40 − 0.3·p → p = (25+32−45)/0.3 = 40
         expectClose(pred, 40, 8, "预测与真值一致（得 \(pred)）")
     } else { expect(false, "成熟模型应能预测") }
+
+    // R29：样本多但 b 钉死在下限 → 不得宣称 mature（真机 b=1.0 预测恒 nil）
+    var stuck = ThermalModel()
+    for _ in 0..<200 {
+        // 极弱风量效应样本：温度几乎不随 percent 变化 → b 推向下限
+        stuck.update(env: 30, power: 20, percent: 10 + Double.random(in: 0...80), temp: 70)
+    }
+    expect(stuck.sampleCount >= ThermalModel.minSamples, "卡死模型样本数仍可很高")
+    if stuck.b <= 2.5 {
+        expect(!stuck.isMature, "b≤2.5 时 isMature=false（R29 诚实门）")
+        expect(stuck.predictedPercent(for: 30, power: 20, targetTemp: 50) == nil,
+               "b≤2.5 预测 nil")
+    }
 
     // 物理约束：异常样本不把参数推出合理域（归一化域 [0,100]×[1,100]）
     var m2 = ThermalModel()

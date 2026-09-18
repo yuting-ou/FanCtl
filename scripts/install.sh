@@ -105,9 +105,15 @@ sleep 1
 rm -rf "/Applications/清风.app" /Applications/FanCtl.app
 cp -R "$DIST/FanCtl.app" "/Applications/清风.app"
 # 把 App bundle 属主改回实际登录用户（非 root）：此后仅改 UI 时可用 ./scripts/deploy.sh 免密替换，
-# 无需再 sudo（守护进程仍归 root，与此无关）
-if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-    chown -R "$SUDO_USER:staff" "/Applications/清风.app"
+# 无需再 sudo（守护进程仍归 root，与此无关）。
+# R29：osascript 升级无 SUDO_USER——与 upgrade.sh 同源取 console 用户，否则
+# App 属主停在 root:admin，deploy.sh 免密通道失效。
+APP_OWNER="${SUDO_USER:-}"
+if [[ -z "$APP_OWNER" || "$APP_OWNER" == "root" ]]; then
+    APP_OWNER=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || echo root)
+fi
+if [[ -n "$APP_OWNER" && "$APP_OWNER" != "root" ]]; then
+    chown -R "$APP_OWNER:staff" "/Applications/清风.app"
 fi
 
 # 确保守护进程已生成配置文件并放开组写权限（App 需要写它）
