@@ -70,14 +70,24 @@ final class PowerCompositionSampler {
                         self.cpuNilStreak = 0
                     } else {
                         self.cpuNilStreak += 1
-                        if self.cpuNilStreak >= 3 { self.cpuPower = nil }
+                        if self.cpuNilStreak == 3 {
+                            self.cpuPower = nil
+                            if logEvent == nil {
+                                logEvent = "powermetrics CPU 分项连续 3 次无有效读数，CPU 分项前馈已过期"
+                            }
+                        }
                     }
                     if let g {
                         self.gpuPower = g
                         self.gpuNilStreak = 0
                     } else {
                         self.gpuNilStreak += 1
-                        if self.gpuNilStreak >= 3 { self.gpuPower = nil }
+                        if self.gpuNilStreak == 3 {
+                            self.gpuPower = nil
+                            if logEvent == nil {
+                                logEvent = "powermetrics GPU 分项连续 3 次无有效读数，GPU 分项前馈已过期"
+                            }
+                        }
                     }
                     self.samplingInFlight = false
                     self.lock.unlock()
