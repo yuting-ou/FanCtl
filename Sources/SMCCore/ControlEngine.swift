@@ -746,11 +746,18 @@ public final class ControlEngine {
         // 验证期（probeVerifyLoops > 0）用严格检查（无升速宽限），探测真实故障。
         // fastConfigApply 拍只更新命令基线不计数：快速下拖时限速行程在数百 ms 内走完
         // 而 RPM 物理回落需 1-3s，逐拍计 mismatch 会稳定误判闭环失效（v2.8 审查 P1）
+        // R27（L3-F4）：本拍即将发起故障试探时，空命令拍不计自解进度（countsRecover=false），
+        // 避免 record（拍首）在 probe 写入前消耗 recover 配额、削弱 3 拍验证窗。
+        let controlBlockedNow = writeHealth.faulted || feedbackHealth.faulted
+        let probeDueNow = controlBlockedNow
+            && hooks.now().timeIntervalSince(lastProbeTime) >= 30
+            && probeVerifyLoops <= 0
         if fastConfigApply {
             feedbackHealth.recordCommandOnly(states: fanStates, commandedRPM: lastWrittenRPM)
         } else {
             feedbackHealth.record(states: fanStates, commandedRPM: lastWrittenRPM,
-                                  risingGrace: probeVerifyLoops <= 0)
+                                  risingGrace: probeVerifyLoops <= 0,
+                                  countsRecover: !probeDueNow)
         }
         var writtenRPM: [Int: Double] = [:]
         var appliedPercents: [Double] = []
@@ -987,6 +994,10 @@ public final class ControlEngine {
                     if probeOK {
                         // 设 4：本拍末尾 -=1 后剩 3，保证注释承诺的完整 3 拍严格验证窗
                         probeVerifyLoops = 4
+                        // R27（L3-F6）：试探写入即进入强制模式语义——验证失败交还时
+                        // 才能无条件 restoreAutoAll，避免「仅启动期故障、此前无正常写」
+                        // 时 SMC 残留强制 RPM。
+                        forcedModeActive = true
                         hooks.log("故障试探写入成功，进入跟随验证（3 拍）…")
                     }
                 }
@@ -1116,7 +1127,8 @@ public final class ControlEngine {
                                                  reason: reason,
                                                  speedChange: speedChanged,
                                                  cyclingGuard: guardArmedThisBeat,
-                                                 overshoot: overshootNow) {
+                                                 overshoot: overshootNow,
+                                                 envTemp: valleyEnv ?? lastPlausibleEnvTemp) {
                 ConfigStore.archiveDay(archived)
             }
             prevStatsAppliedPercent = appliedPercent

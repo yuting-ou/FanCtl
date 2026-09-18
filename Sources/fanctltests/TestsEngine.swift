@@ -950,6 +950,16 @@ func testStatsSampler() {
     expectClose(gp.stats.revolutions, 200, 1e-9, "门外读数仍计转数（4×1000RPM×3s/60）")
     expect(gp.stats.tempHistogram?[TempHistogram.bucketIndex(for: 80)] == 3,
            "直方图仅含合理读数秒数")
+    // R27 L3-F2：环境参照偏低失真门 + 无参照时 <15° 排除
+    expect(!StatsSampler.tempPlausible(8.4, envTemp: 31), "低于环境 12°+ 门外")
+    expect(StatsSampler.tempPlausible(45, envTemp: 31), "环境+14° 合理")
+    expect(!StatsSampler.tempPlausible(8.4), "无环境参照时 <15° 门外（cpuDie≈8）")
+    expect(StatsSampler.tempPlausible(83.8, envTemp: 31), "真实热峰 83° 仍入账")
+    var eg = StatsSampler(now: Date())
+    _ = eg.record(temp: 8.4, totalRPM: 0, seconds: 3, now: Date(), envTemp: 31)
+    _ = eg.record(temp: 83.8, totalRPM: 0, seconds: 3, now: Date(), envTemp: 31)
+    expectEqual(eg.stats.maxTemp, 83.8, "偏低失真不抬峰值，热峰保留")
+    expectEqual(eg.stats.tempCount, 1, "偏低失真不进均温分母")
 
     // 跨天：返回前一天战报供归档，新账从零开始
     let future = now.addingTimeInterval(25 * 3600)

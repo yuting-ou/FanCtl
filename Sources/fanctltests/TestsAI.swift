@@ -1047,8 +1047,8 @@ func testThermalLearn() {
         expect(ThermalLearn().envelopeGap() == nil, "无数据返回 nil")
         var lo = ThermalLearn()
         for _ in 0..<3 { lo.record(temp: 60, percent: 30) }
-        for _ in 0..<3 { lo.record(temp: 70, percent: 10) }  // 低温非单调不在 ≥75° 统计域
-        expect(lo.envelopeGap() == nil, "仅 <75° 数据 → nil（高温段域外）")
+        for _ in 0..<3 { lo.record(temp: 70, percent: 10) }  // 查询域外统计：gap 仍看 ≥75°
+        expect(lo.envelopeGap() == nil, "仅 <75° 数据 → nil（高温段域外，R27 不改 gap 口径）")
     }
 
     // v3.4.5（3B）：高温段单调化——非单调先验在 ≥75° 查询时向上取包络
@@ -1058,11 +1058,13 @@ func testThermalLearn() {
         for _ in 0..<3 { nm.record(temp: 88, percent: 62) }   // 88° 桶采信（瞬态污染，低于 82°）
         expectClose(nm.percent(for: 88)!, 85, 1e-9, "高温非单调向上取包络（88° 需求 ≥ 82°）")
         expectClose(nm.percent(for: 86)!, 85, 1e-9, "86° 插值(73.5) 后仍取包络 85")
-        // 低温段（<75°）不钳：<75° 查询保持原值（低温污染由 sanitize 负责）
+        // R27（L3-F3）：查表单调化扩到全温域——真机 69°=96%>73°=84% 属先验违例
         var lo = ThermalLearn()
         for _ in 0..<3 { lo.record(temp: 60, percent: 30) }
         for _ in 0..<3 { lo.record(temp: 70, percent: 20) }   // 70° 低于 60°（低温非单调）
-        expectClose(lo.percent(for: 70)!, 20, 1e-9, "低温段不单调化（70° 保持 20）")
+        expectClose(lo.percent(for: 70)!, 30, 1e-9,
+                    "R27：低温非单调也向上取包络（70° 需求 ≥ 60°）")
+        expectClose(lo.percent(for: 60)!, 30, 1e-9, "60° 桶原值")
     }
 
     // v5: NaN/Inf 防御——record 接收 NaN percent 时不污染学习数据

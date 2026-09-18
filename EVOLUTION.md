@@ -163,6 +163,17 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R27（4.1.3(78)）：L1 dogfood 初裁 + L3 集成对抗审查修正
+- **L1 初裁（77 真机，安装后 ~15h）**：P1 门通过——启动试探一次交还后 AI 正常，`controlFault` 无永久锁存；睡眠/唤醒/电池切换无异常；包络 trusted 桶**存在** 69°=96.6%>73°=84.3%（修订 R26「无污染」表述）；R26 powermetrics 日志在 77 后无「连续 1 次」刷屏。
+- **L3 独立审查**：PASS-WITH-NOTES、无 critical。落地修正：
+  - **F1** `FanFeedbackHealth.riseOnlyGraceMaxBeats=12`：滞后路径仅靠 `rpmRising` 的 matched 连续封顶，退化扇无界爬升不再永久算响应。
+  - **F2** `StatsSampler.tempPlausible`：有环境时 `temp >= env-12`（与控制偏低门同源）；无环境时 `temp>=15`（排除 cpuDie≈8）；**101.9 热峰保留**（R26 误把真实峰值当坏点）。
+  - **F3** ThermalLearn 查表单调化扩到**全温域**（只向上取 max，P5）；`envelopeGap()` 统计口径仍 ≥75° 不改写观察协议。
+  - **F4** `record(countsRecover:)`：试探写入拍不计自解进度，避免削弱 3 拍验证窗。
+  - **F6** probe 写入成功即 `forcedModeActive=true`，验证失败可无条件 `restoreAutoAll`。
+  - **F7** 单侧 powermetrics 连续 3 次无读数时记一条过期日志。
+- **验证**：4616 断言 / 76 组全绿。
+
 ### R26（4.1.3(77) 细节打磨）：战报温度门 + powermetrics 日志诚实化 + 包络观察关闭
 - **数据驱动选题（真机 76 dogfood 快照）**：①学习表 trusted 桶**无**非单调污染（更高温桶输出未显著更低）——4.2-B 关闭，gap=2.09 是冷启动双峰重建非污染，**不手术**；②日志见 powermetrics 反复「连续 1 次」失败（信息量与实现颠倒：首败才打日志、真过期反而静默）；③今日战报 maxTemp≈101.9°C（05:59Z）——控制路径红线另算，但曲线优化器吃 stats 分位数，坏点会污染底座。
 - **StatsSampler 温度合理性门**：`tempPlausible` = 有限且 (0,125]°C；门外跳过 maxTemp/高温秒/直方图/均温分母，功耗/转数/调速计数照旧。单测锁门外读数不抬峰值、不进分母、转数仍计。

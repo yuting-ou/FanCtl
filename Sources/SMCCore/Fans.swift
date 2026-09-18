@@ -244,11 +244,15 @@ public struct WriteHealth: Equatable {
 // R25 起转宽限：actualRPM < 100 不再无条件 mismatch——若相对上拍上升超过 spinUpDeltaRPM，
 //      视为物理起转中（空闲停转→负载爬升），与真停转区分；滞后路径同样接受 RPM 斜坡为
 //      响应证据（即使试探窗 risingGrace=false）。恒 <100 / 恒低速不升 / 升后停住仍 fault。
+// R27（L3-F1）：滞后路径的「仅靠 rpmRising」宽限封顶 riseOnlyGraceMaxBeats 拍——
+//      无界 +50/拍爬升会把「退化但未死」的风扇永久算作响应（真故障探测与学习排除门失效）。
 public struct FanFeedbackHealth: Equatable {
     public static let faultThreshold = 5
     public static let recoverThreshold = 3      // 故障后连续匹配/交还拍数（首次故障的基准）
     /// 起转判定：actualRPM 较上拍上升超过该值 → 物理在爬升，不判停转/不因滞后计 mismatch。
     public static let spinUpDeltaRPM: Double = 50
+    /// 滞后路径仅靠 RPM 斜坡（非命令上升）计 matched 的连续拍上限（≈12×3s=36s）。
+    public static let riseOnlyGraceMaxBeats = 12
     static let recoverMaxShift = 4              // 连续故障退避上限：3<<4=48 拍
     public private(set) var consecutiveFailures = 0
     public private(set) var faulted = false
@@ -256,6 +260,7 @@ public struct FanFeedbackHealth: Equatable {
     private var recoverCount = 0
     private var lastCommanded: [Int: Double] = [:]
     private var lastActualRPM: [Int: Double] = [:]
+    private var riseOnlyGraceStreak: [Int: Int] = [:]
     // v2.6.2 启动宽限：daemon 重启后首拍 lastCommanded 为空，升速宽限失效，
     // 从 auto 接管到新目标时风扇爬升会被误判故障——首拍只记录命令不计数
     private var warmedUp = false
@@ -270,7 +275,8 @@ public struct FanFeedbackHealth: Equatable {
     public init() {}
 
     public mutating func record(states: [FanState], commandedRPM: [Int: Double],
-                                risingGrace: Bool = true) {
+                                risingGrace: Bool = true,
+                                countsRecover: Bool = true) {
         if !warmedUp {
             warmedUp = true
             for st in states {
@@ -290,7 +296,13 @@ public struct FanFeedbackHealth: Equatable {
                 .map { st.actualRPM > $0 + Self.spinUpDeltaRPM } ?? false
             if st.actualRPM < 100 {
                 // R25：真停转 = 低于 100 且相对上拍未在爬升；起转中给宽限
-                if rpmRising { matchedCount += 1 } else { mismatch = true }
+                if rpmRising {
+                    matchedCount += 1
+                    riseOnlyGraceStreak[st.id] = 0
+                } else {
+                    mismatch = true
+                    riseOnlyGraceStreak[st.id] = 0
+                }
                 continue
             }
             let lagging = abs(st.actualRPM - target) > max(300, target * 0.35)
@@ -300,11 +312,23 @@ public struct FanFeedbackHealth: Equatable {
                 // 旧值，若仍宽限则验证永远"通过"，探测不到真实故障。
                 // R25：物理 RPM 斜坡（rpmRising）在试探窗内同样算响应——活风扇在爬升
                 // 与死风扇恒低速可分；命令侧 risingGrace 语义保持不变。
+                // R27：仅靠 rpmRising 的 matched 连续封顶，防止退化扇无界「假响应」。
                 let cmdRising = risingGrace && (lastCommanded[st.id].map { target > $0 + 50 } ?? false)
-                if cmdRising || rpmRising { matchedCount += 1 }
-                else { mismatch = true }
+                if cmdRising {
+                    matchedCount += 1
+                    riseOnlyGraceStreak[st.id] = 0
+                } else if rpmRising {
+                    let n = (riseOnlyGraceStreak[st.id] ?? 0) + 1
+                    riseOnlyGraceStreak[st.id] = n
+                    if n <= Self.riseOnlyGraceMaxBeats { matchedCount += 1 }
+                    else { mismatch = true }
+                } else {
+                    riseOnlyGraceStreak[st.id] = 0
+                    mismatch = true
+                }
             } else {
                 matchedCount += 1            // 高目标且未滞后未停转 = 确实跟上
+                riseOnlyGraceStreak[st.id] = 0
             }
         }
         // 记录本拍命令/RPM（无命令的交还期保留旧命令基线；RPM 基线每拍刷新）
@@ -323,11 +347,15 @@ public struct FanFeedbackHealth: Equatable {
             // 锁存：交还（无命令）或匹配都算恢复进度，连续达标才解除。R24：所需拍数随
             // 连续故障次数退避，但自解路径永不移除 → 假故障最多 3 拍即解、坏风扇退避封顶，
             // 结构上不可能锁存（这是与"删自解"版的关键区别）。
-            recoverCount += 1
-            if recoverCount >= effectiveRecoverThreshold {
-                faulted = false
-                consecutiveFailures = 0
-                recoverCount = 0
+            // R27（L3-F4）：试探写入拍（countsRecover=false）不计自解进度——
+            // 否则 record 在 probe 写之前的空命令拍会提前消耗 recover，削弱 3 拍验证窗。
+            if countsRecover {
+                recoverCount += 1
+                if recoverCount >= effectiveRecoverThreshold {
+                    faulted = false
+                    consecutiveFailures = 0
+                    recoverCount = 0
+                }
             }
         } else {
             consecutiveFailures = 0

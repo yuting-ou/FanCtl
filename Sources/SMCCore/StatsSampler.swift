@@ -42,14 +42,15 @@ public struct StatsSampler {
                                 reason: ControlReason? = nil,
                                 speedChange: Bool = false,
                                 cyclingGuard: Bool = false,
-                                overshoot: Double? = nil) -> DailyStats? {
+                                overshoot: Double? = nil,
+                                envTemp: Double? = nil) -> DailyStats? {
         let day = DailyStats.dayString(for: now)
         var archived: DailyStats? = nil
         if stats.date != day {
             archived = stats
             stats = DailyStats(date: day)
         }
-        if StatsSampler.tempPlausible(temp) {
+        if StatsSampler.tempPlausible(temp, envTemp: envTemp) {
             if temp > stats.maxTemp {
                 stats.maxTemp = temp
                 stats.maxTempAt = now
@@ -85,8 +86,15 @@ public struct StatsSampler {
         return archived
     }
 
-    /// 战报温度采样是否物理合理（R26）。
-    public static func tempPlausible(_ temp: Double) -> Bool {
-        temp.isFinite && temp > 1.0 && temp <= 125.0
+    /// 战报温度采样是否物理合理（R26→R27）。
+    /// - 有限且 (0, 125]°C（上界：真实硅温峰值可 >100，不把热峰当坏点）
+    /// - 有环境参照时：不得比环境冷 12°C 以上（与控制路径偏低失真门同源）
+    /// - 无环境参照时：temp < 15°C 视为失真（真机曾见 cpuDie≈8°C 而 GPU 正常）
+    public static func tempPlausible(_ temp: Double, envTemp: Double? = nil) -> Bool {
+        guard temp.isFinite, temp > 1.0, temp <= 125.0 else { return false }
+        if let env = envTemp, env.isFinite, env > 5 {
+            return temp >= env - 12
+        }
+        return temp >= 15
     }
 }

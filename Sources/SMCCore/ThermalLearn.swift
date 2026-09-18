@@ -166,11 +166,11 @@ public struct ThermalLearn: Equatable {
             default: result = nil
             }
         }
-        // v3.4.5（3B）：高温段（≥75°）单调化——先验只允许随温度不下降。
-        // 真实学习图出现过 86°=74%、88°=62% 低于 82° 的 85%（瞬态采样污染），
-        // 非单调先验在过冲区导致高温欠冷；向上取 max 方向安全（只多冷不过热）。
-        // 与更低温度全部采信桶取运行最大值；<75° 区间不钳（sanitize 负责低温污染）。
-        if let r = result, TempHistogram.midTemp(of: b) >= Self.monotonicFloorTemp {
+        // R27（L3-F3）：查表单调化不限 ≥75°——真机 learnMap 曾出现 69°=96.6% >
+        // 73°=84.3%（均 trusted），先验「风量需求随温度不下降」在全温域成立；
+        // 只向上取 max（P5：欠冷代价大于过冷）。sanitize 仍负责写入侧低温污染。
+        // envelopeGap() 统计口径保持 ≥monotonicFloorTemp（观察协议不因本改动改写历史）。
+        if let r = result {
             var envelope = r
             var i = b - 1
             while i >= 0 {

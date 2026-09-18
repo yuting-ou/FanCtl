@@ -390,6 +390,39 @@ func testOffsetsAndReadings() {
         expect(fh.faultStreak == 0, "确认跟随后 streak 归零（R24c 语义未破）")
     }
 
+    // R27 L3-F1：无界 RPM 爬升不得永久算响应——退化扇（斜坡但远落后目标）须 fault
+    do {
+        var fh = FanFeedbackHealth()
+        let cmd = [0: 4000.0]
+        var rpm = 150.0
+        fh.record(states: [FanState(id: 0, actualRPM: rpm, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)],
+                  commandedRPM: cmd)
+        for _ in 0..<(FanFeedbackHealth.riseOnlyGraceMaxBeats + FanFeedbackHealth.faultThreshold + 2) {
+            rpm += 60   // 永远上升，但始终严重落后 4000
+            fh.record(states: [FanState(id: 0, actualRPM: rpm, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)],
+                      commandedRPM: cmd, risingGrace: false)
+        }
+        expect(fh.faulted,
+               "无界爬升退化扇：rise-only 宽限封顶后必须 fault（L3-F1）")
+    }
+
+    // R27 L3-F4：countsRecover=false 时不消耗自解进度
+    do {
+        var fh = FanFeedbackHealth()
+        let dead = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [dead], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [dead], commandedRPM: cmd)
+        }
+        expect(fh.faulted, "前置 fault")
+        // 试探写入拍：空命令但 countsRecover=false → 仍 faulted
+        fh.record(states: [dead], commandedRPM: [:], countsRecover: false)
+        expect(fh.faulted, "试探拍 countsRecover=false 不计自解（L3-F4）")
+        for _ in 0..<3 { fh.record(states: [dead], commandedRPM: [:]) }
+        expect(!fh.faulted, "其后正常交还 3 拍仍自解")
+    }
+
     // controlFault 字段往返 + 旧 status 兼容
     do {
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
