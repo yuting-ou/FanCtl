@@ -189,6 +189,12 @@ public final class ControlEngine {
         }
         self.aiMetricsUserTarget = cfgUserTarget
         self.thermalModel = ConfigStore.loadModel() ?? ThermalModel()
+        // R30：b 贴地时重置辨识（预测本已 nil，不改控制；见 ThermalModel.resetIfUnusable）
+        var modelResetReason: String?
+        if thermalModel.resetIfUnusable(reason: &modelResetReason) {
+            if let msg = modelResetReason { hooks.log(msg) }
+            modelDirty = true
+        }
 
         // 启动时清洗历史污染数据——阈值随启动时的环境估计修正（v2.9）：
         // 原判据隐含 25°C 室温，热带/夏季重载下 65°/55% 是合法物理，

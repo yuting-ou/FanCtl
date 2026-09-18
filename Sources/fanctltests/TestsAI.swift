@@ -1238,6 +1238,12 @@ func testThermalModel() {
         expect(!stuck.isMature, "b≤2.5 时 isMature=false（R29 诚实门）")
         expect(stuck.predictedPercent(for: 30, power: 20, targetTemp: 50) == nil,
                "b≤2.5 预测 nil")
+        var why: String? = nil
+        expect(stuck.resetIfUnusable(reason: &why), "未收敛模型可重置")
+        expect(stuck.sampleCount == 0 && stuck.b > 2.5, "重置后回到新模型")
+        expect(why != nil, "重置给出日志原因")
+        var why2: String? = nil
+        expect(!stuck.resetIfUnusable(reason: &why2), "新模型不再重置")
     }
 
     // 物理约束：异常样本不把参数推出合理域（归一化域 [0,100]×[1,100]）

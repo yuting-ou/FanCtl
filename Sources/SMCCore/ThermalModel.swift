@@ -150,6 +150,18 @@ public struct ThermalModel: Codable {
 
     /// 预测是否当前可用（与 isMature 同义，语义更直白）。
     public var hasUsablePrediction: Bool { isMature }
+
+    /// R30：参数未收敛（样本多但 b 贴地）时整模重置，让 RLS 重新辨识。
+    /// 此时 predictedPercent 本已恒 nil，重置**不改变**当前控制行为；
+    /// 仅避免协方差坍缩后的「假成熟」继续占用操作带记忆。
+    /// 返回是否发生了重置；reason 供 daemon 日志。
+    @discardableResult
+    public mutating func resetIfUnusable(reason: inout String?) -> Bool {
+        guard sampleCount >= Self.minSamples, b <= 2.5 else { return false }
+        reason = String(format: "热模型 b=%.2f 未收敛（样本 %d），已重置辨识", b, sampleCount)
+        self = ThermalModel()
+        return true
+    }
 }
 
 // 自定义 Codable：recentSamples (tuple 数组) 不支持 Codable，需手动排除
