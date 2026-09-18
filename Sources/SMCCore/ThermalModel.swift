@@ -143,8 +143,13 @@ public struct ThermalModel: Codable {
         return steady
     }
 
-    // 模型是否已采信（供 UI 展示“模型已掌握 N 样本”）
-    public var isMature: Bool { sampleCount >= Self.minSamples }
+    // 模型是否已可采信（供 UI/诊断展示）。
+    // R29：必须与 predictedPercent 同门槛（b>2.5）——真机见过 sampleCount≥2500 但
+    // b 钉在下限 1.0，预测恒 nil；若 isMature 只看样本数，诊断会把「空转模型」说成成熟。
+    public var isMature: Bool { sampleCount >= Self.minSamples && b > 2.5 }
+
+    /// 预测是否当前可用（与 isMature 同义，语义更直白）。
+    public var hasUsablePrediction: Bool { isMature }
 }
 
 // 自定义 Codable：recentSamples (tuple 数组) 不支持 Codable，需手动排除

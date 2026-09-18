@@ -850,6 +850,14 @@ public struct DailyStats: Codable {
         s.powerHistogram = s.powerHistogram?.map(fin)
         return s
     }
+
+    /// R29：调速次数折算到「次/分钟」（按受控秒）。绝对 speedChanges 随 loop 拍频
+    /// 放大（AI 期 1s 拍 vs 空闲 20s 拍不可直接比），磨损趋势应看本速率。
+    public var speedChangesPerMinute: Double {
+        let mins = tempSeconds / 60.0
+        guard mins > 0.5, speedChanges.isFinite, tempSeconds.isFinite else { return 0 }
+        return speedChanges / mins
+    }
 }
 
 // v3.5.1：天数序列的纯函数语义（从 FanModel 提取，App 与测试共用同一实现——

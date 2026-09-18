@@ -32,27 +32,27 @@ SHA_DAEMON="${4:-}"
 SHA_APPBIN="${5:-}"
 
 # root 侧复核（在 bootout 之前——不匹配则原状退出，运行中的 daemon/App 不受扰动）
-if [[ -n "$TAG" ]]; then
-    STAGED_VER=$(plutil -extract CFBundleShortVersionString raw \
-        "$STAGING/FanCtl.app/Contents/Info.plist" 2>/dev/null || true)
-    if [[ "$STAGED_VER" != "$TAG" ]]; then
-        echo "暂存包版本 ${STAGED_VER} ≠ 授权版本 ${TAG}（授权后被篡改？）" >&2
-        exit 3
-    fi
+# R29：门禁 fail-closed——TAG/双哈希为必填。App 自动升级恒传齐；手动/社交工程路径
+# 若缺参数则拒绝安装，禁止「跳过校验仍 root 动手」。
+if [[ -z "$TAG" || -z "$SHA_DAEMON" || -z "$SHA_APPBIN" ]]; then
+    echo "缺少授权 tag 或二进制哈希参数，拒绝升级（fail-closed）" >&2
+    exit 3
 fi
-if [[ -n "$SHA_DAEMON" ]]; then
-    actual=$(/usr/bin/shasum -a 256 "$STAGING/fanctld" | awk '{print $1}')
-    if [[ "$actual" != "$SHA_DAEMON" ]]; then
-        echo "暂存 daemon 二进制哈希不符（授权后被篡改？）" >&2
-        exit 3
-    fi
+STAGED_VER=$(plutil -extract CFBundleShortVersionString raw \
+    "$STAGING/FanCtl.app/Contents/Info.plist" 2>/dev/null || true)
+if [[ "$STAGED_VER" != "$TAG" ]]; then
+    echo "暂存包版本 ${STAGED_VER} ≠ 授权版本 ${TAG}（授权后被篡改？）" >&2
+    exit 3
 fi
-if [[ -n "$SHA_APPBIN" ]]; then
-    actual=$(/usr/bin/shasum -a 256 "$STAGING/FanCtl.app/Contents/MacOS/FanCtl" | awk '{print $1}')
-    if [[ "$actual" != "$SHA_APPBIN" ]]; then
-        echo "暂存 App 二进制哈希不符（授权后被篡改？）" >&2
-        exit 3
-    fi
+actual=$(/usr/bin/shasum -a 256 "$STAGING/fanctld" | awk '{print $1}')
+if [[ "$actual" != "$SHA_DAEMON" ]]; then
+    echo "暂存 daemon 二进制哈希不符（授权后被篡改？）" >&2
+    exit 3
+fi
+actual=$(/usr/bin/shasum -a 256 "$STAGING/FanCtl.app/Contents/MacOS/FanCtl" | awk '{print $1}')
+if [[ "$actual" != "$SHA_APPBIN" ]]; then
+    echo "暂存 App 二进制哈希不符（授权后被篡改？）" >&2
+    exit 3
 fi
 
 # R23 审查（P3-1）：marker 已是符号链接时在 bootout 之前快速失败——否则装完 daemon、

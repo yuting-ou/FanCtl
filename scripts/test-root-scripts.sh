@@ -66,6 +66,12 @@ M="$TMP/marker-ok"
 run_expect 0 "tag 与暂存版本一致 → gates-ok" \
     env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.3" "$D_SHA" "$A_SHA"
 
+run_expect 3 "R29 fail-closed：缺 tag/哈希 → exit 3（不得跳过门禁）" \
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M"
+
+run_expect 3 "R29 fail-closed：仅有 marker 无 tag → exit 3" \
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "" "$D_SHA" "$A_SHA"
+
 run_expect 3 "P1-A：传 v 前缀 tag（v4.1.3）必拒 — App 侧必须 sanitizeTag" \
     env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "v4.1.3" "$D_SHA" "$A_SHA"
 
@@ -115,7 +121,7 @@ fi
 
 # --- 无 tag/sha 时放行（手动兼容路径）---
 ST="$(make_stage 4.1.3)"
-run_expect 0 "无 tag/sha 参数（手动兼容）→ gates-ok" \
+run_expect 3 "无 tag/sha 参数 → fail-closed exit 3（R29 取消手动兼容跳过门禁）" \
     env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST"
 
 echo "== install.sh config.json 符号链接谓词（FANCTL_TEST_CONFIG_GUARD=1）=="
