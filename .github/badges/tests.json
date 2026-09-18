@@ -1,6 +1,1 @@
-{
-  "schemaVersion": 1,
-  "label": "tests",
-  "message": "4636 assertions",
-  "color": "success"
-}
+{\n  "schemaVersion": 1,\n  "label": "tests",\n  "message": "4636 assertions",\n  "color": "success"\n}\n
