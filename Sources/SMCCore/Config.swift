@@ -395,6 +395,10 @@ public struct DaemonStatus: Codable {
     public var hardwareProfile: HardwareProfile?
     // 4.0 B2 冷启动校准：true = 用户选 AI 但学习表未成熟，观察期语义化 auto
     public var calibrating: Bool?
+    // R31：热模型诊断（与 predictedPercent 同门的 usable；旧 status 为 nil）
+    public var thermalModelUsable: Bool?
+    public var thermalModelB: Double?
+    public var thermalModelSamples: Int?
     public var cpuTemp: Double { sensors.cpuDie }
     public var gpuTemp: Double { sensors.gpuDie }
 
@@ -421,7 +425,10 @@ public struct DaemonStatus: Codable {
                 learnMap: [ThermalLearn.LearnedPoint]? = nil,
                 decisionTrace: DecisionTrace? = nil,
                 hardwareProfile: HardwareProfile? = nil,
-                calibrating: Bool? = nil) {
+                calibrating: Bool? = nil,
+                thermalModelUsable: Bool? = nil,
+                thermalModelB: Double? = nil,
+                thermalModelSamples: Int? = nil) {
         self.sensors = sensors
         self.mode = mode
         self.appliedPercent = appliedPercent
@@ -458,6 +465,9 @@ public struct DaemonStatus: Codable {
         // 也必须显式赋值，"没赋值"与"值为 nil"语义不同。
         self.hardwareProfile = hardwareProfile
         self.calibrating = calibrating
+        self.thermalModelUsable = thermalModelUsable
+        self.thermalModelB = thermalModelB
+        self.thermalModelSamples = thermalModelSamples
     }
 
     // 旧版便利初始化（保持源码兼容）
@@ -495,6 +505,7 @@ public struct DaemonStatus: Codable {
         case learnMap, decisionTrace
         case hardwareProfile
         case calibrating
+        case thermalModelUsable, thermalModelB, thermalModelSamples
         case cpuTemp, gpuTemp
     }
 
@@ -543,6 +554,9 @@ public struct DaemonStatus: Codable {
         self.decisionTrace = try container.decodeIfPresent(DecisionTrace.self, forKey: .decisionTrace)
         self.hardwareProfile = try container.decodeIfPresent(HardwareProfile.self, forKey: .hardwareProfile)
         calibrating = try container.decodeIfPresent(Bool.self, forKey: .calibrating)
+        thermalModelUsable = try container.decodeIfPresent(Bool.self, forKey: .thermalModelUsable)
+        thermalModelB = try container.decodeIfPresent(Double.self, forKey: .thermalModelB)
+        thermalModelSamples = try container.decodeIfPresent(Int.self, forKey: .thermalModelSamples)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -577,6 +591,9 @@ public struct DaemonStatus: Codable {
         try container.encodeIfPresent(decisionTrace, forKey: .decisionTrace)
         try container.encodeIfPresent(hardwareProfile, forKey: .hardwareProfile)
         try container.encodeIfPresent(calibrating, forKey: .calibrating)
+        try container.encodeIfPresent(thermalModelUsable, forKey: .thermalModelUsable)
+        try container.encodeIfPresent(thermalModelB, forKey: .thermalModelB)
+        try container.encodeIfPresent(thermalModelSamples, forKey: .thermalModelSamples)
         // 同时写旧字段，保证回滚到旧版本 App/daemon 时也能读
         try container.encode(sensors.cpuDie, forKey: .cpuTemp)
         try container.encode(sensors.gpuDie, forKey: .gpuTemp)
