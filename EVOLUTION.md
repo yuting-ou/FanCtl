@@ -163,6 +163,12 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R30（4.1.3(81) 自主决策）：热模型卫生重置；磨损控制律明确延后
+- **真机采样（约 20×4s）**：loopInterval 为 3s/10s/20s 混合（AI 空闲已自动拉长），applied 可降到 0（交还）。**不支持**立刻为降 speedChanges 改 AI 死区/拍频——绝对次数受日间高拍时段影响，当前空闲拍并不密。
+- **决策**：批次 B 控制律（舒适带死区/更长拍）**延后**；先看 80/81 dogfood 与 `speedChangesPerMinute` 趋势。遵守失败账本与「无预注册不动控制律」。
+- **落地**：`ThermalModel.resetIfUnusable`——启动时 `b≤2.5` 且样本≥min 则整模重置并打日志；预测本已 nil，不改控制。与 R29 `isMature` 共同避免假成熟。
+- **卫生**：清理已合并的 `.worktrees/r25–r29` 与 compose/tmp 分支。
+
 ### R29（4.1.3(80) 批次A 快赢）：诚实化 + 升级门禁 fail-closed + 工程债
 - **ThermalModel.isMature**：改为 `sampleCount≥min && b>2.5`（与 predictedPercent 同门）；真机 b=1.0、样本 2500+ 时不得再称「模型成熟」。单测锁收敛模型 mature + b 贴下限 not mature。
 - **upgrade.sh fail-closed**：缺 TAG/daemon-sha/app-sha 一律 exit 3，禁止手动路径跳过门禁；test-root-scripts +2 条。
