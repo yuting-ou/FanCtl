@@ -163,6 +163,12 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R28（4.1.3(79) 安全 P1）：损坏备份 O_EXCL|O_NOFOLLOW——闭合 admin 组符号链接静默提权
+- **全维度巡查发现**：support 目录 `root:admin 775`，损坏备份用路径式 `Data.write` 会跟随符号链接；admin 组进程可预置 `config.corrupted.<epoch>.json` 等链接 + 弄脏 config → root 把任意字节写进链接目标（LaunchDaemon/cron 等），绕过 Authorization Services。saveConfig 已是 fd 纪律，**备份路径是同源原语的漏网实例**。
+- **修复**：`FanCtlPaths.writeNewFileExclusive`——`O_CREAT|O_EXCL|O_NOFOLLOW` + `fchmod` + EINTR 重试 write；目标为链接或已存在则失败（只损失备份可观测性，主路径仍回默认配置）。`loadConfig` 与 `loadCorruptionAware` 全部改走该原语。
+- **测试**：`testCorruptionBackupNoFollow`——正常新建 / 符号链接拒绝且 victim 未污染 / O_EXCL 拒覆盖 / 损坏 config 回默认。
+- **验证**：fanctltests 全绿（合并后计徽章）；真机经 osascript 安装。
+
 ### R27（4.1.3(78)）：L1 dogfood 初裁 + L3 集成对抗审查修正
 - **L1 初裁（77 真机，安装后 ~15h）**：P1 门通过——启动试探一次交还后 AI 正常，`controlFault` 无永久锁存；睡眠/唤醒/电池切换无异常；包络 trusted 桶**存在** 69°=96.6%>73°=84.3%（修订 R26「无污染」表述）；R26 powermetrics 日志在 77 后无「连续 1 次」刷屏。
 - **L3 独立审查**：PASS-WITH-NOTES、无 critical。落地修正：

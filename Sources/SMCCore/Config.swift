@@ -920,6 +920,39 @@ public enum FanCtlPaths {
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
     }
+
+    /// R28（安全 P1）：在可能被 admin 组预置符号链接的目录里新建「损坏备份」类文件。
+    /// O_CREAT|O_EXCL|O_NOFOLLOW：目标已是符号链接或已存在则失败——**绝不跟随**写入
+    /// 链接目标。与 saveConfig 的 fd 纪律同源：路径式 Data.write 会跟随 symlink，
+    /// 组内进程可借 root 解码失败把任意内容写进 LaunchDaemon/cron 等（静默提权）。
+    /// 备份失败只损失可观测性，不影响「回默认配置」主路径。
+    @discardableResult
+    public static func writeNewFileExclusive(_ data: Data, to url: URL, mode: mode_t = 0o644) -> Bool {
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        if fchmod(fd, mode) != 0 {
+            try? FileManager.default.removeItem(at: url)
+            return false
+        }
+        var written = 0
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard raw.baseAddress != nil else { return }
+            while written < raw.count {
+                let n = write(fd, raw.baseAddress!.advanced(by: written), raw.count - written)
+                if n <= 0 {
+                    if n < 0, errno == EINTR { continue }
+                    return
+                }
+                written += n
+            }
+        }
+        guard written == data.count else {
+            try? FileManager.default.removeItem(at: url)
+            return false
+        }
+        return true
+    }
 }
 
 public enum ConfigStore {
@@ -943,7 +976,8 @@ public enum ConfigStore {
             // 组内用户高频写非法 config 可让 root 在组可写目录持续落盘撑爆磁盘
             let backupPath = FanCtlPaths.supportDir
                 .appendingPathComponent("config.corrupted.\(Int(Date().timeIntervalSince1970)).json")
-            try? data.write(to: backupPath)
+            // R28 P1：禁止跟随符号链接；O_EXCL 防预置同名链接
+            FanCtlPaths.writeNewFileExclusive(data, to: backupPath)
             let stale = (try? FileManager.default.contentsOfDirectory(
                 at: FanCtlPaths.supportDir, includingPropertiesForKeys: nil))?
                 .filter { $0.lastPathComponent.hasPrefix("config.corrupted.") && $0.pathExtension == "json" }

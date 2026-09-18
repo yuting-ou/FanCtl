@@ -472,7 +472,8 @@ extension ConfigStore {
             // 毫秒精度：秒级时间戳在同秒内多次损坏时互相覆盖（测试也会因此不稳定）
             let backupPath = FanCtlPaths.supportDir
                 .appendingPathComponent("\(name).corrupted.\(Int(Date().timeIntervalSince1970 * 1000)).json")
-            try? data.write(to: backupPath)
+            // R28 P1：与 loadConfig 同源——备份写不得跟随组可写目录里的符号链接
+            FanCtlPaths.writeNewFileExclusive(data, to: backupPath)
             // 只保留同前缀最新 5 个备份（文件名含 epoch 秒，字典序=时间序）
             let prefix = "\(name).corrupted."
             if let entries = try? FileManager.default.contentsOfDirectory(atPath: FanCtlPaths.supportDir.path) {

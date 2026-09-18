@@ -283,6 +283,44 @@ func testSaveConfigPermissions() {
     expect(leftovers.isEmpty, "无 .config.json.<uuid> 临时残留")
 }
 
+// R28（安全 P1）：损坏备份 O_EXCL|O_NOFOLLOW——预置符号链接时不得写穿 victim
+func testCorruptionBackupNoFollow() {
+    group("损坏备份不跟随符号链接")
+    let dir = engineTestEnv()
+    FanCtlPaths.ensureDirectories()
+    defer {
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+    let fm = FileManager.default
+    // 1) 正常新建备份
+    let okURL = FanCtlPaths.supportDir.appendingPathComponent("probe.corrupted.1.json")
+    expect(FanCtlPaths.writeNewFileExclusive(Data("hello".utf8), to: okURL), "正常路径可新建备份")
+    expectEqual((try? String(contentsOf: okURL, encoding: .utf8)) ?? "?", "hello", "内容落盘")
+    // 2) 预置符号链接 → 必须失败且 victim 不变
+    let victim = dir.appendingPathComponent("p1-victim.txt")
+    let secret = "SECRET".data(using: .utf8)!
+    let w1 = try? secret.write(to: victim)
+    expect(w1 != nil, "victim 写入成功")
+    let linked = FanCtlPaths.supportDir.appendingPathComponent("learn.corrupted.999999.json")
+    try? fm.removeItem(at: linked)
+    let sl = symlink(victim.path, linked.path)
+    expect(sl == 0, "预置符号链接成功")
+    expect(!FanCtlPaths.writeNewFileExclusive(Data("PWNED".utf8), to: linked),
+           "目标为符号链接时 writeNewFileExclusive 必须失败")
+    let victimText = (try? Data(contentsOf: victim)).flatMap { String(data: $0, encoding: .utf8) }
+    expectEqual(victimText ?? "?", "SECRET", "victim 未被备份写穿（P1 提权闭合）")
+    // 3) 目标已存在（普通文件）→ O_EXCL 失败
+    expect(!FanCtlPaths.writeNewFileExclusive(Data("X".utf8), to: okURL), "已存在文件 O_EXCL 拒绝覆盖")
+    // 4) loadConfig 损坏路径仍回默认，且不污染无关 victim
+    let bad = "NOT JSON {".data(using: .utf8)!
+    expect((try? bad.write(to: FanCtlPaths.configFile)) != nil, "写入损坏 config")
+    let cfg = ConfigStore.loadConfig()
+    expectEqual(cfg.mode, FanConfig().sanitized().mode, "损坏 config 回默认")
+    expectEqual((try? Data(contentsOf: victim)).flatMap { String(data: $0, encoding: .utf8) } ?? "?",
+                "SECRET", "loadConfig 损坏备份未污染 pre-planted victim 类目标")
+}
+
 
 // MARK: - 日期链（跨天归档/保留期/AI效果比较的地基）
 
