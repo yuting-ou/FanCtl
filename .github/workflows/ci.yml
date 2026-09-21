@@ -114,6 +114,7 @@ jobs:
           mkdir -p "$STAGE"
           cp -R dist/FanCtl.app "$STAGE/"
           cp dist/fanctld "$STAGE/"
+          cp dist/fanprobe "$STAGE/"
           cp scripts/install.sh "$STAGE/"
           cp scripts/uninstall.sh "$STAGE/"
           zip -qr "FanCtl-v${VERSION}.zip" "$STAGE"

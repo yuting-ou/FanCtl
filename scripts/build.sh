@@ -103,8 +103,9 @@ BIN="$ROOT/.build/release"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
-# 守护进程二进制
+# 守护进程二进制 + 只读诊断工具（R32：磨损速率/热模型 dogfood 入口）
 cp "$BIN/fanctld" "$DIST/fanctld"
+cp "$BIN/fanprobe" "$DIST/fanprobe"
 
 # 组装菜单栏 App bundle
 APP="$DIST/FanCtl.app"
@@ -169,9 +170,11 @@ STRINGS
 # 静默吞掉，可能让未签名二进制混进 dist/ 发行资产，装机后才在 Gatekeeper/升级链炸。
 codesign --force --sign - "$APP"
 codesign --force --sign - "$DIST/fanctld"
+codesign --force --sign - "$DIST/fanprobe"
 
 echo "==> 构建完成:"
 echo "    $DIST/fanctld"
+echo "    $DIST/fanprobe"
 echo "    $APP"
 echo ""
 echo "下一步执行安装: sudo ./scripts/install.sh"

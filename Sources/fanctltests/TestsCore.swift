@@ -106,6 +106,22 @@ func testHistogram() {
         expectEqual(window[0].date, "2026-09-05", "评估窗只含晚于基线日的天")
         expect([DailyStats]().after(baselineDate: "2026-09-01").isEmpty, "空序列→空窗")
     }
+
+    // R29/R32：speedChangesPerMinute 磨损速率口径（批次 B 控制律延后的裁决探针）
+    do {
+        var d = DailyStats(date: "2026-09-21")
+        expectEqual(d.speedChangesPerMinute, 0, "无受控秒 → 0")
+        d.tempSeconds = 30; d.speedChanges = 10
+        expectEqual(d.speedChangesPerMinute, 0, "受控秒≤0.5 分 → 0（防抖）")
+        d.tempSeconds = 120; d.speedChanges = 30
+        expectClose(d.speedChangesPerMinute, 15, 1e-9, "30次/2分 = 15/min")
+        d.tempSeconds = 600; d.speedChanges = 30
+        expectClose(d.speedChangesPerMinute, 3, 1e-9, "30次/10分 = 3/min（拍频归一）")
+        var bad = DailyStats(date: "x"); bad.tempSeconds = 120; bad.speedChanges = .nan
+        expectEqual(bad.speedChangesPerMinute, 0, "非有限 speedChanges → 0")
+        var bad2 = DailyStats(date: "y"); bad2.tempSeconds = .infinity; bad2.speedChanges = 10
+        expectEqual(bad2.speedChangesPerMinute, 0, "非有限 tempSeconds → 0")
+    }
 }
 
 

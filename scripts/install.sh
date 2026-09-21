@@ -38,6 +38,13 @@ launchctl bootout system "$PLIST" 2>/dev/null || true
 echo "==> 安装守护进程..."
 mkdir -p /usr/local/libexec
 install -m 755 -o root -g wheel "$DIST/fanctld" /usr/local/libexec/fanctld
+# R32：诊断工具上 PATH（只读，无 root 运行需求）
+mkdir -p /usr/local/bin
+if [[ -f "$DIST/fanprobe" ]]; then
+    install -m 755 -o root -g wheel "$DIST/fanprobe" /usr/local/bin/fanprobe
+else
+    echo "⚠️ dist/fanprobe 缺失——跳过诊断工具安装（请用 ./scripts/build.sh 重新构建）" >&2
+fi
 
 echo "==> 创建配置与日志目录..."
 mkdir -p "$SUPPORT"

@@ -163,6 +163,22 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R32（4.1.3(83) dogfood 初裁 + 磨损口径可观测）：80–82 观测收口；批次B控制律仍延后
+- **真机证据（82 连跑 ~3 天后，2026-09-21）**：
+  - `controlFault` 无锁存；空闲↔负载起转、睡眠/唤醒/电池切换正常（R25 假故障 dogfood 通过）。
+  - R31 诊断字段在 status 可用：`thermalModelUsable=false` / `b=1.00` / 样本曾达 288+（与 R29 诚实门一致）。
+  - dt 账本受控 **2.95 天**（<7）；快拍秒占比 **9.9%**（>5%）。4.1-E 已预注册关闭「不改秒基」，形式确认未开、不阻塞。
+  - `learnEnvelopeGap` 安装前 raw 为 **12.18**（75° raw 87.8 < 73° raw 100，trusted 非单调）；lookup 层 R27 单调包络仍把控制读到 100%（P5 向上取 max）。
+  - 磨损速率（R29 口径 `speedChanges/tempSeconds`）近 14 天约 **3.2–16.4 次/受控分**，与日间负载/拍频共变；**无预注册阈值**支撑立刻改死区/拍频。
+- **决策（沿 R30）**：批次 B 控制律（舒适带死区/更长拍）**继续延后**。遵守失败账本与「无预注册不动控制律」。继续用 `fanprobe` 趋势 + dogfood，不单日绝对次数裁决。
+- **落地（诊断/可观测，零控制律改动）**：
+  - `fanprobe`：今日 `speedChangesPerMinute` + 近 14 天磨损速率趋势（按日期排序防脏 history）；热模型文件明细（a/b/样本/采信带/mature）。
+  - `build.sh`/`install.sh`/`upgrade.sh`：`dist/fanprobe` + `/usr/local/bin/fanprobe`；自升级路径若暂存包带 fanprobe 则同步安装，未带则跳过不阻断。
+  - `DailyStats.speedChangesPerMinute` 补单测（防抖/拍频归一/非有限值）。
+- **83 启动即验（osascript 安装）**：日志 `热模型 b=1.00 未收敛（样本 301），已重置辨识` + `清洗 13 个污染桶（环境 31°C）`；重启后内存热模型 `b≈5.8`（样本 4，尚未 mature）——R30 重置对「RLS 协方差坍缩」有效，长跑贴地后须重启才重辨识。包络 gap 降至 **2.4°**（sanitize 洗掉污染桶；**不做数据手术**，继续观察）。风扇实际 RPM 跟随目标；无 controlFault。
+- **验证**：fanctltests **4642 断言 / 77 组全绿**；真机 App+daemon+fanprobe 均为 **4.1.3(83)**。
+- **独立对抗审查（推送前）**：**APPROVE（无 P1）**。确认 diff 零控制律文件；`speedChangesPerMinute` 单测有牙（删属性 6 断言红）。P2 已修：Release zip / `upgrade.sh` 原先不装 fanprobe——`ci.yml` 发行物补 `dist/fanprobe`，`upgrade.sh` 暂存包带则装、不带则跳过；`install.sh` 缺 fanprobe 时告警。P3 已修：磨损趋势文案改为「近 14 归档日 + 今日实时」（避免 15 行被读成「14 天」）；fanprobe 读 history 先按日期排序。残余：CI 徽章契约下限 workflow 仍 4400、源码门 4550（历史遗留，非本轮引入）；App 内嵌 upgrade 脚本随下次 build.sh 再生成同步。
+
 ### R31（4.1.3(82) 观测）：status 热模型诊断 + fanprobe 生效查表
 - **背景**：R29/R30 已让 isMature 诚实、启动重置贴地模型；诊断仍要读磁盘 JSON。dt 账本受控仍 <7 天，形式确认未开。
 - **改动**：DaemonStatus 可选字段 thermalModelUsable/B/Samples（decodeIfPresent 兼容旧包）；ControlEngine 每拍下发；fanprobe 打印热模型可用性 + percent(for:) 生效查表与 raw 采信桶。

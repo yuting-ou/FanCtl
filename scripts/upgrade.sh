@@ -82,6 +82,11 @@ launchctl bootout system "$PLIST" 2>/dev/null || true
 echo "==> 安装守护进程..."
 mkdir -p /usr/local/libexec
 install -m 755 -o root -g wheel "$STAGING/fanctld" /usr/local/libexec/fanctld
+# R32：诊断工具与 daemon 同步升级（暂存包未带 fanprobe 时跳过，不阻断升级）
+if [[ -f "$STAGING/fanprobe" ]]; then
+    mkdir -p /usr/local/bin
+    install -m 755 -o root -g wheel "$STAGING/fanprobe" /usr/local/bin/fanprobe
+fi
 
 echo "==> 配置/日志目录权限对齐..."
 mkdir -p "$SUPPORT" /Library/Logs/FanCtl

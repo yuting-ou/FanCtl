@@ -64,6 +64,27 @@ do {
     // 今日战报摘要（调速次数 = |输出Δ|≥3% 的拍数，风扇寿命代理指标）
     if let s = ConfigStore.loadStats(), s.date == DailyStats.today(), s.tempCount > 0 {
         print("今日: 最高 \(String(format: "%.1f", s.maxTemp))°C · 调速 \(Int(s.speedChanges)) 次 · 启停抑制 \(Int(s.aiCyclingGuards)) 次\(s.overshootPeak >= 3 ? " · 过冲峰值 +\(Int(s.overshootPeak.rounded()))°" : "") · 静音/安静 \(Int(s.quietSeconds / 60)) 分钟")
+        print(String(format: "  磨损速率: %.2f 次/受控分（R29 口径；批次B门看趋势）",
+                     s.speedChangesPerMinute))
+    }
+    // R32：近 14 归档日磨损速率 + 今日实时（history 未必含今天；裁决看趋势不看单日）
+    // 防御性按日期排序：archiveDay 维护有序，但损坏/手改 JSON 不保证；suffix(14) 才是「最近」
+    do {
+        var rows: [(String, Double, Double)] = []
+        let hist = ConfigStore.loadHistory().sorted { $0.date < $1.date }
+        for d in hist.suffix(14) where d.tempSeconds > 30 {
+            rows.append((d.date, d.speedChanges, d.speedChangesPerMinute))
+        }
+        if let s = ConfigStore.loadStats(), s.date == DailyStats.today(), s.tempSeconds > 30 {
+            if let last = rows.last, last.0 == s.date { rows.removeLast() }
+            rows.append((s.date, s.speedChanges, s.speedChangesPerMinute))
+        }
+        if !rows.isEmpty {
+            print("磨损速率趋势（次/受控分，R29 口径；近 14 归档日 + 今日实时）:")
+            for (date, ch, rate) in rows {
+                print(String(format: "  %@: %.2f（调速 %.0f 次）", date, rate, ch))
+            }
+        }
     }
     if let m = ConfigStore.loadAIMetrics(), m.sampleCount > 0 {
         print(String(format: "AI 指标: %.1f 分钟 | 平均 %.1f°C | 波动 %.1f°C | 平均输出 %.1f%% | 超温 %.0f 秒",
@@ -103,6 +124,19 @@ do {
             let b = s.thermalModelB.map { String(format: "%.2f", $0) } ?? "-"
             print("热模型: \(usable ? "可用" : "不可用（预测回退查表）") | b=\(b) | 样本 \(s.thermalModelSamples ?? 0)")
         }
+    }
+    // R32：磁盘热模型明细（status 只带 b/samples/usable；辨识带与 a 仅文件有）
+    if let m = ConfigStore.loadModel() {
+        let pw: String
+        if let lo = m.minPower, let hi = m.maxPower {
+            pw = String(format: "%.1f–%.1fW", lo, hi)
+        } else { pw = "-" }
+        let env: String
+        if let lo = m.minEnv, let hi = m.maxEnv {
+            env = String(format: "%.1f–%.1f°C", lo, hi)
+        } else { env = "-" }
+        print(String(format: "热模型文件: a=%.2f b=%.2f 样本 %d | 采信带 功耗 %@ 环境 %@ | mature=%@",
+                     m.a, m.b, m.sampleCount, pw, env, m.isMature ? "true" : "false"))
     }
 } catch {
     print("SMC 访问失败: \(error)")
