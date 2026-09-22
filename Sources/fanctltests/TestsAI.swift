@@ -1300,8 +1300,30 @@ func testThermalModel() {
         let legacy = #"{"a":25,"b":5,"sampleCount":100}"#.data(using: .utf8)!
         let old = try! JSONDecoder().decode(ThermalModel.self, from: legacy)
         expect(old.minPower == nil && old.maxEnv == nil, "旧模型无范围字段兼容")
-        expect(old.predictedPercent(for: 25, power: 40, targetTemp: 45) != nil,
+        // 目标 40：need = (25+20−40)/0.1 = 50 > 0
+        expect(old.predictedPercent(for: 25, power: 40, targetTemp: 40) != nil,
                "旧数据保持原行为（范围不设限）")
+        // R33：need≤0（目标 45 → need=0）不得返回合法 0%
+        expect(old.predictedPercent(for: 25, power: 40, targetTemp: 45) == nil,
+               "need≤0 → nil（防 0% 短路）")
+    }
+
+    // R33（控制安全 P1）：need≤0 不得返回合法 0%（.some(0) 会短路 learned??curve??seed）
+    do {
+        expect(m.predictedPercent(for: 25, power: 40, targetTemp: 200) == nil,
+               "目标远高于模型平衡 → need≤0 → nil 而非 0% 前馈")
+        if let p = m.predictedPercent(for: 25, power: 40, targetTemp: 45) {
+            expect(p > 0, "正常工况预测为正风量（得 \(p)）")
+        }
+    }
+
+    // R33：learned=0 不得短路曲线/公式种子（P5 欠冷更贵）；优先级仍 learned>curve>seed
+    do {
+        var c = AIController()
+        let o = c.step(temp: 85, learned: 0, curvePercent: 40)
+        if let o {
+            expect(o >= 40, "learned=0 播种应落到曲线 40 或更高（得 \(o)）")
+        } else { expect(false, "首拍应有输出") }
     }
 }
 

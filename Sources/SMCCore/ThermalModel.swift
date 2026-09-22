@@ -131,16 +131,18 @@ public struct ThermalModel: Codable {
            env < lo - Self.bandMarginEnv || env > hi + Self.bandMarginEnv { return nil }
         let need = (env + a * power / 50.0 - targetTemp) / (b / 50.0)
         guard need.isFinite else { return nil }
-        let steady = max(0, min(100, need))
+        // R33（控制安全 P1）：need≤0 时**不得**返回合法 0%——Optional 的 .some(0) 会短路
+        // `learned ?? curve ?? seed`，在热瞬态/查表空桶时静默欠冷。此处返回 nil 让调用方回退。
+        var best: Double? = need > 0 ? max(0, min(100, need)) : nil
         // #3 瞬态预测：短窗口参数可能反映更高的瞬态热阻，取 max 保守偏安全
         if recentSamples.count >= Self.transientMinSamples, transientB > 2.5 {
             let tNeed = (env + transientA * power / 50.0 - targetTemp) / (transientB / 50.0)
-            if tNeed.isFinite {
+            if tNeed.isFinite, tNeed > 0 {
                 let transient = max(0, min(100, tNeed))
-                return max(steady, transient)
+                best = max(best ?? 0, transient)
             }
         }
-        return steady
+        return best
     }
 
     // 模型是否已可采信（供 UI/诊断展示）。

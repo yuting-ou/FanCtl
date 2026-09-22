@@ -293,17 +293,18 @@ public struct AIController {
                 secondsSinceRelease = .infinity
                 graceSeconds = .infinity
                 // 夺回即从经验起步：负载来了直接给出"已知需要的风量"
-                // 优先学习值 → 曲线插值（用户期望的先验）→ 公式种子
-                output = learned ?? curvePercent ?? seedOutput(for: temp)
+                // 取 max 而非 ?? 链（R33 P5）：模型/学习给出的 0% 是合法 Double 但会短路
+                // 曲线/种子 → 静默欠冷；欠冷代价大于过冷，宁取可用源中的较高者。
+                output = seedChoice(learned: learned, curvePercent: curvePercent, temp: temp)
                 return output
             }
             return nil
         }
 
         guard prev != nil else {
-            // 首拍无历史斜率：优先学习值播种，退回曲线插值，最后退回公式起点
+            // 首拍无历史斜率：与夺回同源（R33）：max 防 0% 前馈短路
             lastAppliedDeltas = nil   // 播种拍非 PD 增量：dt 账本不入账
-            output = learned ?? curvePercent ?? seedOutput(for: temp)
+            output = seedChoice(learned: learned, curvePercent: curvePercent, temp: temp)
             return checkIdleRelease(temp: temp, allowRelease: allowRelease, dt: dt)
         }
 
@@ -381,7 +382,12 @@ public struct AIController {
         // learned 上限 80%：即使学习数据被污染（如未清洗到的异常高值），
         //   单次前馈也不会直接拉满 100%，PD 仍可在其上细调
         if slopeRate > tuning.slopeDeadband {
-            let raw: Double = learned ?? curvePercent ?? (error > 5 ? 60 : (error > 2 ? 35 : 20))
+            // R33：≤0 的 learned/curve 不得短路公式兜底（Optional.some(0) 静默欠冷）
+            let raw: Double = {
+                if let l = learned, l.isFinite, l > 0 { return l }
+                if let c = curvePercent, c.isFinite, c > 0 { return c }
+                return error > 5 ? 60 : (error > 2 ? 35 : 20)
+            }()
             let feedforward = min(raw, 80)
             if feedforward > output { output = feedforward }
         }
@@ -458,6 +464,14 @@ public struct AIController {
     }
 
     // 首拍/夺回种子：偏离目标越远起点越高；学习数据充足时调用方优先用 learned
+    /// R33：播种/前馈——跳过 ≤0 的学习/曲线值（.some(0) 会短路下游），其余保持
+    /// `learned ?? curve ?? seed` 优先级。只堵 0% 欠冷短路，不改正常选源顺序。
+    private func seedChoice(learned: Double?, curvePercent: Double?, temp: Double) -> Double {
+        if let l = learned, l.isFinite, l > 0 { return l }
+        if let c = curvePercent, c.isFinite, c > 0 { return c }
+        return seedOutput(for: temp)
+    }
+
     private func seedOutput(for temp: Double) -> Double {
         min(100, max(0, (temp - tuning.targetTemp) * tuning.kP * 4 + 30))
     }

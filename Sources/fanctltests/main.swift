@@ -756,7 +756,7 @@ testGarbageCodable()
 testChaosTimelines()
 print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
-// R23：2499→4400——原下限是 4496 实际值的 55%，砍掉近半测试仍发绿徽章，契约形同虚设
+// R33：CI 曾为 4400、源码 4550 双源漂移——已统一为 4550
 let minAssertions = 4550
 // R23 测试基建：第二道门槛——distinct group 数。断言总数可被循环刷量虚高
 // （如 expectPersonalityOrdered 单次产 ~816 条），删掉整段测试但保留循环类断言时

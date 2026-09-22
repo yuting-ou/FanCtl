@@ -34,6 +34,7 @@ sleep 1
 echo "==> 删除文件..."
 rm -f "$PLIST"
 rm -f /usr/local/libexec/fanctld
+rm -f /usr/local/bin/fanprobe   # R33：install/upgrade 会装上，卸载必须一并清
 rm -rf "/Library/Application Support/FanCtl"
 rm -rf /Applications/FanCtl.app "/Applications/清风.app"
 rm -f /var/log/fanctld.log

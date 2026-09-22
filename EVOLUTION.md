@@ -163,6 +163,25 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R33（4.1.3(84) 多维度全面审查 + 阻断项修复）：安全/控制/数据/升级/性能五路对抗审查
+- **形态**：作者令「从每个方面出发仔细自查」。五路独立审查（安全提权 / 控制安全 / 数据+测试 / 升级发行+运维 / 性能架构可靠）+ 主代理对账。**未改批次 B 控制律**；安全向欠冷修复按 P5（欠冷更贵）落地。
+- **总判**：架构/内存/崩溃面大体健康（性能路 APPROVE）；**安全路 BLOCK、控制安全 BLOCK、数据诚实 BLOCK、发行首装 BLOCK**。下列 P1 已修，其余进账本。
+- **本轮已修（P1/高杠杆）**：
+  1. **控制安全**：`ThermalModel.predictedPercent` 在 `need≤0` 时返回 **nil**（不再合法 0%——`.some(0)` 会短路 `learned??curve??seed` 静默欠冷）；AI 播种/升温前馈跳过 ≤0 的 learned/curve（优先级不变）。
+  2. **发行首装**：`install.sh` 产物根随布局自适应（zip 与仓库树）——原先固定 `../dist` 使 Release 包 `sudo ./install.sh` **永远装不上**。
+  3. **发行首装**：`install.sh` 复制后 `xattr -dr com.apple.quarantine`（与 upgrade 对齐，否则 Gatekeeper 拦首次打开）。
+  4. **安全**：osascript 路径/提示含 `"` `\` 换行时**拒绝提权**（堵 AppleScript 字符串闭合注入）；watcher 窗 120s→900s（覆盖输密码）。
+  5. **卸载完整**：`uninstall.sh` 删除 `/usr/local/bin/fanprobe`。
+  6. **测试契约**：CI 断言下限 4400→**4550**（与源码门一致）。
+- **验证**：fanctltests **4646 断言 / 77 组全绿**（含 need≤0→nil、learned=0 不短路曲线）。
+- **P1 未修（进账本，需架构/信任根，禁止静默当已修）**：
+  - 安全：用户可写 bundle 内 `uninstall.sh`/`upgrade.sh` 被文档/UI 推 `sudo` 执行（R23 同类）；App 二进制内嵌脚本仍随 `chown -R` 用户可写（信任根未立）；sha256 校验→`install` 按路径 TOCTOU；`/usr/local` 符号链接种植；config chown/chmod shell check-then-act；损坏备份可把 root 文件泄给 admin 组。
+  - 控制安全：env−12 仍最长 90s 盲窗；SSD/battery 70/45 **guard 不进 manual**（仅 78/48/92 红线）；NAND 传感器失效时托底静默关闭；`wake()` 不重置 FanFeedbackHealth（睡醒假 controlFault）；controlBlocked 期间红线非连续写。
+  - 数据诚实：history 整文件解码失败即清空 30 天归档；AI `averageTemp/stdDev` 未按时间加权（自适应拍下偏繁忙段）；`learnedPoints` 与 `percent(for:)` 包络范围不一致（展示≠控制）；`speedChangesPerMinute` 分子/分母域不一致。
+  - 可靠：save* 返回值被忽略仍清 dirty；非 config 写路径无 EINTR 重试；SMC init 失败 × KeepAlive=10s 崩溃循环；config 损坏自愈写默认值（销毁 last-good）。
+  - 运维：issue 模板不收 fanprobe/status；badge 步骤可绿洗红构建；Release zip 无信任根（R23 已知）。
+- **方法论**：审查必须按攻击面提问「最坏热后果 / 同 uid 能否 root / 指标会不会说谎 / 首装是否真能装上」；测试失败即语义门有效（seedChoice 曾改过头 max 越权，红测打回只堵 0% 短路）。
+
 ### R32（4.1.3(83) dogfood 初裁 + 磨损口径可观测）：80–82 观测收口；批次B控制律仍延后
 - **真机证据（82 连跑 ~3 天后，2026-09-21）**：
   - `controlFault` 无锁存；空闲↔负载起转、睡眠/唤醒/电池切换正常（R25 假故障 dogfood 通过）。

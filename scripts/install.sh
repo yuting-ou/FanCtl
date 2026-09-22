@@ -22,8 +22,17 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-cd "$(dirname "$0")/.."
-DIST="$(pwd)/dist"
+# R33：产物根随布局自适应——仓库树是 scripts/../dist；Release zip 是 install.sh 与
+# FanCtl.app/fanctld/fanprobe 同级。原先固定 cd .. + dist/ 导致 zip 首装永远找不到产物。
+_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -f "$_SCRIPT_DIR/fanctld" && -d "$_SCRIPT_DIR/FanCtl.app" ]]; then
+    DIST="$_SCRIPT_DIR"
+elif [[ -f "$_SCRIPT_DIR/../dist/fanctld" && -d "$_SCRIPT_DIR/../dist/FanCtl.app" ]]; then
+    DIST="$(cd "$_SCRIPT_DIR/../dist" && pwd)"
+else
+    echo "未找到构建产物（fanctld + FanCtl.app）。仓库内请先 ./scripts/build.sh；Release 包请在解压目录执行。" >&2
+    exit 1
+fi
 PLIST=/Library/LaunchDaemons/com.fanctl.daemon.plist
 SUPPORT="/Library/Application Support/FanCtl"
 
@@ -111,6 +120,8 @@ pkill -x FanCtl 2>/dev/null || true
 sleep 1
 rm -rf "/Applications/清风.app" /Applications/FanCtl.app
 cp -R "$DIST/FanCtl.app" "/Applications/清风.app"
+# R33：与 upgrade.sh 对齐——未公证 bundle + quarantine = Gatekeeper 拦首次打开
+xattr -dr com.apple.quarantine "/Applications/清风.app" 2>/dev/null || true
 # 把 App bundle 属主改回实际登录用户（非 root）：此后仅改 UI 时可用 ./scripts/deploy.sh 免密替换，
 # 无需再 sudo（守护进程仍归 root，与此无关）。
 # R29：osascript 升级无 SUDO_USER——与 upgrade.sh 同源取 console 用户，否则

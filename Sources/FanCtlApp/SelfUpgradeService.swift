@@ -160,7 +160,7 @@ final class SelfUpgradeService: ObservableObject {
             try? FileManager.default.removeItem(at: marker)
             let quotedMarker = marker.path.replacingOccurrences(of: "'", with: "'\\''")
             let watcherScript = """
-            for i in $(seq 1 120); do
+            for i in $(seq 1 900); do
                 [ "$(cat '\(quotedMarker)' 2>/dev/null)" = '\(normTag)' ] && sleep 1 && open '/Applications/清风.app' && exit 0
                 sleep 1
             done
@@ -171,11 +171,20 @@ final class SelfUpgradeService: ObservableObject {
             watcher.arguments = ["-c", watcherScript]
             try? watcher.run()
             let quotedStage = innerDir.path.replacingOccurrences(of: "'", with: "'\\''")
-            let prompt = SelfUpgrade.authorizationPrompt(tag: tag)
+            // R33（安全 P1-C）：AppleScript 外层是双引号字符串——路径里的 " \ 换行可闭合
+            // do shell script 并追加 with administrator privileges。拒绝含元字符的路径，
+            // 不做“拼接转义”（双层引号极易漏）。
+            func applescriptSafe(_ s: String) -> Bool {
+                !s.contains(where: { $0 == "\"" || $0 == "\\" || $0 == "\n" || $0 == "\r" })
+            }
+            guard applescriptSafe(quotedStage), applescriptSafe(quotedMarker),
+                  applescriptSafe(SelfUpgrade.authorizationPrompt(tag: tag)) else {
+                throw Failure("暂存路径/提示含 AppleScript 元字符，已拒绝提权")
+            }
             let appleScript =
                 "do shell script \"echo \(embeddedUpgradeScriptBase64) | base64 -d | bash -s -- "
                 + "'\(quotedStage)' '\(quotedMarker)' '\(normTag)' '\(shaDaemon)' '\(shaAppBin)'\""
-                + " with administrator privileges with prompt \"\(prompt)\""
+                + " with administrator privileges with prompt \"\(SelfUpgrade.authorizationPrompt(tag: tag))\""
             let (osaStatus, osaErr) = try await Task.detached(priority: .userInitiated) {
                 let osa = Process()
                 osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
