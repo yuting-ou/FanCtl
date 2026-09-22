@@ -273,7 +273,7 @@ public struct ThermalLearn: Equatable {
             inner = (0...3).map { i in inner[min(inner.count - 1, Int((Double(i) * step).rounded()))] }
         }
         // 最小间距过滤（丢弃与前一保留点 <1.5° 的点），含锚点在内统一处理
-        var all = [lowAnchor] + inner + [highAnchor]
+        let all = [lowAnchor] + inner + [highAnchor]
         var result: [CurvePoint] = []
         for p in all {
             if let last = result.last, p.temp - last.temp < 1.5 { continue }

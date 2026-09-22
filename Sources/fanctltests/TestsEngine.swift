@@ -723,7 +723,7 @@ func testAdversarialFixes() {
     // 预置 7 个不同秒级时间戳的旧备份（避免碰撞使测试空转），再触发一次损坏自愈，
     // 断言裁剪后 ≤5。
     do {
-        var envDirs: [URL] = [engineTestEnv()]
+        let envDirs: [URL] = [engineTestEnv()]
         FanCtlPaths.ensureDirectories()
         let base = Int(Date().timeIntervalSince1970) - 100   // 都早于本次新备份
         for i in 0..<7 {

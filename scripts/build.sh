@@ -33,6 +33,8 @@ if ! env -u SDKROOT swiftc -typecheck "$_PROBE" >/dev/null 2>&1; then
     _def_sdk="$(env -u SDKROOT xcrun --sdk macosx --show-sdk-path)"
     _def="$(cd "$_def_sdk" 2>/dev/null && pwd -P)"
     # glob 直接展开（引号前缀容忍空格路径），while-read 逐行防词分割；跳过默认 SDK 本体
+    _sdklist="$(mktemp "${TMPDIR:-/tmp}/fanctl-sdklist.XXXXXX")" # R34: 临时文件替代 process substitution（/dev/fd 在受限环境打不开）
+    printf '%s\n' "$(dirname "$_def_sdk")"/MacOSX[0-9]*.[0-9]*.sdk 2>/dev/null | sort -Vr > "$_sdklist"
     while IFS= read -r _d; do
         _real="$(cd "$_d" 2>/dev/null && pwd -P)" || continue
         [ "$_real" = "$_def" ] && continue
@@ -40,7 +42,7 @@ if ! env -u SDKROOT swiftc -typecheck "$_PROBE" >/dev/null 2>&1; then
             APP_SDKROOT="$_real"
             break
         fi
-    done < <(printf '%s\n' "$(dirname "$_def_sdk")"/MacOSX[0-9]*.[0-9]*.sdk 2>/dev/null | sort -Vr)
+    done < "$_sdklist"; rm -f "$_sdklist"
     [ -n "$APP_SDKROOT" ] || { echo "❌ 默认 SDK 与更旧 SDK 均无法编译 SwiftUI @State（SwiftUIMacros 插件缺失？），App 目标无法构建" >&2; exit 1; }
     echo "⚠️ 默认 SDK 缺 SwiftUIMacros 宏插件（CLT 打包缺陷），App 目标钉到 ${APP_SDKROOT} ；daemon/测试仍用默认 SDK"
 fi

@@ -8,7 +8,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 UPGRADE="$ROOT/scripts/upgrade.sh"
 INSTALL="$ROOT/scripts/install.sh"
-TMP="$(mktemp -d /tmp/fanctl-root-tests.XXXXXX)"
+# 暂存跟随 $TMPDIR（macOS 惯例）：/tmp 只读的受限环境下 mktemp 直接失败，
+# set -e 让整个门禁跑不了，红得误导（报「输出缺少汇总行」而非真实原因）（R34）
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/fanctl-root-tests.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 pass=0
