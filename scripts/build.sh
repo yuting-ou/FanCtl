@@ -86,8 +86,10 @@ let embeddedUpgradeScriptBase64 = "$_UPGRADE_B64"
 EOF
 
 echo "==> 编译 release（非 UI 目标：默认系统 SDK）..."
-swift build -c release --disable-sandbox --target fanctld
-swift build -c release --disable-sandbox --target fanprobe
+# 显式写 --scratch-path：构建与 artifact() 的查询必须是**同一组 flags**（v89 的教训），
+# 不把默认落点交给环境或未来的 SwiftPM 默认值
+swift build -c release --disable-sandbox --scratch-path "$ROOT/.build" --target fanctld
+swift build -c release --disable-sandbox --scratch-path "$ROOT/.build" --target fanprobe
 
 # ---------------------------------------------------------------------------
 # 产物定位（R35 发版链，两次翻车后定的纪律）：必须与构建问**同一组 flags**。
@@ -96,19 +98,35 @@ swift build -c release --disable-sandbox --target fanprobe
 # 三级策略：① 带 --target 问 show-bin-path；② 不中则在 scratch 里按 mtime 找同名
 # 可执行件（刚编的一定最新）；③ 还不中 → 响亮失败。消息一律 ASCII：CI 上
 # "$f（全角" 曾被 bash 吞进变量名报 unbound variable（见 EVOLUTION R35 发版链）。
+# show-bin-path 的 stderr 收集处（诊断用）：走 TMPDIR，不用固定文件名——
+# /tmp 里固定名会被他用户预置符号链接（R28 同族的面）
+SBP_ERR=$(mktemp "${TMPDIR:-/tmp}/fanctl-sbp.XXXXXX")
+# 同一 EXIT trap 里并列清理：bash 的 trap 是覆盖语义，另起一条会把第 21 行的
+# _PROBE_DIR 回收顶掉（那样探测临时目录就会泄漏）
+trap 'rm -rf "$_PROBE_DIR"; rm -f "$SBP_ERR"' EXIT
+
 artifact() {  # $1=SwiftPM 目标名 $2=产物文件名 $3=scratch 目录 $4=SDKROOT（可空）
     local target="$1" name="$2" scratch="$3" sdk="$4" p found
     if [ -n "$sdk" ]; then
         p=$(SDKROOT="$sdk" swift build -c release --disable-sandbox --scratch-path "$scratch" \
-            --target "$target" --show-bin-path 2>/dev/null || true)
+            --target "$target" --show-bin-path 2>"$SBP_ERR" || true)
     else
         p=$(swift build -c release --disable-sandbox --scratch-path "$scratch" \
-            --target "$target" --show-bin-path 2>/dev/null || true)
+            --target "$target" --show-bin-path 2>"$SBP_ERR" || true)
     fi
     if [ -n "$p" ] && [ -f "$p/$name" ]; then printf '%s\n' "$p/$name"; return 0; fi
-    found=$(find "$scratch" -type f -name "$name" -perm +111 -print0 2>/dev/null \
-        | xargs -0 ls -t 2>/dev/null | head -1 || true)
+    # 回退搜索用 -L（跟随符号链接）：SwiftBuild 后端会把 .build 里的目录做成指向
+    # scratch 外的链接，find 默认不跟随 → -type f 一个都不命中（CI 第四红的根因假设）。
+    # 排除 dist：那里有上一轮的产物副本，宁缺不"静默拷陈旧件"（自证门也拦不住同号陈旧件）。
+    found=$(find -L "$ROOT" -name "$name" -type f -perm +111 2>/dev/null \
+        | grep -v -e "^$ROOT/Sources" -e "^$ROOT/dist" | xargs -0 ls -t 2>/dev/null | head -1 || true)
     if [ -n "$found" ] && [ -f "$found" ]; then printf '%s\n' "$found"; return 0; fi
+    # 彻底找不到：把现场打全——这是发行链的"最后一次提问"，信息要给足
+    echo "DIAG show-bin-path rc/stderr:" >&2
+    sed -n '1,6p' "$SBP_ERR" >&2 || true
+    echo "DIAG scratch=$scratch target=$target name=$name" >&2
+    ls -l "$scratch" 2>&1 | head -20 >&2 || true
+    find "$ROOT" -maxdepth 3 -name "$name*" 2>/dev/null | head -20 >&2 || true
     return 1
 }
 
@@ -121,8 +139,11 @@ if [ -n "$APP_SDKROOT" ]; then
 else
     echo "==> 编译 release（App 目标：默认系统 SDK）..."
     APP_SCRATCH="$ROOT/.build"
-    swift build -c release --disable-sandbox --target FanCtlApp
+    swift build -c release --disable-sandbox --scratch-path "$APP_SCRATCH" --target FanCtlApp
 fi
+
+rm -rf "$DIST"
+mkdir -p "$DIST"
 
 FANCTLD_BIN=$(artifact fanctld fanctld "$ROOT/.build" "") \
     || { echo "ERROR: cannot locate fanctld under $ROOT/.build" >&2; exit 1; }
@@ -134,8 +155,6 @@ echo "==> 产物 $FANCTLD_BIN"
 echo "==> 产物 $FANPROBE_BIN"
 echo "==> 产物 $APP_EXEC_BIN"
 
-rm -rf "$DIST"
-mkdir -p "$DIST"
 cp "$FANCTLD_BIN" "$DIST/fanctld"
 cp "$FANPROBE_BIN" "$DIST/fanprobe"
 
