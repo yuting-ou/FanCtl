@@ -284,10 +284,12 @@ fi
 # 说明里必须点名本版的完整版本号（只提旧系列 = 迁移警示过期；发 4.2.9 贴 4.2.2 的
 # 说明也在此红）。V 为空时必须直接判负——`grep -qF ""` 是恒真，空串会把这道门变成摆设。
 V=$(head -1 "$ROOT/VERSION" | awk '{print $1}')
-if [[ -n "$V" ]] && grep -qF -- "$V" "$ROOT/RELEASE-NOTES.md" 2>/dev/null; then
-    ok "RELEASE-NOTES.md 提到本版 ${V}"
+# 必须命中"本版变更要点"里那条 bullet（`- <版本>：`）——全文匹配会被旧版警示行蒙过
+V_RE=${V//./\.}
+if [[ -n "$V" ]] && grep -qE "^- ${V_RE}[：:]" "$ROOT/RELEASE-NOTES.md" 2>/dev/null; then
+    ok "RELEASE-NOTES.md 有本版要点行 - ${V}："
 else
-    bad "RELEASE-NOTES.md 未提到本版 ${V:-<VERSION 读空>}，迁移警示会过期"
+    bad "RELEASE-NOTES.md 缺要点行 - ${V:-<VERSION 读空>}：（说明与 tag 会不同源）"
 fi
 # 配对门要命中代码本身而不是注释：`--report` 三个字符在注释里也算数
 if grep -q 'contains("--report")' "$ROOT/Sources/fanprobe/main.swift" \

@@ -616,7 +616,8 @@ final class EngineCollector {
 // v3.4.1：钩子可注入（DoD-7）——电池/分项功耗/wake 路径此前零覆盖
 func makeEngine(smc: MockSMC, clock: FakeClock, collector: EngineCollector,
                 onBattery: @escaping () -> Bool = { false },
-                powerComponents: @escaping () -> (cpu: Double?, gpu: Double?) = { (nil, nil) }) -> ControlEngine {
+                powerComponents: @escaping () -> (cpu: Double?, gpu: Double?) = { (nil, nil) },
+                daemonVersion: String? = nil) -> ControlEngine {
     // v3.4.5：走时钟安全构造（makeTemperatureSensors），否则真实时间在 FakeClock
     // 基准（本地正午）之前时每拍触发后台重扫 → 并发写竞态（间歇 exit 139 真根因）
     let sensors = try! makeTemperatureSensors(smc: smc, clock: { clock.time() })
@@ -628,7 +629,7 @@ func makeEngine(smc: MockSMC, clock: FakeClock, collector: EngineCollector,
                     schedule: { collector.schedules.append($0) },
                     onBattery: onBattery,
                     powerComponents: powerComponents,
-                    setPowerInterval: { _ in }))
+                    setPowerInterval: { _ in }, daemonVersion: daemonVersion))
 }
 
 
@@ -811,9 +812,9 @@ print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
 // R33：CI 曾为 4400、源码 4550 双源漂移——已统一；改数值必须两处同时改
 // R35/R36：4.2.1 实测 4736 断言 / 82 组；R37：4.2.2 实测 4836 / 84（诊断包结构与口径、
-// 只读零副作用两组）；R38：4.2.3 实测 4852 / 85（daemon 版本自报的 JSON 契约组，含
+// 只读零副作用两组）；R38：4.2.3 实测 4860 / 85（daemon 版本自报的 JSON 契约组，含
 // "init 参数漏赋值"与"接线计数"两条 F9 同族守卫）
-let minAssertions = 4840
+let minAssertions = 4850
 // R23 测试基建：第二道门槛——distinct group 数。断言总数可被循环刷量虚高
 // （如 expectPersonalityOrdered 单次产 ~816 条），删掉整段测试但保留循环类断言时
 // 总数不降、覆盖却净损；group 数是粗粒度结构量，删函数即少一个 group，刷不出来。

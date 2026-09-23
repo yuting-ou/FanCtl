@@ -38,6 +38,7 @@ private func fullReportInput() -> DiagnosticReport.Input {
     st.thermalModelUsable = true
     st.thermalModelB = 1.2
     st.thermalModelSamples = 312
+    st.daemonVersion = "4.2.3 (94)"
     st.hardwareProfile = HardwareProfile(
         modelID: "Mac14,10", chipName: "Apple M2 Pro", osVersion: "26.1",
         fanCount: 1, sensorCounts: .init(cpu: 3, gpu: 1, nand: 2, batt: 3, palm: 1,
@@ -107,14 +108,15 @@ func testDiagnosticReport() {
     expect(emptyText.contains("daemon 缺失") || emptyText.contains("缺失（未装守护进程"),
            "空输入报 daemon 二进制缺失")
     expect(emptyText.contains("App 未找到"), "空输入报 App 版本未找到")
+    expect(emptyText.contains("无 status，无从判断"),
+           "没解出 status 时不下「daemon 早于某版」的因果结论")
     expect(emptyText.contains("缺（损坏将回出厂默认）"), "无 last-good 时明说会回出厂默认")
 
     // ④ 装机版本：App 版本串与 daemon 落盘时间都要出现（issue 第一问=什么版本）
     let fullText = fullLines.joined(separator: "\n")
     expect(fullText.contains("4.2.2 (93)"), "满输入含 App 版本串")
     expect(fullText.contains("二进制装于 2023-11-"), "满输入含 daemon 安装时间")
-    expect(fullText.contains("版本未落盘（daemon 早于 4.2.3）"),
-           "status 里没有版本时如实报未落盘")
+    expect(fullText.contains("daemon 自报 4.2.3 (94)"), "满输入打印 daemon 自报版本")
     expect(fullText.contains("模式 ai"), "满输入含调速模式")
     expect(fullText.contains("fan0: 2600/2800RPM"), "满输入含风扇实际/目标转速")
     expect(fullText.contains("口径 秒加权"), "有秒分母的指标标注为新口径")
@@ -196,6 +198,16 @@ func testDiagnosticReport() {
            "风扇小节带陈旧标记")
     expect(staleLines.contains(where: { $0.hasPrefix("daemon:") && $0.contains("停更 10 分钟") }),
            "停更时长与标记同源（10 分钟）")
+    // 版本取自 status.json，停更三小时后打印的自报版本同样是三小时前的——装机行必须同标
+    expect(staleLines.contains(where: { $0.hasPrefix("装机:") && $0.contains("陈旧快照") }),
+           "装机行也带陈旧标注")
+
+    // 有 status 但没自报版本（旧 daemon / 该值被改）：报"未自报"，不猜版本
+    var noVerInput = fullReportInput()
+    noVerInput.status?.daemonVersion = nil
+    let noVerText = DiagnosticReport.text(noVerInput)
+    expect(noVerText.contains("未自报（旧版 daemon，或该值被改/被拒收）"),
+           "缺值只说缺值，不断言「daemon 早于 4.2.3」")
 
     // ⑧c 文件在但解不出（损坏或跨版本）：不得说"运行中"，也不得说"无 status.json"
     var undecodableInput = fullReportInput()
@@ -374,6 +386,15 @@ func testDaemonVersionField() {
         return (try? dec.decode(DaemonStatus.self, from: d))?.daemonVersion
     }
     expectEqual(decoded("4.2.3 (94)"), "4.2.3 (94)", "基线：常规版本串可解出")
+    // 同一份夹具的常规字段也要解得出——否则三条 nil 期望可能只是"整包 JSON 没解出来"
+    let baselineJSON = "{\"cpuTemp\":70,\"gpuTemp\":55,\"mode\":\"ai\",\"appliedPercent\":40,"
+        + "\"fans\":[],\"timestamp\":\"2026-09-23T10:00:00Z\",\"daemonVersion\":\"4.2.3 (94)\"}"
+    if let base = baselineJSON.data(using: .utf8),
+       let baseStatus = try? dec.decode(DaemonStatus.self, from: base) {
+        expectClose(baseStatus.cpuTemp, 70, 0.001, "夹具基线：常规字段同批解出（守卫不是靠整包失败蒙对）")
+    } else {
+        expect(false, "夹具基线：常规 status 应可解码")
+    }
     expectEqual(decoded(String(repeating: "9", count: 64)), String(repeating: "9", count: 64),
                 "64 字符以内保留")
     expectEqual(decoded(String(repeating: "9", count: 65)), nil, "超长版本串按污染处理")
@@ -406,4 +427,32 @@ func testDaemonVersionField() {
     let wired = engine.components(separatedBy: "daemonVersion: hooks.daemonVersion").count - 1
     expectEqual(sites, 3, "引擎里的 status 构造点数量（常规 + 两个传感器故障分支）")
     expectEqual(wired, sites, "每个 status 构造点都必须带 daemonVersion（漏加即红）")
+
+    // checked-in 占位常量必须与 VERSION 一致：CI 的测试作业走裸 `swift build`（不经
+    // build.sh），漂了就等于让测试链上的 daemon 自报一个它从未拥有过的版本号
+    let versionLine = source("VERSION").split(separator: "\n").first.map(String.init) ?? ""
+    let fields = versionLine.split(separator: " ").map(String.init)
+    expectEqual(fields.count, 2, "VERSION 读到两个字段")
+    let generated = source("Sources/fanctld/Version.generated.swift")
+    if fields.count == 2 {
+        expect(generated.contains("let fanctldVersion = \"\(fields[0]) (\(fields[1]))\""),
+               "Version.generated.swift 与 VERSION 同步（改号必须先跑 build.sh）")
+    }
+
+    // 行为覆盖（文本计数门只能防删，防不了"故障分支实际没写进去"）：
+    // 启动即传感器读失败 → 走"sensors 全 0 的最小 status"那条构造，它也必须带版本
+    let dir = engineTestEnv()
+    ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+    let smc = makeFanSMC()
+    smc.set("PSTR", 30)
+    smc.set("Tp01", 0)                     // 温度读失败
+    let clock = FakeClock()
+    let collector = EngineCollector()
+    let faultEngine = makeEngine(smc: smc, clock: clock, collector: collector,
+                                 daemonVersion: "9.9.9 (1)")
+    faultEngine.beat()
+    let written = ConfigStore.loadStatus()
+    expectEqual(written?.controlFault, true, "前提：这一拍确实走了传感器故障分支")
+    expectEqual(written?.daemonVersion, "9.9.9 (1)", "故障分支的 status 也带自报版本")
+    try? FileManager.default.removeItem(at: dir)
 }
