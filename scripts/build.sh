@@ -89,47 +89,60 @@ echo "==> 编译 release（非 UI 目标：默认系统 SDK）..."
 swift build -c release --disable-sandbox --target fanctld
 swift build -c release --disable-sandbox --target fanprobe
 
-# 产物目录一律问 SwiftPM，不硬编码 .build/release：不同工具链/构建后端
-# （llbuild 与 SwiftBuild）会把它放在 .build/release 或 .build/<triple>/release
-# 等不同位置——CI runner 更新 Xcode 后，硬编码路径的 cp 直接失败（v4.1.4 首次发版即栽在这）。
-BIN=$(swift build -c release --disable-sandbox --show-bin-path)
+# ---------------------------------------------------------------------------
+# 产物定位（R35 发版链，两次翻车后定的纪律）：必须与构建问**同一组 flags**。
+# CI 实测：不带 --target 的 --show-bin-path 给 .build/<triple>/release，而 --target
+# fanctld 的产物不在那里；本机反过来两条路都存在——硬编码目录或"半问"都会翻车。
+# 三级策略：① 带 --target 问 show-bin-path；② 不中则在 scratch 里按 mtime 找同名
+# 可执行件（刚编的一定最新）；③ 还不中 → 响亮失败。消息一律 ASCII：CI 上
+# "$f（全角" 曾被 bash 吞进变量名报 unbound variable（见 EVOLUTION R35 发版链）。
+artifact() {  # $1=SwiftPM 目标名 $2=产物文件名 $3=scratch 目录 $4=SDKROOT（可空）
+    local target="$1" name="$2" scratch="$3" sdk="$4" p found
+    if [ -n "$sdk" ]; then
+        p=$(SDKROOT="$sdk" swift build -c release --disable-sandbox --scratch-path "$scratch" \
+            --target "$target" --show-bin-path 2>/dev/null || true)
+    else
+        p=$(swift build -c release --disable-sandbox --scratch-path "$scratch" \
+            --target "$target" --show-bin-path 2>/dev/null || true)
+    fi
+    if [ -n "$p" ] && [ -f "$p/$name" ]; then printf '%s\n' "$p/$name"; return 0; fi
+    found=$(find "$scratch" -type f -name "$name" -perm +111 -print0 2>/dev/null \
+        | xargs -0 ls -t 2>/dev/null | head -1 || true)
+    if [ -n "$found" ] && [ -f "$found" ]; then printf '%s\n' "$found"; return 0; fi
+    return 1
+}
 
 if [ -n "$APP_SDKROOT" ]; then
     # 钉住 SDK 的 App 构建走独立 scratch——避免与默认 SDK 构建互相失效缓存反复全量重编
     echo "==> 编译 release（App 目标：${APP_SDKROOT} ）..."
-    APP_BIN=$(SDKROOT="$APP_SDKROOT" swift build -c release --disable-sandbox \
-        --scratch-path "$ROOT/.build-app-sdk" --show-bin-path)
+    APP_SCRATCH="$ROOT/.build-app-sdk"
     SDKROOT="$APP_SDKROOT" swift build -c release --disable-sandbox \
-        --scratch-path "$ROOT/.build-app-sdk" --target FanCtlApp
+        --scratch-path "$APP_SCRATCH" --target FanCtlApp
 else
     echo "==> 编译 release（App 目标：默认系统 SDK）..."
-    APP_BIN=$(swift build -c release --disable-sandbox --show-bin-path)
+    APP_SCRATCH="$ROOT/.build"
     swift build -c release --disable-sandbox --target FanCtlApp
 fi
 
+FANCTLD_BIN=$(artifact fanctld fanctld "$ROOT/.build" "") \
+    || { echo "ERROR: cannot locate fanctld under $ROOT/.build" >&2; exit 1; }
+FANPROBE_BIN=$(artifact fanprobe fanprobe "$ROOT/.build" "") \
+    || { echo "ERROR: cannot locate fanprobe under $ROOT/.build" >&2; exit 1; }
+APP_EXEC_BIN=$(artifact FanCtlApp FanCtlApp "$APP_SCRATCH" "$APP_SDKROOT") \
+    || { echo "ERROR: cannot locate FanCtlApp under $APP_SCRATCH" >&2; exit 1; }
+echo "==> 产物 $FANCTLD_BIN"
+echo "==> 产物 $FANPROBE_BIN"
+echo "==> 产物 $APP_EXEC_BIN"
+
 rm -rf "$DIST"
 mkdir -p "$DIST"
-
-# 产物目录由 SwiftPM 自己回答（show-bin-path），并打进日志——CI runner 与本机可能
-# 落在不同后端目录（.build/release vs .build/out/Products/Release），硬编码必翻车。
-echo "==> SwiftPM 产物目录: BIN=$BIN APP_BIN=$APP_BIN"
-# 缺产物响亮报错。此处消息一律 ASCII：CI 上 `$f（全角括号` 曾报 "unbound variable"
-# （bash 3.2 把紧跟变量名的多字节吞进名字，本地复现不出，见 EVOLUTION R35 发版链）——
-# 发行路径不赌任何 shell 的多字节行为。
-for prod in "$BIN/fanctld" "$BIN/fanprobe" "$APP_BIN/FanCtlApp"; do
-    if [ ! -f "$prod" ]; then
-        echo "ERROR: missing build artifact: $prod" >&2
-        echo "ERROR: BIN=$BIN APP_BIN=$APP_BIN" >&2
-        exit 1
-    fi
-done
-cp "$BIN/fanctld" "$DIST/fanctld"
-cp "$BIN/fanprobe" "$DIST/fanprobe"
+cp "$FANCTLD_BIN" "$DIST/fanctld"
+cp "$FANPROBE_BIN" "$DIST/fanprobe"
 
 # 组装菜单栏 App bundle
 APP="$DIST/FanCtl.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$APP_BIN/FanCtlApp" "$APP/Contents/MacOS/FanCtl"
+cp "$APP_EXEC_BIN" "$APP/Contents/MacOS/FanCtl"
 cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # 随包携带卸载脚本，App“关于”菜单可指引用户一键卸载
 cp "$ROOT/scripts/uninstall.sh" "$APP/Contents/Resources/uninstall.sh"
@@ -187,6 +200,21 @@ STRINGS
 
 # ad-hoc 签名（本机运行足够）。R23（P3）：失败必须红——此前 `|| true` 把签名失败
 # 静默吞掉，可能让未签名二进制混进 dist/ 发行资产，装机后才在 Gatekeeper/升级链炸。
+# 发行链自证（R35）：组装完必须能回答"dist 里到底是不是本次代码"——
+# 产物定位失败的最坏形态不是报错，而是静默拷进一个陈旧的中间件（同号不同码）。
+# daemon 自己报的版本与 App 的 Info.plist 都对齐 VERSION 才算过。
+DAEMON_V=$("$DIST/fanctld" -v 2>/dev/null || true)
+if [ "$DAEMON_V" != "fanctld ${APP_VERSION} (${BUILD_NUMBER})" ]; then
+    echo "ERROR: dist/fanctld version mismatch: got [$DAEMON_V] want [fanctld ${APP_VERSION} (${BUILD_NUMBER})]" >&2
+    exit 1
+fi
+PLIST_V=$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")
+PLIST_B=$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")
+if [ "$PLIST_V" != "$APP_VERSION" ] || [ "$PLIST_B" != "$BUILD_NUMBER" ]; then
+    echo "ERROR: Info.plist version mismatch: got [$PLIST_V / $PLIST_B] want [$APP_VERSION / $BUILD_NUMBER]" >&2
+    exit 1
+fi
+
 codesign --force --sign - "$APP"
 codesign --force --sign - "$DIST/fanctld"
 codesign --force --sign - "$DIST/fanprobe"
