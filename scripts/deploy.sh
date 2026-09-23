@@ -10,7 +10,7 @@ APP="/Applications/清风.app"
 DIST_APP="dist/FanCtl.app"
 
 if [[ ! -d "$DIST_APP" ]]; then
-    echo "未找到 $DIST_APP，请先运行 ./scripts/build.sh"
+    echo "未找到 ${DIST_APP}，请先运行 ./scripts/build.sh"
     exit 1
 fi
 

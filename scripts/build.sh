@@ -110,10 +110,18 @@ fi
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
-# 守护进程二进制 + 只读诊断工具（R32：磨损速率/热模型 dogfood 入口）
-# 缺产物必须响亮报错，不能留给 cp 的"No such file or directory"当谜面
-for f in "$BIN/fanctld" "$BIN/fanprobe" "$APP_BIN/FanCtlApp"; do
-    [ -f "$f" ] || { echo "❌ 缺少产物：$f（SwiftPM 报的产物目录：BIN=$BIN APP_BIN=$APP_BIN）" >&2; exit 1; }
+# 产物目录由 SwiftPM 自己回答（show-bin-path），并打进日志——CI runner 与本机可能
+# 落在不同后端目录（.build/release vs .build/out/Products/Release），硬编码必翻车。
+echo "==> SwiftPM 产物目录: BIN=$BIN APP_BIN=$APP_BIN"
+# 缺产物响亮报错。此处消息一律 ASCII：CI 上 `$f（全角括号` 曾报 "unbound variable"
+# （bash 3.2 把紧跟变量名的多字节吞进名字，本地复现不出，见 EVOLUTION R35 发版链）——
+# 发行路径不赌任何 shell 的多字节行为。
+for prod in "$BIN/fanctld" "$BIN/fanprobe" "$APP_BIN/FanCtlApp"; do
+    if [ ! -f "$prod" ]; then
+        echo "ERROR: missing build artifact: $prod" >&2
+        echo "ERROR: BIN=$BIN APP_BIN=$APP_BIN" >&2
+        exit 1
+    fi
 done
 cp "$BIN/fanctld" "$DIST/fanctld"
 cp "$BIN/fanprobe" "$DIST/fanprobe"

@@ -163,6 +163,19 @@ else
 fi
 
 echo "——"
+echo "== shell 展开的多字节邻接（R35 发版链）=="
+# v4.1.4 首次发版在 CI 红于 build.sh："$f（全角括号" 报 unbound variable（bash 把紧跟
+# 变量名的多字节吞进名字；本地 bash 3.2 + 各 locale 都复现不出，但不值得拿发版赌）。
+# 规则：非 ASCII 紧跟展开的一律写 ${VAR}——扫全 scripts/*.sh 的非注释行。
+mb_hits=$(perl -ne 'print "$ARGV:$.: $_" if /^\s*(?!#).*\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/' \
+    "$ROOT"/scripts/*.sh 2>/dev/null || true)
+if [[ -z "$mb_hits" ]]; then
+    ok '无 $VAR 紧跟非 ASCII 的展开（发行路径不赌 locale）'
+else
+    bad "存在 \$VAR 紧跟非 ASCII 的展开："
+    printf '%s\n' "$mb_hits" >&2
+fi
+
 echo "root 脚本门禁：$pass 通过 / $fail 失败"
 if [[ "$fail" -gt 0 ]]; then exit 1; fi
 exit 0

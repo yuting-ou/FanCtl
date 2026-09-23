@@ -172,7 +172,7 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
   4. **落盘失败仍清 dirty 旗（C3）**：`enterSleep/shutdownSave` 原先丢弃 save* 返回值 → 入睡/退出那一刻的样本静默丢失。改 = `flushAll()` 失败置脏旗让主循环下个节流周期重试 + 边沿日志 `persistenceFailedLogged`（**静默降级可以，静默失效不可以**）；dirty 旗改 `public private(set)` 供引擎测试观察（同 thermalLearn/aiMetrics 惯例）。**变异**：3 红。测试阶段设计要点：学习发生在落盘之前，必须在"失败日志刚出现"那一拍冻结学习，才能把"保留脏旗"与"清旗后靠新样本重新置脏"两种实现区分开。
   5. **配置损坏自愈抹掉用户意图（D1）+ SMC 启动竞态（D2）**：`loadConfig` 解码成功即滚动写 `config.last-good.json`（同 fd 纪律、同 664/root:admin → **不新增提权面**：能污染它的人本就能直接写 config.json）；损坏时按 **last-good → 默认** 恢复。**变异两处**：移除滚动写 → 7 红；绕过恢复分支 → 5 红。`bootstrapSMC` 进程内有界退避重试 3 次（0/2/8s）替代"一次失败即 exit(1)"（那是 KeepAlive + ThrottleInterval=10 下"每 10s 全量扫描→退出"的静默循环），原因留档 `exit-reason.flag` 由下次启动读出并删除。
 - **写盘纪律单实现化**：saveConfig 的 fd 序列（`O_CREAT|O_EXCL` 临时 + `fchmod 664` 穿透 umask + EINTR 重试写 + root 时 `fchown admin` + `rename` 永不跟随符号链接）抽出 `ConfigStore.writeAtomicFD`，last-good 复用同一实现——两处各写一遍正是 R23 修的提权原语重新长回来的地方。
-- **验证**：fanctltests **4719 断言 / 81 组全绿**（R34 的 4646/77 → +73 断言 / +4 组，其中两路独立审查追加 +22）；契约门槛双源同步 4550→**4600**、minGroups 75→**79**；`./scripts/build.sh` 全链路 EXIT 0、dist 三产物 codesign ok（App 身份 4.1.4/86）；`test-root-scripts.sh` 23 通过 / 0 失败（批次 A 未动，门禁不变）；清掉全部编译代码警告（ThermalLearn `var sortedBase`→`let`；TestsCore `()?` 推断的 `w1`；TestsEngine 从未使用的 `w1`——R34"零代码警告"状态的续作）。
+- **验证**：fanctltests **4719 断言 / 81 组全绿**（R34 的 4646/77 → +73 断言 / +4 组，其中两路独立审查追加 +22）；契约门槛双源同步 4550→**4600**、minGroups 75→**79**；`./scripts/build.sh` 全链路 EXIT 0、dist 三产物 codesign ok（App 身份 4.1.4/86）；`test-root-scripts.sh` 24 通过 / 0 失败（含发版链修复新增的多字节邻接静态门，见下）；清掉全部编译代码警告（ThermalLearn `var sortedBase`→`let`；TestsCore `()?` 推断的 `w1`；TestsEngine 从未使用的 `w1`——R34"零代码警告"状态的续作）。
 - **顺带抓到一处测试基座说谎（R35 尾巴）**：断言总数在 **4690/4696 之间随机漂移**（12 次跑 3 次低 6）。定位法：临时给 harness 的 `group()` 记累计断言数、多次跑取差分（注意差分归属的是**上一组**，标签会错位）。根因在 `testThermalModel`：`stuck` 模型用**未播种** `Double.random` 喂弱风量样本，`if stuck.b <= 2.5 { …6 条断言… }` 一旦不成立整段**静默不执行**——R29 的 `b>2.5` 诚实门（isMature/预测 nil/可重置）在某次 CI 里根本没跑过，而徽章照样绿。改 = 确定性伪随机序列 `(i*37)%81` + 把 `b≤2.5` 变成**显式断言**、段内 6 条无条件执行 → 6/6 次稳定（当时 4697；审查轮补完回归后 4719）。教训：**测试里的 `if <实现算出的值> { 断言 }` 与"注释描述行为"同罪**——它让覆盖率变成随机数；条件成立与否本身必须是断言。
 - **口径变更（跨版本比较失效，必须记账）**：4.1.4 起 AI 评测的均温/波动/均输出为**秒加权**。升级前后窗口的数值不可直接比较（同窗口内始终可比；旧账本文件解码后自动走样本口径）。本文件历史条目里引用的 stdDev/均温数字保持原样不改写——它们是样本口径产物。
 - **两条否决（进失败账本）**：support 目录 `chmod 1775`、`fanctld` engine 延迟初始化 + 常驻重试。理由见失败账本 R35 两行。
@@ -199,6 +199,11 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
   - 证伪②：**"FanCtlApp.swift 的 `#if RELEASE` 门失效"** 不成立——仓库内 `#if RELEASE`/`#if DEBUG` 出现 0 次，合成遥测由 `CommandLine.arguments.contains("--snapshot")` 门控（参数门比构建配置门更难在生产路径误触发）。
   - 证伪③：`install.sh` 的 `.permission-fix-hint` 写入不存在（全仓无该文件名的写点）。
   - **元经验**：独立审查的产出必须过"逐条核实"这一关才能进修复清单——本轮 7 项里 3 项是把不存在的代码当成缺陷（含一处"实测得 nan"的假证据）。指控要能被 grep/复现反驳，否则修的是想象。
+- **发版链两次翻车（4.1.4(87)→(88)，同日）**：tag 首次触发时 Release 作业红在打包步，两次根因不同：
+  1. **产物目录硬编码**：`cp: .build/release/fanctld: No such file or directory`。CI runner 与本机新构建后端（SwiftBuild）把产物放在 `.build/out/Products/Release`，`.build/release` 只是旧 llbuild 路线留的兼容副本；**本机两条路径都存在**，所以 build.sh 本地全绿、runner 独红。修 = `BIN`/`APP_BIN` 一律问 `swift build --show-bin-path`（带各自完整 flags：App 的 `--scratch-path` 与钉住的 `SDKROOT` 都要复现），并把两个目录 echo 进日志。
+  2. **`$VAR` 紧跟全角标点**：新加的缺产物守卫在 CI 又红——`build.sh: line 116: f…: unbound variable`，出处正是 `echo "…$f（SwiftPM …"`。用 `/bin/bash` 3.2.57 + `LC_ALL/LANG` 取 C/POSIX/ANSI_X3.4-1968/空环境全部**复现不出**（本机 bash 正确终止变量名），但结论一样：发行路径不赌任何 shell 的多字节邻接行为。修 = 关键守卫的消息改纯 ASCII、变量一律 `${VAR}`；顺手扫全仓另两处同型（`deploy.sh` 的 `$DIST_APP，`、`install.sh` 的 `$PLIST）`——后者在 LaunchDaemon 注册失败的错误分支里，正是最需要它说话的时候）。并加**静态门禁**（`test-root-scripts.sh` 第 24 项）：`scripts/*.sh` 非注释行里 `$VAR` 紧跟非 ASCII 即红，由 `TestsUpgrade.testRootScriptGates` 在每次 `fanctltests` 里跑到。
+  - build 号 86→87→88：CI 构建的代码状态与本机构建的同号版本不同，同号即 R12 的"同号不同码"。
+  - 教训：**发行链必须在与发行同构的环境真跑一次**。v4.1.0/v4.1.1 的 Release 都早于 R22 的分目标 SDK 改造，此后 runner 又换过 Xcode——本地绿与 Release 绿之间没有蕴含关系；且"修发版链的补丁本身"也要走同一条链验证（第二次翻车就是修复引入的）。
 - **真机待验（作者执行，AI 不碰 sudo）**：装 4.1.4 后走一轮睡眠/唤醒，看 status/`fanprobe` 是否仍打 `controlFault`；手工截断一次 config.json，看是否回 last-good 而非出厂默认。
 
 ### R34（4.1.3(85) 全面自审 + root 门禁可移植性修复）：测试基座误导性红根修

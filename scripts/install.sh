@@ -108,7 +108,7 @@ chmod 644 "$PLIST"
 # R23（P3）：bootstrap 失败此前被 set -e 无声吞退——此刻 daemon 已 bootout、二进制已装、
 # App 未装，处于"调速无人管"中间态且无提示。显式报错并给恢复路径。
 if ! launchctl bootstrap system "$PLIST"; then
-    echo "❌ LaunchDaemon 注册失败（plist=$PLIST）。风扇调速当前无人接管——" >&2
+    echo "❌ LaunchDaemon 注册失败（plist=${PLIST}）。风扇调速当前无人接管——" >&2
     echo "   排查后重跑 sudo ./scripts/install.sh；或先手动恢复系统调度：launchctl kickstart -k system/com.fanctl.daemon" >&2
     exit 1
 fi
