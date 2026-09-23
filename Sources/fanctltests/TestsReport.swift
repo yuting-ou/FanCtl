@@ -209,6 +209,29 @@ func testDiagnosticReport() {
     expect(noVerText.contains("未自报（旧版 daemon，或该值被改/被拒收）"),
            "缺值只说缺值，不断言「daemon 早于 4.2.3」")
 
+    // ⑧b2 App 版本串来自**用户可写**的 bundle（install.sh 把 /Applications/清风.app
+    //     chown 给登录用户），必须先消毒再进文本：ANSI 转义会在"把报告粘进终端"时真被
+    //     解释，超长/非 ASCII 会把一行小节撑成不可读。拒渲染只出固定标记，不保留原文片段
+    var escInput = fullReportInput()
+    escInput.installedAppVersion = "\u{001B}[2J已清屏"
+    let escLines = DiagnosticReport.lines(escInput)
+    expectEqual(escLines.count, DiagnosticReport.sectionCount, "可疑版本串不改变小节数")
+    expect(escLines.contains(where: { $0.hasPrefix("装机:") && $0.contains("版本串可疑（已拒绝渲染）") }),
+           "含控制字符的 App 版本被拒渲染")
+    let escText = escLines.joined(separator: "\n")
+    expect(!escText.contains("\u{001B}") && !escText.contains("已清屏"),
+           "被拒的原文一个字节都不留在报告里")
+    var longInput = fullReportInput()
+    longInput.installedAppVersion = String(repeating: "9", count: 65)
+    expect(DiagnosticReport.text(longInput).contains("版本串可疑"),
+           "超长 App 版本被拒渲染")
+    var cjkInput = fullReportInput()
+    cjkInput.installedAppVersion = "四其二"
+    expect(DiagnosticReport.text(cjkInput).contains("版本串可疑"),
+           "非 ASCII 的 App 版本被拒渲染（版本号本就该是 ASCII）")
+    expect(DiagnosticReport.sanitizeVersion("4.2.3 (94)") == "4.2.3 (94)",
+           "常规版本串照常通过（守卫不是照单全拒）")
+
     // ⑧c 文件在但解不出（损坏或跨版本）：不得说"运行中"，也不得说"无 status.json"
     var undecodableInput = fullReportInput()
     undecodableInput.status = nil

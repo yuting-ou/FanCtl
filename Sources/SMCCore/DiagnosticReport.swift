@@ -93,6 +93,16 @@ public enum DiagnosticReport {
         guard let v else { return "—" }
         return v ? yes : no
     }
+    /// 身份类字符串（版本串）的消毒：**限长 + 只收可打印 ASCII**。
+    /// 两个来源都不该被无条件信任——daemon 侧已在 `DaemonStatus` 解码时过滤（那道管"落盘的
+    /// JSON"），这里管"渲染前最后一道"，因为它要挡的是 App 侧：`/Applications/清风.app`
+    /// 被安装脚本 chown 给登录用户，`CFBundleShortVersionString` 想写什么写什么，其中
+    /// `\x1b[2J` 这类 ANSI 转义会在"用户把报告粘进终端/issue"时真的被解释。
+    /// 拒渲染时报错值被整体替换成固定标记，不保留任何原文（保留前缀就等于放行前缀）。
+    public static func sanitizeVersion(_ s: String?, limit: Int = 64) -> String? {
+        guard let s, !s.isEmpty, s.count <= limit else { return nil }
+        return s.utf8.allSatisfy { $0 >= 0x20 && $0 <= 0x7e } ? s : nil
+    }
     /// 把可选字符串安全收成一行（去换行，防破坏"一行一小节"结构）
     private static func one(_ s: String?, fallback: String = "—") -> String {
         guard let s, !s.isEmpty else { return fallback }
@@ -112,6 +122,13 @@ public enum DiagnosticReport {
         // 新鲜度必须也管这一行：版本取自 status.json，daemon 停三天后再升级，这里印出的
         // 就是三天前的自报版本——与"App 新 daemon 旧"的签名完全同形
         let stale: String = ((i.statusAgeSeconds ?? 0) > 30 && s != nil) ? "（陈旧快照）" : ""
+        // App 版本来自用户可写的 bundle，必须先消毒：可疑值不保留任何片段，只出固定标记
+        let appVer: String
+        if let raw = i.installedAppVersion, !raw.isEmpty {
+            appVer = sanitizeVersion(raw).map { one($0) } ?? "版本串可疑（已拒绝渲染）"
+        } else {
+            appVer = "未找到（\(FanCtlPaths.installedAppBundle)）"
+        }
         let daemonWhen: String = i.daemonBinaryInstalledAt.map { "二进制装于 " + stamp.string(from: $0) }
             ?? "二进制缺失（未装守护进程，或落点不可读）"
         // 版本是 daemon **自报**（取自同组可写、未经校验的 status.json）。缺值的原因至少三种
@@ -124,8 +141,7 @@ public enum DiagnosticReport {
         } else {
             daemonVer = "未自报（旧版 daemon，或该值被改/被拒收）"
         }
-        out.append("装机: App " + one(i.installedAppVersion,
-                                      fallback: "未找到（\(FanCtlPaths.installedAppBundle)）")
+        out.append("装机: App " + appVer
                    + " · daemon " + daemonVer + " · " + daemonWhen + stale)
 
         let profile: String = s.flatMap { $0.hardwareProfile }?.oneLine

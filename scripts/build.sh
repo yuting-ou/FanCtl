@@ -48,9 +48,6 @@ if ! env -u SDKROOT swiftc -typecheck "$_PROBE" >/dev/null 2>&1; then
 fi
 rm -rf "$_PROBE_DIR"
 
-echo "==> 运行回归测试（失败则中断构建；默认系统 SDK）..."
-swift run -c release --disable-sandbox fanctltests
-
 # 版本单一来源（4B）：根目录 VERSION 文件 = "主版本 build号"。
 # App（Info.plist）与 daemon（fanctld -v）都从这里读，消除 README/脚本/二进制三处硬编码漂移。
 # v3.6 修正顺序：必须先重生成 Version.generated.swift 再编译——原顺序（先编译后生成）
@@ -68,6 +65,12 @@ import Foundation
 
 let fanctldVersion = "$APP_VERSION ($BUILD_NUMBER)"
 EOF
+
+# R39：重生成必须排在回归测试**之前**。fanctltests 里有一条"Version.generated.swift
+# 必须等于 VERSION"的一致性断言（R38 审查轮加的），而"提了 VERSION、还没跑 build.sh"
+# 恰好就是它要红的那个状态——放在测试之后就变成：改号 ⇒ 构建自锁死，永远走不到重生成那一步。
+echo "==> 运行回归测试（失败则中断构建；默认系统 SDK）..."
+swift run -c release --disable-sandbox fanctltests
 
 # 批次 A（4.2.0）：不再把特权脚本 base64 内嵌进 App 二进制——二进制住在被
 # chown 给登录用户的 bundle 里，"内嵌"只是把篡改面从包内文件挪到包本身。

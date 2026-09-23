@@ -245,6 +245,8 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
   SMCCore 纯函数（不碰文件/SMC/时钟），缺数据一律出声成"—/未落盘"而不是省略小节；模板新增
   必填项要求贴该输出。发行说明改由仓库 `RELEASE-NOTES.md` 提供（CI 上轻量 tag 无批注，
   原先"从批注取说明"会静默退化成 commit message，迁移警示就丢了）。
+- **身份串消毒（4.2.4）**：诊断包里的 App 版本与 daemon 自报版本都限长 64、只收可打印 ASCII，
+  可疑值整体替换成固定标记——App bundle 被 chown 给登录用户，其 plist 字符串不可信。
 - **daemon 自报版本（4.2.3）**：`status.json` 增 `daemonVersion`（编译期常量注入，进变化
   感知摘要，升级后第一拍即刷新），诊断包"装机"小节改为三件套：App plist 版本 + daemon
   自报版本 + 二进制落盘时间；解码侧限长 64、只收可打印 ASCII（该文件在同组可写目录）。
