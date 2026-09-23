@@ -132,6 +132,43 @@ func testSelfUpgrade() {
 // 静态审查写得出 16+ 对抗样本，但组合空间是无限的——用确定性 LCG 随机串扫
 // sanitizeTag/assetURL/authorizationPrompt 的四条全局性质，锁定"任何输入下"的行为。
 
+/// 批次 A（4.2.0）：root 执行脚本落点的可信判据——App 侧 exec 前的唯一闸门，
+/// 判错方向就是"把提权面当可信放行"，故每一支都要有牙。
+func testPrivilegedScriptTrust() {
+    group("特权脚本信任判据(R36)")
+    func ok(_ reg: Bool, _ link: Bool, _ uid: Int, _ mode: Int) -> Bool {
+        SelfUpgrade.privilegedScriptTrusted(isRegularFile: reg, isSymlink: link,
+                                            ownerUID: uid, modeBits: mode)
+    }
+    // 正例：root 拥有、755/750/700（组与其他无写位）
+    expect(ok(true, false, 0, 0o755), "root:wheel 755 常规文件 → 可信")
+    expect(ok(true, false, 0, 0o750), "750 → 可信")
+    expect(ok(true, false, 0, 0o700), "700 → 可信")
+    // 拒绝面：任一条件不满足都必须拒
+    expect(!ok(true, false, 501, 0o755), "非 root 属主（登录用户）→ 拒")
+    expect(!ok(true, false, 0, 0o775), "组可写 → 拒（admin 组内进程可换正文）")
+    expect(!ok(true, false, 0, 0o764), "组有写位的其他形态 → 拒")
+    expect(!ok(true, false, 0, 0o757), "其他可写 → 拒")
+    expect(!ok(true, true, 0, 0o755), "符号链接 → 拒（哪怕属主是 root）")
+    expect(!ok(false, false, 0, 0o755), "非常规文件（目录/fifo）→ 拒")
+    // 落点常量：文案与脚本侧的安装路径必须同字（漂移=App 校验了个不存在的路径）
+    expectEqual(SelfUpgrade.privilegedUpgradeScript, "/usr/local/libexec/fanctl-upgrade.sh",
+                "升级脚本落点常量")
+    expectEqual(SelfUpgrade.privilegedUninstallScript, "/usr/local/libexec/fanctl-uninstall.sh",
+                "卸载脚本落点常量")
+    // 文案要同时穿过 AppleScript 双引号串与 sh 单引号串两层——两层元字符一起锁
+    // （"$`\ 与换行任一在场都能闭合字符串再拼命令；中文正文本身无害）
+    let hint = SelfUpgrade.privilegedScriptHint
+    expect(!hint.contains(where: { $0 == "\"" || $0 == "\\" || $0 == "\n" || $0 == "\r"
+                                  || $0 == "$" || $0 == "`" || $0 == "'" }),
+           "迁移提示无 AppleScript/sh 双层元字符")
+    // 进 shell 命令行的是路径常量本身（未加引号）：必须纯 ASCII 且无空白/shell 元字符
+    let pathUnsafe: Set<Character> = ["\"", "\\", "'", "$", "`", ";", "&", "|", "|", " ", "\n", "\r"]
+    expect(SelfUpgrade.privilegedUpgradeScript.allSatisfy { $0.isASCII }
+           && !SelfUpgrade.privilegedUpgradeScript.contains(where: { pathUnsafe.contains($0) }),
+           "升级脚本路径常量对 AppleScript/sh 两层都安全")
+}
+
 func testSelfUpgradeFuzz() {
     group("一键升级·模糊性质（500 轮 × 确定性种子）")
     // 字母表刻意混入：shell 元字符、路径段、Unicode 数字、空白、引号、合法字符

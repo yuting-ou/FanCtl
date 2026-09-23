@@ -1,8 +1,12 @@
 #!/bin/bash
 # upgrade.sh — 清风 App 内一键升级的特权安装过程（v3.9.0）
-# R23（P1 修复）起由 App 内嵌正文执行（build.sh 把本文件 base64 进二进制，
-# 经 echo|base64 -d|bash -s 管道直交 root），不再从用户可写的 App bundle 读取——
-# 关闭"驻留进程篡改包内脚本 → 用户例行升级输密码即被静默提权"的通道。
+# 执行位置的演进（同一条威胁：root 执行的代码不能住在用户可写的地方）：
+#   v3.9：读 App bundle 内副本 → 驻留进程可篡改 bundle（被 chown 给登录用户）= 提权道；
+#   R23：正文 base64 内嵌进 App 二进制 → 内容不再依赖包内文件，但**二进制本身**仍在
+#        用户可写的 bundle 里，替换 App 即可换掉被授权的脚本正文；
+#   批次 A（4.2.0）：规范落点 /usr/local/libexec/fanctl-upgrade.sh，root:wheel 755，
+#        由 install.sh 首装、每次升级自我刷新；App 侧 exec 前先 lstat 校验
+#        （常规文件 + root 拥有 + 组/其他无写位），不合规即拒绝提权，绝不回退包内副本。
 # 调起签名：bash -s -- <暂存目录> [标记文件] [授权版本tag] [daemon哈希] [App二进制哈希]
 # 暂存目录由 App 侧（用户态）准备好并已通过 SelfUpgrade.validateStaged 校验门；
 # 后三个参数缺省时退化为旧行为（手动兼容），提供时 root 侧在动手前复核——
@@ -22,8 +26,11 @@ if [[ -z "$STAGING" || ! -d "$STAGING" ]]; then
     echo "用法: upgrade.sh <暂存目录> [标记文件] [tag] [daemon-sha256] [appbin-sha256]" >&2
     exit 1
 fi
-if [[ ! -d "$STAGING/FanCtl.app" || ! -f "$STAGING/fanctld" ]]; then
-    echo "暂存包不完整（缺 FanCtl.app 或 fanctld）" >&2
+# 批次 A：暂存包必须自带特权脚本正文（升级即自我刷新 root 侧脚本）；缺即拒装，
+# 不带着"下次没有可执行链路"的状态往下走
+if [[ ! -d "$STAGING/FanCtl.app" || ! -f "$STAGING/fanctld"
+      || ! -f "$STAGING/upgrade.sh" || ! -f "$STAGING/uninstall.sh" ]]; then
+    echo "暂存包不完整（缺 FanCtl.app / fanctld / upgrade.sh / uninstall.sh）" >&2
     exit 2
 fi
 MARKER="${2:-$STAGING/.upgrade-done}"
@@ -63,11 +70,42 @@ if [[ -L "$MARKER" ]]; then
     exit 4
 fi
 
+# 目录信任门（批次 A）：root 执行代码的落点必须 root 拥有且组/其他不可写。
+# 放在 bootout 之前——不合规就原状退出，绝不"先停服务再报错"。
+LIBEXEC="${FANCTL_LIBEXEC_DIR:-/usr/local/libexec}"
+if [[ "${FANCTL_TEST_GATES_ONLY:-}" != "1" ]]; then
+    mkdir -p "$LIBEXEC"
+    if ! fanctl_dir_trusted "$LIBEXEC" || ! fanctl_dir_trusted "$(dirname "$LIBEXEC")"; then
+        echo "拒绝升级：${LIBEXEC} 或其父目录不是 root 拥有且组/其他不可写" >&2
+        exit 5
+    fi
+fi
+
 if [[ "${FANCTL_TEST_GATES_ONLY:-}" == "1" ]]; then
     echo "gates-ok"
     exit 0
 fi
 
+# R36（批次 A）目录信任谓词：root 要往某个目录里写"将被 root 执行的代码"之前，
+# 必须确认这个目录不是用户可写的——否则同 uid 进程把它换成符号链接或预置同名文件，
+# 下次授权即等于执行攻击者代码（R23/R28 修的是文件面，这里是目录面）。
+# 判据：真实目录（非符号链接）+ 属主 uid 0 + 组/其他写位为 0。
+fanctl_dir_trusted() {
+    local d="$1" st owner mode
+    [[ -d "$d" && ! -L "$d" ]] || return 1
+    st=$(/usr/bin/stat -f "%u %p" "$d" 2>/dev/null) || return 1
+    owner="${st%% *}"; mode="${st##* }"
+    [[ "$owner" == "0" ]] || return 1
+    [[ $(( 0$mode & 0022 )) -eq 0 ]]
+}
+
+# FANCTL_TEST_DIR_TRUST=1：无 root 回归钩子，对 $1 求谓词后退出（0=可信，1=不可信）。
+# 安全向的两支可在无 root 下测（普通用户属主、775/777 写位）；"root 属主正例"只能
+# 真机验证——诚实记档，不在门禁里假称已测。
+if [[ "${FANCTL_TEST_DIR_TRUST:-}" == "1" ]]; then
+    fanctl_dir_trusted "${1:-}"
+    exit $?
+fi
 PLIST=/Library/LaunchDaemons/com.fanctl.daemon.plist
 SUPPORT="/Library/Application Support/FanCtl"
 
@@ -80,8 +118,13 @@ echo "==> 停止旧守护进程..."
 launchctl bootout system "$PLIST" 2>/dev/null || true
 
 echo "==> 安装守护进程..."
-mkdir -p /usr/local/libexec
-install -m 755 -o root -g wheel "$STAGING/fanctld" /usr/local/libexec/fanctld
+mkdir -p "$LIBEXEC"
+install -m 755 -o root -g wheel "$STAGING/fanctld" "$LIBEXEC/fanctld"
+# 自我刷新：root 执行脚本随每次升级更新。必须用 install（unlink+新建 inode）而不是
+# cp 原地覆盖——bash 是边读边执行的，截断自己正在跑的那个 inode 会让后续行错乱。
+for _s in upgrade uninstall; do
+    install -m 755 -o root -g wheel "$STAGING/${_s}.sh" "$LIBEXEC/fanctl-${_s}.sh"
+done
 # R32：诊断工具与 daemon 同步升级（暂存包未带 fanprobe 时跳过，不阻断升级）
 if [[ -f "$STAGING/fanprobe" ]]; then
     mkdir -p /usr/local/bin

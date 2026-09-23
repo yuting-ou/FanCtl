@@ -69,35 +69,28 @@ import Foundation
 let fanctldVersion = "$APP_VERSION ($BUILD_NUMBER)"
 EOF
 
-# 内嵌升级脚本正文（R23 P1 修复）：upgrade.sh base64 进 App 二进制——被授权执行的
-# 内容与二进制同源同版，root 不再读用户可写的包内副本（篡改包内脚本=静默提权通道）。
-# 提交的占位文件供裸 swift build 使用；打包构建时严格同步（与 4E 版本常量同一纪律）。
-# R23 再审（P3-1）：base64 失败/空必须红——否则静默产生空常量，发行版要到用户点升级才炸。
-_UPGRADE_B64="$(base64 -i "$ROOT/scripts/upgrade.sh" | tr -d '\n')"
-if [ -z "$_UPGRADE_B64" ]; then
-    echo "❌ upgrade.sh 内嵌失败（base64 为空——文件不可读？）" >&2
-    exit 1
-fi
-cat > "$ROOT/Sources/FanCtlApp/UpgradeScript.generated.swift" <<EOF
-// 由 scripts/build.sh 从 scripts/upgrade.sh 重新生成（勿手改）。
-// 占位值供裸 \`swift build\` 使用；打包构建时与 upgrade.sh 严格同步（R23 P1 修复：
-// 被授权执行的脚本正文内嵌进二进制，root 不再读用户可写的包内副本）。
-let embeddedUpgradeScriptBase64 = "$_UPGRADE_B64"
-EOF
+# 批次 A（4.2.0）：不再把特权脚本 base64 内嵌进 App 二进制——二进制住在被
+# chown 给登录用户的 bundle 里，"内嵌"只是把篡改面从包内文件挪到包本身。
+# root 执行代码的规范落点改到 /usr/local/libexec/fanctl-{upgrade,uninstall}.sh
+# （root:wheel 755，install.sh 首装、upgrade.sh 每次升级自我刷新）。
 
 echo "==> 编译 release（非 UI 目标：默认系统 SDK）..."
-# 显式写 --scratch-path：构建与 artifact() 的查询必须是**同一组 flags**（v89 的教训），
-# 不把默认落点交给环境或未来的 SwiftPM 默认值
-swift build -c release --disable-sandbox --scratch-path "$ROOT/.build" --target fanctld
-swift build -c release --disable-sandbox --scratch-path "$ROOT/.build" --target fanprobe
+# 两条纪律（v4.1.4 发版连红四次换来的）：
+#   ① 按**产物**请求（--product），不按目标——runner 那版 SwiftPM 的 `--target` 只编译
+#      不链接可执行件，产物目录存在但是空的，本地却会链接（于是本地一直绿）；
+#   ② 构建与 artifact() 的查询用**完全同一组 flags**（含显式 --scratch-path），
+#      不把默认落点交给环境或未来的 SwiftPM 默认值。
+swift build -c release --disable-sandbox --scratch-path "$ROOT/.build" --product fanctld
+swift build -c release --disable-sandbox --scratch-path "$ROOT/.build" --product fanprobe
 
 # ---------------------------------------------------------------------------
 # 产物定位（R35 发版链，两次翻车后定的纪律）：必须与构建问**同一组 flags**。
 # CI 实测：不带 --target 的 --show-bin-path 给 .build/<triple>/release，而 --target
 # fanctld 的产物不在那里；本机反过来两条路都存在——硬编码目录或"半问"都会翻车。
-# 三级策略：① 带 --target 问 show-bin-path；② 不中则在 scratch 里按 mtime 找同名
-# 可执行件（刚编的一定最新）；③ 还不中 → 响亮失败。消息一律 ASCII：CI 上
-# "$f（全角" 曾被 bash 吞进变量名报 unbound variable（见 EVOLUTION R35 发版链）。
+# 三级策略：① 带 --product 问 show-bin-path；② 不中则在工作树里按 mtime 找同名可执行件
+# （刚编的一定最新，且排除 Sources/dist 以免选中源码或上一轮副本）；
+# ③ 还不中 → 打全现场后失败。消息一律 ASCII：CI 上 "$f（全角" 曾被 bash 吞进变量名
+# 报 unbound variable（见 EVOLUTION R35 发版链）。
 # show-bin-path 的 stderr 收集处（诊断用）：走 TMPDIR，不用固定文件名——
 # /tmp 里固定名会被他用户预置符号链接（R28 同族的面）
 SBP_ERR=$(mktemp "${TMPDIR:-/tmp}/fanctl-sbp.XXXXXX")
@@ -105,28 +98,34 @@ SBP_ERR=$(mktemp "${TMPDIR:-/tmp}/fanctl-sbp.XXXXXX")
 # _PROBE_DIR 回收顶掉（那样探测临时目录就会泄漏）
 trap 'rm -rf "$_PROBE_DIR"; rm -f "$SBP_ERR"' EXIT
 
-artifact() {  # $1=SwiftPM 目标名 $2=产物文件名 $3=scratch 目录 $4=SDKROOT（可空）
-    local target="$1" name="$2" scratch="$3" sdk="$4" p found
+artifact() {  # $1=SwiftPM 产物名 $2=产物文件名 $3=scratch 目录 $4=SDKROOT（可空）
+    local product="$1" name="$2" scratch="$3" sdk="$4" p found
     if [ -n "$sdk" ]; then
         p=$(SDKROOT="$sdk" swift build -c release --disable-sandbox --scratch-path "$scratch" \
-            --target "$target" --show-bin-path 2>"$SBP_ERR" || true)
+            --product "$product" --show-bin-path 2>"$SBP_ERR" || true)
     else
         p=$(swift build -c release --disable-sandbox --scratch-path "$scratch" \
-            --target "$target" --show-bin-path 2>"$SBP_ERR" || true)
+            --product "$product" --show-bin-path 2>"$SBP_ERR" || true)
     fi
     if [ -n "$p" ] && [ -f "$p/$name" ]; then printf '%s\n' "$p/$name"; return 0; fi
     # 回退搜索用 -L（跟随符号链接）：SwiftBuild 后端会把 .build 里的目录做成指向
     # scratch 外的链接，find 默认不跟随 → -type f 一个都不命中（CI 第四红的根因假设）。
     # 排除 dist：那里有上一轮的产物副本，宁缺不"静默拷陈旧件"（自证门也拦不住同号陈旧件）。
-    found=$(find -L "$ROOT" -name "$name" -type f -perm +111 2>/dev/null \
-        | grep -v -e "^$ROOT/Sources" -e "^$ROOT/dist" | xargs -0 ls -t 2>/dev/null | head -1 || true)
+    # -n 判空后再喂 xargs：BSD xargs 对空输入仍会执行一次 `ls -t`，那是在列当前目录
+    found=""
+    hits=$(find -L "$ROOT" -name "$name" -type f -perm +111 2>/dev/null \
+        | grep -v -e "^$ROOT/Sources" -e "^$ROOT/dist" || true)
+    if [ -n "$hits" ]; then
+        found=$(printf '%s\n' "$hits" | xargs ls -t 2>/dev/null | head -1 || true)
+    fi
     if [ -n "$found" ] && [ -f "$found" ]; then printf '%s\n' "$found"; return 0; fi
     # 彻底找不到：把现场打全——这是发行链的"最后一次提问"，信息要给足
     echo "DIAG show-bin-path rc/stderr:" >&2
     sed -n '1,6p' "$SBP_ERR" >&2 || true
-    echo "DIAG scratch=$scratch target=$target name=$name" >&2
+    echo "DIAG scratch=$scratch product=$product name=$name" >&2
     ls -l "$scratch" 2>&1 | head -20 >&2 || true
-    find "$ROOT" -maxdepth 3 -name "$name*" 2>/dev/null | head -20 >&2 || true
+    # 不设 maxdepth：v90 的诊断因深度太浅（产物在 4 层以下）等于什么都没报
+    find "$ROOT" -name "$name" -type f 2>/dev/null | head -20 >&2 || true
     return 1
 }
 
@@ -135,11 +134,11 @@ if [ -n "$APP_SDKROOT" ]; then
     echo "==> 编译 release（App 目标：${APP_SDKROOT} ）..."
     APP_SCRATCH="$ROOT/.build-app-sdk"
     SDKROOT="$APP_SDKROOT" swift build -c release --disable-sandbox \
-        --scratch-path "$APP_SCRATCH" --target FanCtlApp
+        --scratch-path "$APP_SCRATCH" --product FanCtlApp
 else
     echo "==> 编译 release（App 目标：默认系统 SDK）..."
     APP_SCRATCH="$ROOT/.build"
-    swift build -c release --disable-sandbox --scratch-path "$APP_SCRATCH" --target FanCtlApp
+    swift build -c release --disable-sandbox --scratch-path "$APP_SCRATCH" --product FanCtlApp
 fi
 
 rm -rf "$DIST"
@@ -163,13 +162,13 @@ APP="$DIST/FanCtl.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$APP_EXEC_BIN" "$APP/Contents/MacOS/FanCtl"
 cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-# 随包携带卸载脚本，App“关于”菜单可指引用户一键卸载
-cp "$ROOT/scripts/uninstall.sh" "$APP/Contents/Resources/uninstall.sh"
-chmod +x "$APP/Contents/Resources/uninstall.sh"
-# v3.9 一键升级：特权安装过程内嵌进 App（root 执行的脚本必须与 App 同源发布，
-# 绝不从网上下载脚本）；SelfUpgradeService 经 osascript 调它
-cp "$ROOT/scripts/upgrade.sh" "$APP/Contents/Resources/upgrade.sh"
-chmod +x "$APP/Contents/Resources/upgrade.sh"
+# 批次 A：特权脚本随发行物根目录分发（与 install.sh 同级），由 install.sh 装进
+# /usr/local/libexec、由 upgrade.sh 每次升级自我刷新；App bundle 内不再携带
+# root 执行代码的副本（bundle 被 chown 给登录用户，放进包里=用户可写的特权代码）。
+cp "$ROOT/scripts/upgrade.sh" "$DIST/upgrade.sh"
+chmod +x "$DIST/upgrade.sh"
+cp "$ROOT/scripts/uninstall.sh" "$DIST/uninstall.sh"
+chmod +x "$DIST/uninstall.sh"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

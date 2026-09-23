@@ -163,6 +163,19 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R36（4.2.0(91) 批次 A）：特权信任根落地 + 发版链第四根因
+- **批次 A 做了什么**：把"root 执行的代码"从用户可写的 App bundle 里彻底搬走。三代演进的同一威胁：v3.9 让 root 读 bundle 内 `upgrade.sh`（bundle 被 `chown -R` 给登录用户 → 驻留进程可篡改正文 → 用户下次输密码即提权）；R23 改成构建期 base64 内嵌进二进制（堵住文件面，但**二进制本身还在同一个可写 bundle 里**，换 App 即换被授权内容）；批次 A 定死规范落点 `/usr/local/libexec/fanctl-{upgrade,uninstall}.sh`（root:wheel 755），install.sh 首装、upgrade.sh 每次升级自我刷新，App 侧 exec 前 `lstat` 校验落点身份，**不合规直接拒绝提权，绝不回退内嵌/包内副本**。
+- **四道闸（每道都有名字）**：
+  1. `SelfUpgrade.privilegedScriptTrusted`（纯函数，Swift 侧 11 条断言）：常规文件 + 非符号链接 + uid 0 + 组/其他无写位。变异验证：删掉写位判据 → 3 红。
+  2. `fanctl_dir_trusted`（shell 侧目录面）：落点目录与其父目录都必须 root 拥有且无组/其他写位——Homebrew 机器常把 `/usr/local` 交给登录用户，那种机器上**拒绝安装**而不是装个假安全。负控两支进 root 脚本门禁（用户属主 / 组可写各一）；正例（root 属主 755）需要 root 构造，诚实记档为"仅真机验证"。
+  3. 暂存包必须自带两个特权脚本正文，缺即 `exit 2`（"半个升级链"不许往下装）。
+  4. 自我刷新必须用 `install`（unlink+新建 inode）而不是 `cp` 原地截断——**bash 边读边执行**，截断自己正在跑的那个 inode 会让后续行错乱。注释钉在代码里，因为它是一个"改小了就静默坏"的坑。
+- **内嵌机制作废而非并存**：删 `UpgradeScript.generated.swift`、build.sh 的 base64 生成段、ci.yml 的占位漂移门、bundle 内两份脚本副本。理由：路径信任建立后内嵌只是同一目标的第二套实现，双实现必然分叉（这也是 `chmod 1775` 那条否决的同源理由）。root 脚本门禁新增静态门把它钉死：`build.sh` 出现 `UpgradeScript|embeddedUpgradeScriptBase64` 即红、往 `Contents/Resources` 放脚本即红、ci.yml 的 STAGE 不带 `upgrade.sh` 即红。
+- **发版链第四根因（这条链今天一共红了四次）**：`--target` 在 runner 那版 SwiftPM 上**只编译不链接可执行件**——产物目录存在但是空的，本机却会链接（所以本地一直绿、CI 独红，前三次都没能看到这个差别）。修 = 按产物请求（`--product fanctld/fanprobe/FanCtlApp`），构建与 `--show-bin-path` 查询用完全同一组 flags（含 `--scratch-path`）；`artifact()` 的兜底搜索改 `find -L`（SwiftBuild 会把 `.build` 内目录做成指向外部的符号链接，`-type f` 默认不跟随）并修掉两个自摆缺陷：BSD `xargs` 对空输入仍执行一次 `ls -t`（那是在列当前目录）、诊断 `find` 的 `maxdepth 3` 比产物深度更浅（等于什么都没报）。
+- **一次性迁移是硬事实**：旧 App 的脚本没有装 root 脚本的逻辑，Release zip 此前也不带 `upgrade.sh` → 4.2.0 必须先手动 `sudo ./install.sh` 一次，此后 App 内升级链自愈。Release 说明与 README/面板卸载指引同步改写。
+- **记账**：4.2.0(91) 承载 R35 全部批次 + 批次 A；契约门槛 4600/79 → **4700/81**（双源同值），实测 **4732 断言 / 82 组**；root 脚本门禁 24 → **32 通过 / 0 失败**。v4.1.4 的 tag 因发版链连红四次从未产出 Release，其代码内容全部包含在 4.2.0 里（tag 去留留给作者定）。
+- **残余风险（不许静默当已修）**：zip→暂存→root 复核之间仍无信任根（无 Developer ID/公证，plan-4.0 已砍）；`/usr/local` 符号链接种植面靠 `lstat`+目录信任门兜，真正的信任根需要公证或 MDM 分发；App 二进制仍在用户可写 bundle 内（批次 A 只保证"root 执行的代码"不可被用户改，不保证"App 不会被换掉"——换掉 App 的代价从"静默提权"降为"下一次授权装的是攻击者的 App，但仍需用户输密码且攻击者拿不到 root 侧代码写权限"）。
+
 ### R35（4.1.4(86) 硬化轮）：闭环状态残留 → 数据诚实 → 自愈退化 → 启动退避
 - **形态**：作者令"从第一性原理出发自己定计划"。全量通读 74 个受版本控制文件（45 Swift / 18,815 行 + 6 shell + CI + docs）后按目的函数（min 过冲/磨损/能耗/热误差，max 泛化/数据可信/可用性）选题，结论：**最高杠杆不在控制律**（"无 ≥7 天真机账本不动控制律"仍成立，dt 受控时长 ~3 天），而在 R33 未修清单里"状态与指标会说谎"那一类。
 - **五修（逐条改前→改后 + 变异证据）**：

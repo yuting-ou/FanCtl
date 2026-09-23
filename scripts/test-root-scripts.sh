@@ -42,6 +42,9 @@ make_stage() {
 EOF
     echo "fake-daemon" > "$dir/fanctld"
     echo "fake-app-bin" > "$dir/FanCtl.app/Contents/MacOS/FanCtl"
+    # 批次 A：暂存包必须自带 root 执行脚本正文（upgrade.sh 缺即 exit 2）
+    echo "#!/bin/bash" > "$dir/upgrade.sh"
+    echo "#!/bin/bash" > "$dir/uninstall.sh"
     echo "$dir"
 }
 
@@ -175,6 +178,50 @@ else
     bad "存在 \$VAR 紧跟非 ASCII 的展开："
     printf '%s\n' "$mb_hits" >&2
 fi
+
+echo "== 批次 A：特权脚本落点与自我刷新（R36）=="
+if grep -q 'fanctl-\${_s}\.sh' "$INSTALL" && grep -q 'fanctl-\${_s}\.sh' "$UPGRADE"; then
+    ok "install.sh 与 upgrade.sh 都把特权脚本装成 fanctl-{upgrade,uninstall}.sh"
+else
+    bad "特权脚本落点缺失（install/upgrade 之一未装 fanctl-*.sh）"
+fi
+if grep -q 'fanctl_dir_trusted' "$INSTALL" && grep -q 'fanctl_dir_trusted' "$UPGRADE"; then
+    ok "两个 root 脚本都装目录信任门（落点必须 root 拥有且组/其他不可写）"
+else
+    bad "目录信任门缺失（可被装进用户可写目录=提权面）"
+fi
+if grep -q 'upgrade.sh' "$ROOT/.github/workflows/ci.yml" \
+   && grep -qE 'cp scripts/upgrade\.sh "\$STAGE/"' "$ROOT/.github/workflows/ci.yml"; then
+    ok "发行 zip 携带 upgrade.sh（首装/升级都能刷新 root 脚本）"
+else
+    bad "ci.yml 的 STAGE 未带 upgrade.sh——批次 A 后 App 升级链会断"
+fi
+if grep -qE 'cp "\$ROOT/scripts/(uninstall|upgrade)\.sh" "\$APP/Contents/Resources' "$ROOT/scripts/build.sh"; then
+    bad "build.sh 仍把特权脚本复制进 App bundle（用户可写的 root 执行代码）"
+else
+    ok "build.sh 不再往 App bundle 里放特权脚本副本"
+fi
+if grep -q 'UpgradeScript\|embeddedUpgradeScriptBase64' "$ROOT/scripts/build.sh"; then
+    bad "build.sh 仍生成内嵌脚本常量（该机制已随批次 A 作废，留着=双实现分叉）"
+else
+    ok "内嵌 base64 机制已整体作废（build.sh 无残留）"
+fi
+# 行为面：暂存包缺 upgrade.sh / uninstall.sh → 必须 exit 2（缺链路组件宁可不装）
+_stage_no_scripts=$(make_stage "4.2.0")
+rm -f "$_stage_no_scripts/upgrade.sh"
+_sha_d=$(sha256 "$_stage_no_scripts/fanctld")
+_sha_a=$(sha256 "$_stage_no_scripts/FanCtl.app/Contents/MacOS/FanCtl")
+run_expect 2 "暂存包缺 upgrade.sh → exit 2（拒绝半个升级链）" \
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$_stage_no_scripts" "$_stage_no_scripts/.m" 4.2.0 "$_sha_d" "$_sha_a"
+# 目录信任谓词（无 root 可测的安全向两支：普通用户属主 / 组可写）
+_trust_dir="$TMP/trust-user"
+mkdir -p "$_trust_dir"
+run_expect 1 "谓词：登录用户属主的目录 → 不可信" \
+    env FANCTL_TEST_DIR_TRUST=1 bash "$INSTALL" "$_trust_dir"
+chmod 775 "$_trust_dir" 2>/dev/null || true
+run_expect 1 "谓词：组可写目录 → 不可信（root 代码落点必须无组写位）" \
+    env FANCTL_TEST_DIR_TRUST=1 bash "$INSTALL" "$_trust_dir"
+# 正例（root 属主 + 755）需要 root 才能构造，诚实记档为"仅真机验证"，不在门禁里假称已测
 
 echo "root 脚本门禁：$pass 通过 / $fail 失败"
 if [[ "$fail" -gt 0 ]]; then exit 1; fi

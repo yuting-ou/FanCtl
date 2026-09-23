@@ -34,6 +34,11 @@ sleep 1
 echo "==> 删除文件..."
 rm -f "$PLIST"
 rm -f /usr/local/libexec/fanctld
+# 批次 A：root 执行脚本与 daemon 同处，卸载必须一并清掉（残留=可被再次执行的死代码）
+rm -f /usr/local/libexec/fanctl-upgrade.sh /usr/local/libexec/fanctl-uninstall.sh
+# 旧版（<4.2.0）把脚本副本装在 bundle 内，bundle 已删即无残留；此处兼容显式清理
+rm -f "/Applications/清风.app/Contents/Resources/uninstall.sh" \
+      "/Applications/清风.app/Contents/Resources/upgrade.sh"
 rm -f /usr/local/bin/fanprobe   # R33：install/upgrade 会装上，卸载必须一并清
 rm -rf "/Library/Application Support/FanCtl"
 rm -rf /Applications/FanCtl.app "/Applications/清风.app"

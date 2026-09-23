@@ -4,7 +4,9 @@ import SMCCore
 // SelfUpgradeService — 一键升级的副作用编排（v3.9.0）
 // 状态机：idle → downloading → validating → installing（等授权+装）→ 成功=进程被脚本杀掉重启；
 // 任何失败回 .failed(reason)（菜单给"重试"），用户取消授权回 idle。
-// 特权边界：本服务只准备"暂存包"（用户态 /tmp），root 干什么由 App 内嵌的 upgrade.sh 决定，
+// 特权边界：本服务只准备"暂存包"（用户态 /tmp），root 干什么由
+// /usr/local/libexec/fanctl-upgrade.sh（root:wheel 755）决定——exec 前先 lstat 校验
+// 该落点（常规文件 + root 拥有 + 组/其他无写位），不合规直接拒绝提权。
 // 下载物仅作为数据被安装（校验门 SelfUpgrade.validateStaged 在授权弹窗之前执行）。
 
 @MainActor
@@ -120,16 +122,23 @@ final class SelfUpgradeService: ObservableObject {
             //    exit 2"暂存包不完整"（真机 dogfood 手造 stage 恰好掩盖过此 bug）。
             //    审查修复②：waitUntilExit 同步阻塞调用线程，osascript 等用户输
             //    密码可能数分钟——绝不能在 MainActor 上等，整段放 detached。
-            //    R23（P1 修复）：被授权执行的脚本正文 = 构建期内嵌的 base64
-            //    （UpgradeScript.generated.swift，由 build.sh 从 scripts/upgrade.sh
-            //    生成），经 echo|base64 -d|bash -s 直交 root——不再读用户可写的
-            //    包内副本（驻留进程篡改 upgrade.sh → 下次升级静默提权的通道关闭；
-            //    b64 字母表对 AppleScript/shell 双层引号天然安全，无竞态窗口）。
-            //    同时把暂存 daemon/App 二进制的 sha256 随命令传入，root 侧动手前
-            //    复核（闭合"授权确认后偷换暂存包"的 TOCTOU）。
-            guard !embeddedUpgradeScriptBase64.isEmpty else {
-                throw Failure("App 内缺内嵌升级脚本（打包问题）")
-            }
+            //    批次 A（4.2.0）：被授权执行的是 root 拥有的固定路径脚本，不再内嵌
+            //    进二进制——二进制本身在被 chown 给登录用户的 bundle 里，"内嵌"只是
+            //    把篡改面从包内文件挪到包本身。exec 前 lstat 校验落点身份，任一不符
+            //    即拒绝提权（fail-closed，绝不回退内嵌/包内副本）。
+            //    暂存 daemon/App 二进制的 sha256 仍随命令传入，root 侧动手前复核
+            //    （闭合"授权确认后偷换暂存包"的 TOCTOU——脚本可信 ≠ 暂存数据可信）。
+            var scriptStat = stat()
+            let scriptPath = SelfUpgrade.privilegedUpgradeScript
+            let statOK = lstat(scriptPath, &scriptStat) == 0
+            let fileKind = Int32(scriptStat.st_mode & S_IFMT)
+            guard statOK,
+                  SelfUpgrade.privilegedScriptTrusted(
+                    isRegularFile: fileKind == S_IFREG,
+                    isSymlink: fileKind == S_IFLNK,
+                    ownerUID: Int(scriptStat.st_uid),
+                    modeBits: Int(scriptStat.st_mode & 0o777))
+            else { throw Failure(SelfUpgrade.privilegedScriptHint) }
             // R23 再审（变异审查 B2）：哈希读不到必须 fail-closed——原 `?? ""` 会在
             // 暂存二进制被同 uid 竞态改成不可读时传空串，而脚本的 `[[ -n ]]` 门对空串
             // 是"跳过复核"→ 整道 sha256 防线被静默旁路。缺哈希即拒绝升级，不带着洞弹窗。
@@ -177,12 +186,13 @@ final class SelfUpgradeService: ObservableObject {
             func applescriptSafe(_ s: String) -> Bool {
                 !s.contains(where: { $0 == "\"" || $0 == "\\" || $0 == "\n" || $0 == "\r" })
             }
-            guard applescriptSafe(quotedStage), applescriptSafe(quotedMarker),
+            guard applescriptSafe(scriptPath),
+                  applescriptSafe(quotedStage), applescriptSafe(quotedMarker),
                   applescriptSafe(SelfUpgrade.authorizationPrompt(tag: tag)) else {
                 throw Failure("暂存路径/提示含 AppleScript 元字符，已拒绝提权")
             }
             let appleScript =
-                "do shell script \"echo \(embeddedUpgradeScriptBase64) | base64 -d | bash -s -- "
+                "do shell script \"\(scriptPath) "
                 + "'\(quotedStage)' '\(quotedMarker)' '\(normTag)' '\(shaDaemon)' '\(shaAppBin)'\""
                 + " with administrator privileges with prompt \"\(SelfUpgrade.authorizationPrompt(tag: tag))\""
             let (osaStatus, osaErr) = try await Task.detached(priority: .userInitiated) {

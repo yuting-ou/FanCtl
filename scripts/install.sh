@@ -17,6 +17,27 @@ if [[ "${FANCTL_TEST_CONFIG_GUARD:-}" == "1" ]]; then
     exit $?
 fi
 
+# R36（批次 A）目录信任谓词：root 要往某个目录里写"将被 root 执行的代码"之前，
+# 必须确认这个目录不是用户可写的——否则同 uid 进程把它换成符号链接或预置同名文件，
+# 下次授权即等于执行攻击者代码（R23/R28 修的是文件面，这里是目录面）。
+# 判据：真实目录（非符号链接）+ 属主 uid 0 + 组/其他写位为 0。
+fanctl_dir_trusted() {
+    local d="$1" st owner mode
+    [[ -d "$d" && ! -L "$d" ]] || return 1
+    st=$(/usr/bin/stat -f "%u %p" "$d" 2>/dev/null) || return 1
+    owner="${st%% *}"; mode="${st##* }"
+    [[ "$owner" == "0" ]] || return 1
+    [[ $(( 0$mode & 0022 )) -eq 0 ]]
+}
+
+# FANCTL_TEST_DIR_TRUST=1：无 root 回归钩子，对 $1 求谓词后退出（0=可信，1=不可信）。
+# 安全向的两支可在无 root 下测（普通用户属主、775/777 写位）；"root 属主正例"只能
+# 真机验证——诚实记档，不在门禁里假称已测。
+if [[ "${FANCTL_TEST_DIR_TRUST:-}" == "1" ]]; then
+    fanctl_dir_trusted "${1:-}"
+    exit $?
+fi
+
 if [[ $EUID -ne 0 ]]; then
     echo "请用 sudo 运行: sudo ./scripts/install.sh"
     exit 1
@@ -45,8 +66,27 @@ echo "==> 停止旧服务（如有）..."
 launchctl bootout system "$PLIST" 2>/dev/null || true
 
 echo "==> 安装守护进程..."
-mkdir -p /usr/local/libexec
-install -m 755 -o root -g wheel "$DIST/fanctld" /usr/local/libexec/fanctld
+# 目录信任门（批次 A）：/usr/local 与 /usr/local/libexec 必须 root 拥有且组/其他不可写。
+# Homebrew 机器常把 /usr/local 交给登录用户——那种机器上"把 root 执行的代码放进去"
+# 等于给同 uid 进程留一条提权道，宁可拒绝安装也不装个假安全。
+LIBEXEC="${FANCTL_LIBEXEC_DIR:-/usr/local/libexec}"
+mkdir -p "$LIBEXEC"
+if ! fanctl_dir_trusted "$LIBEXEC" || ! fanctl_dir_trusted "$(dirname "$LIBEXEC")"; then
+    echo "❌ 拒绝安装：${LIBEXEC} 或其父目录不是 root 拥有且组/其他不可写。" >&2
+    echo "   这是 root 执行代码的落点，被用户可写就成了提权面。修归属后重试：" >&2
+    echo "   sudo chown root:wheel $(dirname "$LIBEXEC") "$LIBEXEC" && sudo chmod 755 $(dirname "$LIBEXEC") "$LIBEXEC"" >&2
+    exit 1
+fi
+install -m 755 -o root -g wheel "$DIST/fanctld" "$LIBEXEC/fanctld"
+# 批次 A：特权脚本正文住在 root 拥有路径，App 只 exec、不再携带可被篡改的副本。
+# 缺脚本 = 升级链路装不起来，宁可不装（fail-closed，绝不"跳过这步继续"）。
+for _s in upgrade uninstall; do
+    if [[ ! -f "$DIST/${_s}.sh" ]]; then
+        echo "❌ 发行物缺 ${_s}.sh（无法安装 root 执行脚本）——请用 ./scripts/build.sh 重新构建或重新下载 Release 包" >&2
+        exit 1
+    fi
+    install -m 755 -o root -g wheel "$DIST/${_s}.sh" "$LIBEXEC/fanctl-${_s}.sh"
+done
 # R32：诊断工具上 PATH（只读，无 root 运行需求）
 mkdir -p /usr/local/bin
 if [[ -f "$DIST/fanprobe" ]]; then

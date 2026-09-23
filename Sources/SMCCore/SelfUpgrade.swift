@@ -3,18 +3,20 @@
 // v3.9（升级自动化）：v3.6 的版本自检只"看见"新版本（打开下载页），
 // 本模块把它推进到"拿到并装上"。分工：
 //   - 本文件：纯逻辑——下载 URL 构造（含 tag 消毒防注入）、暂存包校验门。可单测。
-//   - scripts/upgrade.sh（App Resources 内嵌）：唯一的特权安装过程，仓库作者物，
-//     不从网上下载脚本（root 执行的代码必须与 App 同源）。
+//   - /usr/local/libexec/fanctl-upgrade.sh（root:wheel 755）：唯一的特权安装过程，
+//     由 install.sh 首装、每次升级自我刷新；App 只 exec，不携带也不内嵌其正文。
 //   - FanCtlApp.SelfUpgradeService：副作用编排——下载 zip → 解压 → 调本模块校验
-//     → osascript 管理员授权执行内嵌脚本 → 脚本负责杀旧 App/装 daemon/重启新 App。
+//     → lstat 校验 root 脚本落点 → osascript 管理员授权执行该脚本 → 脚本负责杀旧
+//     App/装 daemon/刷新自身/重启新 App。
 //
 // 安全门（缺一不可）：
 //   1. 下载只走固定 HTTPS 模式（github.com/yuting-ou/FanCtl/releases/download/…），
 //      tag 必须通过 sanitizeTag（数字+点），杜绝路径/命令注入进 URL 与 shell。
-//   2. 特权脚本正文在构建期内嵌进 App 二进制（R23 P1 修复；build.sh 从
-//      scripts/upgrade.sh 生成 UpgradeScript.generated.swift 的 base64 常量），
-//      经 echo|base64 -d|bash -s 直交 root——包内副本仅供手动场景，不再是
-//      "被授权执行的内容"（用户可写 bundle 内的文件可被驻留进程篡改=提权通道）。
+//   2. root 执行的代码只住在 root 拥有、组不可写的路径（批次 A / 4.2.0）。
+//      此前两版都在让用户可写的东西替 root 决定行为：v3.9 读 bundle 内脚本，
+//      R23 把正文内嵌进 App 二进制——而二进制本身也在被 chown 给登录用户的
+//      bundle 里，换掉 App 就换掉了"被授权执行的内容"。现落点固定为
+//      /usr/local/libexec/fanctl-upgrade.sh，exec 前由 privilegedScriptTrusted 把关。
 //   3. 暂存包校验门：解压出的 FanCtl.app 的 Info.plist 版本必须与 Release tag 严格
 //      相等、fanctld 二进制必须存在——防止误装残缺包或错版本包。
 //   4. root 侧复核（R23，闭合授权后 TOCTOU）：App 在弹窗前算好暂存 daemon/App 二进制
@@ -26,6 +28,27 @@ import Foundation
 import CryptoKit
 
 public enum SelfUpgrade {
+
+    /// root 执行脚本的规范落点（install.sh 装、upgrade.sh 每次升级自我刷新）
+    public static let privilegedUpgradeScript = "/usr/local/libexec/fanctl-upgrade.sh"
+    public static let privilegedUninstallScript = "/usr/local/libexec/fanctl-uninstall.sh"
+
+    /// 落点缺失/不合规时的用户文案（批次 A 是一次性迁移：旧 App 没有装 root 脚本的
+    /// 逻辑，所以从 4.2.0 起必须先手动装一次；此后升级链自愈）。
+    /// 固定 ASCII 文案——它会进 AppleScript 字符串字面量，不得含用户可控内容。
+    public static let privilegedScriptHint =
+        "升级链路未就绪：未找到受信的升级脚本，请以管理员身份重新安装清风一次"
+
+    /// root 执行脚本的可信判据（纯函数，测试可锁定）：必须是常规文件（非符号链接、
+    /// 非目录）、属主 uid 0、且组/其他没有写位。守的是"我要 exec 的那个文件本身"；
+    /// 目录面的信任（/usr/local 与 libexec 是否用户可写）由脚本侧 fanctl_dir_trusted 守。
+    /// 不合规即拒绝提权——**绝不回退到 bundle 内副本或内嵌正文**（那是被本批次关掉的通道）。
+    public static func privilegedScriptTrusted(isRegularFile: Bool, isSymlink: Bool,
+                                               ownerUID: Int, modeBits: Int) -> Bool {
+        guard !isSymlink, isRegularFile else { return false }
+        guard ownerUID == 0 else { return false }
+        return modeBits & 0o022 == 0
+    }
 
     public enum StagedError: String, Equatable {
         case missingApp = "暂存包缺 FanCtl.app"

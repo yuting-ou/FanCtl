@@ -348,18 +348,22 @@ struct ContentView: View {
         alert.informativeText = """
         在终端执行以下命令即可完全卸载（需输入密码）：
 
-        sudo /Applications/清风.app/Contents/Resources/uninstall.sh
+        sudo /usr/local/libexec/fanctl-uninstall.sh
 
         卸载将注销登录项、停止并移除守护进程、恢复系统风扇调度，并删除：
         • /Library/LaunchDaemons/com.fanctl.daemon.plist
         • /Library/Application Support/FanCtl
-        • /Applications/清风.app（脚本一并删除，无需手动操作）
+        • /Applications/清风.app
+        • /usr/local/libexec/fanctld 与两个特权脚本
         • /Library/Logs/FanCtl（守护进程日志）
+
+        若上面这条路径不存在（4.2.0 之前装的），改用：
+        sudo "/Applications/清风.app/Contents/Resources/uninstall.sh"
         """
         alert.addButton(withTitle: "复制命令")
         alert.addButton(withTitle: "关闭")
         if alert.runModal() == .alertFirstButtonReturn {
-            let cmd = "sudo /Applications/清风.app/Contents/Resources/uninstall.sh"
+            let cmd = "sudo \(SelfUpgrade.privilegedUninstallScript)"
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(cmd, forType: .string)
         }
