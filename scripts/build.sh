@@ -53,6 +53,13 @@ rm -rf "$_PROBE_DIR"
 # v3.6 修正顺序：必须先重生成 Version.generated.swift 再编译——原顺序（先编译后生成）
 # 导致 daemon 二进制永远带着上一轮的版本号（fanctld -v 滞后一班）。
 read -r APP_VERSION BUILD_NUMBER < "$ROOT/VERSION"
+# 空值必须在**改写任何受版本管理文件之前**中止：重生成排在回归测试之前（R39），
+# 若 VERSION 畸形（少字段/空行），先写坏 Version.generated.swift 再报错等于污染工作树；
+# 而末尾的 dist 自证门用的是同一组变量，空对空照样"通过"，兜不住这一步。
+if [[ -z "$APP_VERSION" || -z "$BUILD_NUMBER" ]]; then
+    echo "ERROR: VERSION 文件畸形（期望 '主版本 build号' 两字段）: [$APP_VERSION] [$BUILD_NUMBER]" >&2
+    exit 1
+fi
 export FANCTL_VERSION="$APP_VERSION"
 export FANCTL_BUILD="$BUILD_NUMBER"
 

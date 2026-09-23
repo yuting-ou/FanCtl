@@ -251,6 +251,25 @@ func testDiagnosticReport() {
     expect(zCount > 100 && zCount <= 200, "只保留前缀、尾巴不漏进报告（实得 z 数 \(zCount)）")
     expect(DiagnosticReport.text(fullReportInput()).contains("主因 AI 自动接管"),
            "中文标签照常通过（消毒不是照单全拒）")
+    // 每一行都必须是"一行"：小节数只数元素，含 \r/\n 的串不会让它变——单独断言
+    expect(hostileLines.allSatisfy { !$0.contains("\n") && !$0.contains("\r") },
+           "敌意文本不会把任何一行拆成多行（含 CR）")
+
+    // 硬件画像与战报日期同属"盘上读来的文本"（status.json / stats.json 组可写），
+    // 两处都曾被漏在消毒之外——这两条就是那个洞的哨兵
+    var hostileProfile = fullReportInput()
+    hostileProfile.status?.hardwareProfile?.modelID = "Mac14,10\u{001B}]0;pwned\u{0007}"
+    let profileText = DiagnosticReport.text(hostileProfile)
+    // 只要求"协议字符不在输出里"：可打印载荷（pwned）无法也不该被删——删它等于改硬件画像
+    expect(!profileText.contains("\u{001B}") && !profileText.contains("\u{0007}"),
+           "硬件画像里的 ESC/BEL 被剥掉（机型标识同样来自可写文件）")
+    expect(DiagnosticReport.lines(hostileProfile).allSatisfy { !$0.contains("\n") && !$0.contains("\r") },
+           "敌意机型标识不会把画像行拆成多行")
+    expect(profileText.contains("硬件画像: Mac14,10"), "画像行主体仍可读出（不是整行丢弃）")
+    var hostileDate = fullReportInput()
+    hostileDate.stats?.date = "2026-09-23\u{001B}[2J"
+    let dateText = DiagnosticReport.text(hostileDate)
+    expect(!dateText.contains("\u{001B}"), "战报日期里的控制字符被剥掉")
 
     // ⑧c 文件在但解不出（损坏或跨版本）：不得说"运行中"，也不得说"无 status.json"
     var undecodableInput = fullReportInput()

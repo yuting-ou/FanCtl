@@ -104,7 +104,7 @@ public enum DiagnosticReport {
         return s.utf8.allSatisfy { $0 >= 0x20 && $0 <= 0x7e } ? s : nil
     }
     /// 所有"从盘上读来的自由文本"的统一出口：压平换行、剥掉控制字符（含 ESC/ BEL——
-    /// 这些会在"把报告粘进终端"时被真的解释）、限长（超长只留前缀 + 截断标记，
+    /// 这些会在"fanprobe 直接 print 到终端"与"把报告粘进终端"时被真的解释）、限长（超长只留前缀 + 截断标记，
     /// 否则一个 200KB 的 exit-reason.flag 就能把 19 行快照变成不可读巨块）。
     /// 非 ASCII 的**可见**字符保留：中文小节标签本来就带中文。
     static func safeText(_ s: String, limit: Int = 200) -> String {
@@ -115,6 +115,11 @@ public enum DiagnosticReport {
             out = String(out.prefix(limit)) + "…（已截断，原长 " + String(s.count) + "）"
         }
         return out
+    }
+    /// 版本类字段（App plist / daemon 自报）的唯一出口：缺失给指定措辞，可疑给固定标记
+    private static func versionOr(_ s: String?, missing: String) -> String {
+        guard let s, !s.isEmpty else { return missing }
+        return sanitizeVersion(s).map { one($0) } ?? "版本串可疑（已拒绝渲染）"
     }
     /// 把可选字符串安全收成一行（去换行，防破坏"一行一小节"结构）
     private static func one(_ s: String?, fallback: String = "—") -> String {
@@ -137,12 +142,8 @@ public enum DiagnosticReport {
         // 就是三天前的自报版本——与"App 新 daemon 旧"的签名完全同形
         let stale: String = ((i.statusAgeSeconds ?? 0) > 30 && s != nil) ? "（陈旧快照）" : ""
         // App 版本来自用户可写的 bundle，必须先消毒：可疑值不保留任何片段，只出固定标记
-        let appVer: String
-        if let raw = i.installedAppVersion, !raw.isEmpty {
-            appVer = sanitizeVersion(raw).map { one($0) } ?? "版本串可疑（已拒绝渲染）"
-        } else {
-            appVer = "未找到（\(FanCtlPaths.installedAppBundle)）"
-        }
+        let appVer = versionOr(i.installedAppVersion,
+                               missing: "未找到（\(FanCtlPaths.installedAppBundle)）")
         let daemonWhen: String = i.daemonBinaryInstalledAt.map { "二进制装于 " + stamp.string(from: $0) }
             ?? "二进制缺失（未装守护进程，或落点不可读）"
         // 版本是 daemon **自报**（取自同组可写、未经校验的 status.json）。缺值的原因至少三种
@@ -150,8 +151,8 @@ public enum DiagnosticReport {
         let daemonVer: String
         if s == nil {
             daemonVer = "无 status，无从判断"
-        } else if let v = s?.daemonVersion {
-            daemonVer = "自报 " + one(v)
+        } else if let raw = s?.daemonVersion {
+            daemonVer = sanitizeVersion(raw).map { "自报 " + one($0) } ?? "版本串可疑（已拒绝渲染）"
         } else {
             daemonVer = "未自报（旧版 daemon，或该值被改/被拒收）"
         }
@@ -160,7 +161,7 @@ public enum DiagnosticReport {
 
         let profile: String = s.flatMap { $0.hardwareProfile }?.oneLine
             ?? "未知（daemon 未运行或状态未落盘）"
-        out.append("硬件画像: " + profile)
+        out.append("硬件画像: " + one(profile))
 
         // 新鲜度取自文件 mtime，"能不能信下面的数字"取决于它；但 status 解不解得出
         // 是另一件事——文件在、解不出时若仍报"运行中"，下面八个小节的"—"就没法解释
@@ -276,7 +277,8 @@ public enum DiagnosticReport {
         // 所以日期必须出现在行内，并与报告生成时刻比对
         let statsWhen: String
         if let d = st?.date {
-            statsWhen = d == dayStamp.string(from: i.generatedAt) ? "今日 \(d)" : "陈旧 \(d)"
+            // 日期串同样来自可写的 stats.json：只用于比较的原样比，进文本的先消毒
+            statsWhen = d == dayStamp.string(from: i.generatedAt) ? "今日 \(one(d))" : "陈旧 \(one(d))"
         } else {
             statsWhen = "无战报"
         }
@@ -288,8 +290,8 @@ public enum DiagnosticReport {
         out.append("上次异常退出: " + one(i.exitReason, fallback: "无记录"))
         out.append("日志: /Library/Logs/FanCtl " + (i.logReadable ? "可读" : "不可读（权限）"))
         out.append("SMC 可打开: " + one(i.probeError, fallback: "是（未取读数）"))
-        out.append("说明: 只含运行时状态与上次退出原因原文；不读配置内容、不含用户名；"
-                   + "温度/转速均为 daemon 落盘快照，非本命令实时采样。")
+        out.append("说明: 只含运行时状态与上次退出原因（控制字符已剥、超长已截断）；不读配置内容、不含用户"
+                   + "名；温度/转速均为 daemon 落盘快照，非本命令实时采样。")
         return out
     }
 

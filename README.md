@@ -181,8 +181,10 @@ dist/                    构建产物(FanCtl.app + fanctld)
 # 测试(无需 Xcode,断言数以顶部徽章为准,失败退出码非 0)
 swift run -c release --disable-sandbox fanctltests
 
-# 构建(先跑测试再组装 dist;版本号单一来源 = 根目录 VERSION 文件)
+# 构建(按 VERSION 重生成版本常量 → 跑测试 → 组装 dist;版本号单一来源 = 根目录 VERSION)
 ./scripts/build.sh
+# 改了 VERSION 就要把 build.sh 重写出的 Sources/fanctld/Version.generated.swift 一并提交:
+# fanctltests 里有一条"该常量必须等于 VERSION"的一致性断言,漏提交 = CI 测试作业直接红
 
 # 安装(需 sudo:daemon → /usr/local/libexec + LaunchDaemon;App → /Applications/清风.app)
 sudo ./scripts/install.sh
@@ -252,7 +254,7 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
 - **daemon 自报版本（4.2.3）**：`status.json` 增 `daemonVersion`（编译期常量注入，进变化
   感知摘要，升级后第一拍即刷新），诊断包"装机"小节改为三件套：App plist 版本 + daemon
   自报版本 + 二进制落盘时间；解码侧限长 64、只收可打印 ASCII（该文件在同组可写目录）。
-- 测试 **4646 → 4871 断言 / 85 组**（契约门槛双源同步 4870/84，以顶部徽章为准）；两路独立审查共报
+- 测试 **4646 → 4876 断言 / 85 组**（断言数与契约门槛以顶部徽章 + `ci.yml`/`fanctltests` 双源为准）；两路独立审查共报
   11 项 → 9 修 3 证伪（其中一项的 P1 推翻了我自己先前的证伪，详见 EVOLUTION R35/R36）。
 ## 9. 4.0 变更摘要(2026-09,冷启动校准与诚实形态 + 审查修复轮)
 
