@@ -347,12 +347,18 @@ func testGarbageCodable() {
             expect(enc(d.sanitized()) == enc(d), "history 消毒幂等")
         }
     }
-    let metricsBase = try! JSONEncoder().encode(AIControlMetrics(targetTemp: 76, userTargetTemp: 76))
+    var metBase = AIControlMetrics(targetTemp: 76, userTargetTemp: 76)
+    metBase.record(temp: 78, output: 40, seconds: 3)
+    // R35：基线必须带 record 过，否则秒加权三键为 nil、变异器喂不到它们
+    let metricsBase = try! JSONEncoder().encode(metBase)
     for _ in 0..<20 {
         writeMutated(metricsBase, to: FanCtlPaths.aiMetricsFile)
         if let m = ConfigStore.loadAIMetrics() {
             let sd = m.temperatureStdDev
             chaosCheck(&parseViolations, 0, sd.isFinite && sd >= 0, "垃圾评测 stdDev \(sd)")
+            chaosCheck(&parseViolations, 0, m.averageTemp.isFinite && m.averageOutput.isFinite
+                       && m.averageTemp >= 0 && m.averageOutput >= 0,
+                       "垃圾评测秒加权均值越界 temp=\(m.averageTemp) out=\(m.averageOutput)")
         }
     }
     // 4.0.1（4.1-A1）：账本独立持久化——用账本形状的基线喂变异器（含三桶+startedAt），

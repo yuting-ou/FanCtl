@@ -258,7 +258,7 @@ public struct ThermalLearn: Equatable {
                                    baseCurve: [CurvePoint]) -> [CurvePoint]? {
         let trusted = points.filter { $0.samples >= minSamples && $0.percent.isFinite }
         guard trusted.count >= 2 else { return nil }
-        var sortedBase = baseCurve.sorted { $0.temp < $1.temp }
+        let sortedBase = baseCurve.sorted { $0.temp < $1.temp }
         guard let lowAnchor = sortedBase.first, let highAnchor = sortedBase.last,
               highAnchor.temp > lowAnchor.temp else { return nil }
 
@@ -469,22 +469,27 @@ extension ConfigStore {
         do {
             return try decoder.decode(type, from: data)
         } catch {
-            // 毫秒精度：秒级时间戳在同秒内多次损坏时互相覆盖（测试也会因此不稳定）
-            let backupPath = FanCtlPaths.supportDir
-                .appendingPathComponent("\(name).corrupted.\(Int(Date().timeIntervalSince1970 * 1000)).json")
-            // R28 P1：与 loadConfig 同源——备份写不得跟随组可写目录里的符号链接
-            FanCtlPaths.writeNewFileExclusive(data, to: backupPath)
-            // 只保留同前缀最新 5 个备份（文件名含 epoch 秒，字典序=时间序）
-            let prefix = "\(name).corrupted."
-            if let entries = try? FileManager.default.contentsOfDirectory(atPath: FanCtlPaths.supportDir.path) {
-                let olds = entries.filter { $0.hasPrefix(prefix) }.sorted().dropLast(5)
-                for old in olds {
-                    try? FileManager.default.removeItem(at: FanCtlPaths.supportDir.appendingPathComponent(old))
-                }
-            }
-            NSLog("fanctld: \(name) 损坏，已备份到 \(backupPath.path)（\(error.localizedDescription)）")
+            backupCorrupted(data, name: name, error: error)
             return nil
         }
+    }
+
+    /// R35 抽出（loadCorruptionAware 与 history 逐日抢救共用）：备份坏文件 +
+    /// 保留最近 5 个 + NSLog。毫秒精度：秒级时间戳在同秒内多次损坏时互相覆盖（测试也会因此不稳定）
+    static func backupCorrupted(_ data: Data, name: String, error: Error) {
+        let backupPath = FanCtlPaths.supportDir
+            .appendingPathComponent("\(name).corrupted.\(Int(Date().timeIntervalSince1970 * 1000)).json")
+        // R28 P1：与 loadConfig 同源——备份写不得跟随组可写目录里的符号链接
+        FanCtlPaths.writeNewFileExclusive(data, to: backupPath)
+        // 只保留同前缀最新 5 个备份（文件名含 epoch 秒，字典序=时间序）
+        let prefix = "\(name).corrupted."
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: FanCtlPaths.supportDir.path) {
+            let olds = entries.filter { $0.hasPrefix(prefix) }.sorted().dropLast(5)
+            for old in olds {
+                try? FileManager.default.removeItem(at: FanCtlPaths.supportDir.appendingPathComponent(old))
+            }
+        }
+        NSLog("fanctld: \(name) 损坏，已备份到 \(backupPath.path)（\(error.localizedDescription)）")
     }
 
     public static func loadLearn() -> ThermalLearn? {

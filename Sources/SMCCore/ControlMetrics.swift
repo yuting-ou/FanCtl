@@ -145,6 +145,20 @@ public struct AIControlMetrics: Codable, Equatable {
     public var sampleCount: Int
     public var temperatureSum: Double
     public var temperatureSquaredSum: Double
+    // R35：秒加权累计（Optional → 合成 Codable 对旧 ai-metrics.json 缺键解出 nil，
+    // 保持升级前口径）。自适应循环间隔 1–20s 下，按样本平均会系统性偏袒短间隔
+    // （繁忙）时段——与 v2.6.2 在 DailyStats.avgTemp 上用 tempSeconds 修掉的是同一类
+    // 口径错误；这里补 temperatureWeightedSum/…Squared/outputWeightedSum。
+    //
+    // 审查修正（P1）：**分母不能用 activeSeconds**。activeSeconds 含升级前累计的全部
+    // 秒，而加权和从 0 起步——旧账本载入后第一拍 record 就让 weighted 由 nil 变非 nil，
+    // 于是 averageTemp = 新拍加权和 /(旧 604800 秒 + 新秒) ≈ 0.46°（真实 78°），
+    // 并被 saveAIMetrics 持久化，直到用户换目标档才清零。故补第四个可选字段记
+    // "加权数据自己覆盖了多少秒"，四个键同拍累加、共用一份分母。
+    public var temperatureWeightedSum: Double?
+    public var temperatureSquaredWeightedSum: Double?
+    public var outputWeightedSum: Double?
+    public var weightedSecondsTotal: Double?
     public var peakTemp: Double
     public var maxOvershoot: Double
     public var highTempSeconds: Double
@@ -183,6 +197,10 @@ public struct AIControlMetrics: Codable, Equatable {
         m.highTempSeconds = secs(m.highTempSeconds)
         m.temperatureSum = secs(m.temperatureSum)
         m.temperatureSquaredSum = secs(m.temperatureSquaredSum)
+        m.temperatureWeightedSum = m.temperatureWeightedSum.map(secs)
+        m.temperatureSquaredWeightedSum = m.temperatureSquaredWeightedSum.map(secs)
+        m.outputWeightedSum = m.outputWeightedSum.map(secs)
+        m.weightedSecondsTotal = m.weightedSecondsTotal.map(secs)
         m.outputSum = secs(m.outputSum)
         m.outputChangeMagnitude = secs(m.outputChangeMagnitude)
         return m
@@ -196,6 +214,10 @@ public struct AIControlMetrics: Codable, Equatable {
         let t = max(0, min(150, temp)), p = max(0, min(100, output)), dt = min(seconds, 60)
         activeSeconds += dt; sampleCount += 1; temperatureSum += t
         temperatureSquaredSum += t * t; peakTemp = max(peakTemp, t)
+        temperatureWeightedSum = (temperatureWeightedSum ?? 0) + t * dt
+        temperatureSquaredWeightedSum = (temperatureSquaredWeightedSum ?? 0) + t * t * dt
+        outputWeightedSum = (outputWeightedSum ?? 0) + p * dt
+        weightedSecondsTotal = (weightedSecondsTotal ?? 0) + dt
         maxOvershoot = max(maxOvershoot, t - targetTemp)
         if t >= targetTemp + 5 { highTempSeconds += dt }
         outputSum += p
@@ -205,12 +227,29 @@ public struct AIControlMetrics: Codable, Equatable {
         lastOutput = p; updatedAt = Date()
     }
 
-    public var averageTemp: Double { sampleCount > 0 ? temperatureSum / Double(sampleCount) : 0 }
-    public var temperatureStdDev: Double {
-        guard sampleCount > 0 else { return 0 }
-        return sqrt(max(0, temperatureSquaredSum / Double(sampleCount) - averageTemp * averageTemp))
+    /// 秒加权分母 = 加权四元组**自己覆盖的秒数**，绝不能用 activeSeconds（含升级前
+    /// 全部秒，混用即 P1 稀释事故）。nil/≤0 = 尚无加权数据 → 各视图回退样本口径。
+    private var weightedSpan: Double? {
+        guard let s = weightedSecondsTotal, s > 1e-6 else { return nil }
+        return s
     }
-    public var averageOutput: Double { sampleCount > 0 ? outputSum / Double(sampleCount) : 0 }
+
+    public var averageTemp: Double {
+        if let w = temperatureWeightedSum, let s = weightedSpan { return w / s }
+        return sampleCount > 0 ? temperatureSum / Double(sampleCount) : 0
+    }
+    public var temperatureStdDev: Double {
+        let avg = averageTemp
+        if let w = temperatureSquaredWeightedSum, let s = weightedSpan {
+            return sqrt(max(0, w / s - avg * avg))
+        }
+        guard sampleCount > 0 else { return 0 }
+        return sqrt(max(0, temperatureSquaredSum / Double(sampleCount) - avg * avg))
+    }
+    public var averageOutput: Double {
+        if let w = outputWeightedSum, let s = weightedSpan { return w / s }
+        return sampleCount > 0 ? outputSum / Double(sampleCount) : 0
+    }
 }
 
 extension DTermLedgerBucket {

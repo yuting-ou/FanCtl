@@ -70,17 +70,45 @@ guard getuid() == 0 else {
     exit(1)
 }
 
-let smc: SMCConnection
-let fans: FanController
-let sensors: TemperatureSensors
-do {
-    smc = try SMCConnection()
-    fans = try FanController(smc: smc)
-    sensors = try TemperatureSensors(smc: smc)
-} catch {
-    log("SMC 初始化失败: \(error)")
+// R23 打磨（P3-2）→ R35 审查：清扫提前到 SMC 引导**之前**。放在后面的话，
+// "SMC 连续初始化失败→exit(1)→launchd 重启"这条退避循环根本走不到清扫，
+// 崩溃留下的原子写临时文件在故障期只增不减。
+ConfigStore.cleanupStaleTemps()
+
+// R35：开机早期 IOKit 可能尚未就绪——旧实现一次失败即 exit(1)，配 LaunchDaemon 的
+// KeepAlive + ThrottleInterval=10 就是"每 10 秒全量扫描→退出"的静默循环。进程内
+// 有界退避把这个竞态窗口压在 20s 一轮内跨过；仍失败才交回 launchd，
+// 并把原因留档（下次启动可答"上次为何退出"）。
+// 此处 sleep 安全：主循环定时器与 dispatchMain 尚未启动，没有并发拍会被干扰。
+func bootstrapSMC(attemptDelays: [Double] = [0, 2, 8])
+    -> (SMCConnection, FanController, TemperatureSensors)? {
+    for (i, delay) in attemptDelays.enumerated() {
+        if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+        do {
+            let smc = try SMCConnection()
+            let fans = try FanController(smc: smc)
+            let sensors = try TemperatureSensors(smc: smc)
+            if i > 0 { log("SMC 初始化在第 \(i + 1) 次尝试恢复") }
+            return (smc, fans, sensors)
+        } catch {
+            log("SMC 初始化失败（第 \(i + 1)/\(attemptDelays.count) 次）: \(error)")
+        }
+    }
+    return nil
+}
+
+guard let boot = bootstrapSMC() else {
+    // R35 审查（P3）：标记文件也走 fd 纪律——Data.write(.atomic) 用进程 umask 建临时
+    // 文件（root 默认 022 → 644 恰好，但整套 O_EXCL/NOFOLLOW/fchmod 保证一并绕过），
+    // 与 install.sh 提示文件同属 R28 立的"root 不跟随组内符号链接"面。
+    ConfigStore.writeAtomicFD(Data("smc-init-failed（SMC 连续初始化失败，原因见本日志上文）".utf8),
+                              to: FanCtlPaths.exitReasonFile, mode: 0o644)
+    log("SMC 连续初始化失败，退出交由 launchd 重启（期间风扇由系统自行调度）")
     exit(1)
 }
+let smc = boot.0
+let fans = boot.1
+let sensors = boot.2
 
 // R23（P2 修复）：fanCount==0 不再 shell 层 exit(1)——那让 4.0 B1 专门建的 passive
 // 语义（FNum 低频重探 + 无风扇机型模式语义化为 auto，ControlEngine/Fans 双侧实现）
@@ -99,8 +127,6 @@ log("启动: fanctld \(fanctldVersion) — 风扇 x\(fans.fanCount), CPU x\(coun
 // 而 status 却显示"系统自动调度"——与唤醒回调的无条件恢复对齐。
 fans.restoreAutoAll()
 log("启动: 已恢复系统自动调度（清理异常退出残留的强制模式）")
-// R23 打磨（P3-2）：清扫上次崩溃/断电残留的 .config.json.<uuid> 临时文件（仅 >1h 者）
-ConfigStore.cleanupStaleConfigTemps()
 
 // 上次异常退出原因（看门狗写入的标记）：让"它为什么自己重启过"可回答
 if let data = try? Data(contentsOf: FanCtlPaths.exitReasonFile),
@@ -176,8 +202,8 @@ watchdogSource.setEventHandler {
     guard !engine.isSuspendedForSleep else { return }
     guard DispatchTime.now() >= engine.heartbeat() + .seconds(60) else { return }
     log("看门狗：主循环超 60s 无心跳，判定挂死，退出交由 launchd 重启")
-    try? Data("watchdog-hang（主循环超 60s 无心跳）".utf8)
-        .write(to: FanCtlPaths.exitReasonFile, options: .atomic)
+    ConfigStore.writeAtomicFD(Data("watchdog-hang（主循环超 60s 无心跳）".utf8),
+                              to: FanCtlPaths.exitReasonFile, mode: 0o644)
     exit(9)
 }
 watchdogSource.resume()

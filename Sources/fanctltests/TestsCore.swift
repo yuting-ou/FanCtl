@@ -316,8 +316,8 @@ func testCorruptionBackupNoFollow() {
     // 2) 预置符号链接 → 必须失败且 victim 不变
     let victim = dir.appendingPathComponent("p1-victim.txt")
     let secret = "SECRET".data(using: .utf8)!
-    let w1 = try? secret.write(to: victim)
-    expect(w1 != nil, "victim 写入成功")
+    let wrote = (try? secret.write(to: victim)) != nil
+    expect(wrote, "victim 写入成功")
     let linked = FanCtlPaths.supportDir.appendingPathComponent("learn.corrupted.999999.json")
     try? fm.removeItem(at: linked)
     let sl = symlink(victim.path, linked.path)
@@ -531,4 +531,188 @@ func testPowerMetricsGolden() {
     expectEqual(PowerMetricsParser.watts(in: "", key: "CPU Power:"), nil, "空输出 → nil")
     // 单位歧义行：无单位裸数字按 W 采信（与修复前一致——真实输出恒有单位）
     expectClose(PowerMetricsParser.watts(in: "CPU Power: 45", key: "CPU Power:")!, 45, 1e-9, "无单位按 W")
+}
+
+// MARK: - R35 数据诚实：配置 last-good 自愈 / history 逐日抢救 / AI 评测秒加权
+
+/// 配置损坏自愈的目标是"最后一份能解码的配置"，不是出厂默认。
+/// 同时锁定 writeAtomicFD 抽取（saveConfig 改调它）没有改变写盘语义
+/// ——符号链接/权限语义由 testSaveConfigPermissions 覆盖。
+func testConfigLastGood() {
+    group("config last-good 自愈(R35)")
+    let dir = engineTestEnv()
+    defer {
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+    FanCtlPaths.ensureDirectories()
+    let custom = FanConfig(mode: .manual, manualPercent: 77,
+                           curve: CurvePreset.aggressive.points, preset: .aggressive,
+                           aiTargetTemp: 80, envCompensation: false)
+    expect(ConfigStore.saveConfig(custom), "① 写入用户配置")
+    expectEqual(ConfigStore.loadConfig().mode, .manual, "① 正常解码")
+    expect(FileManager.default.fileExists(atPath: FanCtlPaths.configLastGoodFile.path),
+           "① 解码成功后滚动出 last-good 副本")
+    // ② 活文件损坏（截断/手改）→ 回用户配置，不回出厂默认
+    try? "{\"mode\":\"manual\",\"curve\":[".write(to: FanCtlPaths.configFile,
+                                                  atomically: true, encoding: .utf8)
+    let healed = ConfigStore.loadConfig()
+    expectEqual(healed.mode, .manual, "② 从 last-good 恢复模式")
+    expectEqual(healed.manualPercent, 77, "② 用户百分比保留（旧实现静默变默认 50）")
+    expectEqual(healed.preset, .aggressive, "② 曲线档不被抹回均衡")
+    expectEqual(healed.aiTargetTemp, 80, "② AI 目标保留")
+    expectEqual(ConfigStore.loadConfig().manualPercent, 77, "② 恢复结果已写回，重读仍成立")
+    if let live = try? Data(contentsOf: FanCtlPaths.configFile),
+       let good = try? Data(contentsOf: FanCtlPaths.configLastGoodFile) {
+        expect(live == good, "② 恢复后活文件与副本一致（下次成功解码再滚动更新）")
+    } else { expect(false, "② 两份文件都应存在") }
+    // ③ 副本也损坏 → 默认配置仍是有界的最后退路，且不留半态
+    try? "garbage".write(to: FanCtlPaths.configLastGoodFile, atomically: true, encoding: .utf8)
+    try? "garbage".write(to: FanCtlPaths.configFile, atomically: true, encoding: .utf8)
+    let fallback = ConfigStore.loadConfig()
+    expectEqual(fallback.mode, FanConfig().sanitized().mode, "③ 无可用副本才回默认")
+    expect(fallback.curve.count >= 2, "③ 默认配置自带可用曲线")
+    // ④ 正常写盘不该制造残留临时文件（writeAtomicFD 的 tmp 命名被清扫逻辑覆盖）
+    expect(ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 72)), "④ 写新配置")
+    let temps = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+        .filter { $0.hasPrefix(".") }
+    expect(temps.isEmpty, "④ 无 .config.* 临时残留（得 \(temps)）")
+    // ⑤ R35 审查（P2）：last-good 的语义是"最后一份可用"，不是"最后一份可解码"。
+    //   越界值（组内用户直写 manualPercent=450）解码是成功的，原样进副本就等于把越界
+    //   配置预备成将来损坏时的"好消息"——副本必须落消毒后的字节。
+    try? #"{"mode":"manual","manualPercent":450,"aiTargetTemp":0,"curve":[{"temp":52,"percent":0},{"temp":85,"percent":450}]}"#
+        .write(to: FanCtlPaths.configFile, atomically: true, encoding: .utf8)
+    let clamped = ConfigStore.loadConfig()
+    expectEqual(clamped.manualPercent, 100, "⑤ 越界 manualPercent 被消毒钳位")
+    expectEqual(clamped.aiTargetTemp, 40, "⑤ 越界 aiTargetTemp 被消毒钳位")
+    if let good = try? String(contentsOf: FanCtlPaths.configLastGoodFile, encoding: .utf8) {
+        expect(!good.contains("450"), "⑤ 原始越界值不得进副本")
+        expect(good.contains("\"manualPercent\" : 100"), "⑤ 副本落的是消毒后字节")
+    } else { expect(false, "⑤ 越界但可解码的配置仍应滚动出副本") }
+    // ⑥ R35 审查：崩溃残留的原子写临时文件按家族白名单清扫——exit-reason.flag 也走
+    //   writeAtomicFD 后，它的 `.exit-reason.flag.<uuid>` 必须在清扫面内；
+    //   同时白名单不得扩大化误删组内用户的其它点文件。
+    func touch(_ name: String, age: TimeInterval) -> URL {
+        let u = dir.appendingPathComponent(name)
+        try? "x".write(to: u, atomically: false, encoding: .utf8)
+        try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-age)],
+                                               ofItemAtPath: u.path)
+        return u
+    }
+    let staleCfg = touch(".config.json.\(UUID().uuidString)", age: 7200)
+    let staleGood = touch(".config.last-good.json.\(UUID().uuidString)", age: 7200)
+    let staleFlag = touch(".exit-reason.flag.\(UUID().uuidString)", age: 7200)
+    let fresh = touch(".config.json.\(UUID().uuidString)", age: 60)
+    let foreign = touch(".not-ours.config.json", age: 7200)
+    let unrelated = touch(".DS_Store", age: 7200)
+    ConfigStore.cleanupStaleTemps()
+    expect(!FileManager.default.fileExists(atPath: staleCfg.path), "⑥ 旧 config 临时件清掉")
+    expect(!FileManager.default.fileExists(atPath: staleGood.path), "⑥ 旧 last-good 临时件清掉")
+    expect(!FileManager.default.fileExists(atPath: staleFlag.path), "⑥ 旧 exit-reason 临时件清掉")
+    expect(FileManager.default.fileExists(atPath: fresh.path), "⑥ 在途（<1h）临时件不动")
+    expect(FileManager.default.fileExists(atPath: foreign.path)
+           && FileManager.default.fileExists(atPath: unrelated.path),
+           "⑥ 白名单外的点文件不误删（得 \(foreign.lastPathComponent)/\(unrelated.lastPathComponent)）")
+}
+
+/// 一条坏记录不得抹掉 30 天归档（旧实现：整表解码失败 → [] → archiveDay 用空表覆盖）
+func testHistorySalvage() {
+    group("history 逐日抢救(R35)")
+    let dir = engineTestEnv()
+    defer {
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+    FanCtlPaths.ensureDirectories()
+    let mixed = """
+    [{"date":"2026-09-01","maxTemp":80,"maxTempAt":"2026-09-01T10:00:00Z","highTempSeconds":0,"tempSum":2400,"tempCount":30,"revolutions":0,"tempSeconds":30},
+     {"date":"broken","maxTemp":{"not":"a number"},"maxTempAt":null,"tempSum":"x"},
+     {"date":"2026-09-02","maxTemp":84,"maxTempAt":"2026-09-02T10:00:00Z","highTempSeconds":0,"tempSum":2520,"tempCount":30,"revolutions":0,"tempSeconds":30}]
+    """
+    try? mixed.write(to: FanCtlPaths.historyFile, atomically: true, encoding: .utf8)
+    let days = ConfigStore.loadHistory()
+    expectEqual(days.count, 2, "坏元素丢弃、好日子抢救（得 \(days.count)）")
+    expect(days.map(\.date) == ["2026-09-01", "2026-09-02"], "抢救顺序与日期保留")
+    expectEqual(days.first?.maxTemp, 80, "抢救内容完好")
+    let backups = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+        .filter { $0.hasPrefix("history.corrupted.") }
+    expectEqual(backups.count, 1, "坏文件仍按既有协议备份")
+    // 关键回归：归档一次新日子后，抢救回来的日子不得被空表覆盖丢弃
+    var fresh = DailyStats(date: "2026-09-03"); fresh.tempCount = 5; fresh.maxTemp = 88
+    ConfigStore.archiveDay(fresh)
+    let after = ConfigStore.loadHistory()
+    expectEqual(after.count, 3, "archiveDay 后 3 天俱在（旧实现此处只剩 1 天）")
+    expect(after.map(\.date) == ["2026-09-01", "2026-09-02", "2026-09-03"], "归档不抹历史")
+    // 完全不可抢救的形态：返回空但不炸，且行为与旧版一致
+    try? "NOT JSON {".write(to: FanCtlPaths.historyFile, atomically: true, encoding: .utf8)
+    expect(ConfigStore.loadHistory().isEmpty, "非 JSON → 空（不 trap）")
+    try? "{\"a\":1}".write(to: FanCtlPaths.historyFile, atomically: true, encoding: .utf8)
+    expect(ConfigStore.loadHistory().isEmpty, "顶层非数组 → 空（不 trap）")
+    // R35 审查（P3）：非对象元素混入不得连累好日子——整表 `as? [[String: Any]]`
+    // 在这种形态下 cast 失败会丢掉全部可抢救的天，正是"逐日抢救"最该救的形态
+    let mixedScalar = """
+    [{"date":"2026-09-04","maxTemp":79,"maxTempAt":"2026-09-04T10:00:00Z","highTempSeconds":0,"tempSum":2400,"tempCount":30,"revolutions":0,"tempSeconds":30},
+     42, "junk", null,
+     {"date":"2026-09-05","maxTemp":83,"maxTempAt":"2026-09-05T10:00:00Z","highTempSeconds":0,"tempSum":2520,"tempCount":30,"revolutions":0,"tempSeconds":30}]
+    """
+    try? mixedScalar.write(to: FanCtlPaths.historyFile, atomically: true, encoding: .utf8)
+    let rescued = ConfigStore.loadHistory()
+    expectEqual(rescued.count, 2, "混入标量/null 仍抢救出 2 天（得 \(rescued.count)）")
+    expect(rescued.map(\.date) == ["2026-09-04", "2026-09-05"], "非对象元素只丢自己")
+}
+
+/// 均温/波动/均输出按秒加权：自适应 1–20s 拍下不再偏袒繁忙时段（同 v2.6.2 DailyStats 口径）
+func testAIMetricsWeighted() {
+    group("AI 评测秒加权(R35)")
+    var m = AIControlMetrics(targetTemp: 76)
+    m.record(temp: 90, output: 90, seconds: 1)          // 1s 快拍（繁忙期）
+    m.record(temp: 70, output: 30, seconds: 15)         // 15s 长拍（空闲期）
+    // 秒加权：(90×1+70×15)/16 = 71.25；样本口径（旧）：(90+70)/2 = 80
+    expectClose(m.averageTemp, 71.25, 1e-9, "均温按秒加权（旧样本口径给 80）")
+    expectClose(m.averageOutput, 33.75, 1e-9, "均输出按秒加权（(90+450)/16）")
+    // E[t²]=(8100+4900×15)/16 = 5100 → sd = √(5100 − 71.25²)
+    expectClose(m.temperatureStdDev, (5100 - 71.25 * 71.25).squareRoot(), 1e-6, "波动按秒加权")
+    expectEqual(m.sampleCount, 2, "样本数仍计（口径只影响均值分母）")
+    // 往返保留新字段（updatedAt 先归整秒：iso8601 策略不带亚秒）
+    let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+    let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+    var pinned = m
+    pinned.updatedAt = Date(timeIntervalSince1970: 700_000_000)
+    guard let blob = try? enc.encode(pinned),
+          let back = try? dec.decode(AIControlMetrics.self, from: blob) else {
+        expect(false, "往返编解码失败（harness 缺陷）"); return
+    }
+    expectEqual(back, pinned, "秒加权字段往返")
+    // 旧 ai-metrics.json（无加权键）：weighted 为 nil → 回退样本口径，与升级前一致
+    let legacy = #"{"targetTemp":76,"activeSeconds":10,"sampleCount":2,"temperatureSum":150,"temperatureSquaredSum":11252,"peakTemp":80,"maxOvershoot":4,"highTempSeconds":0,"outputSum":80,"outputChangeCount":1,"outputChangeMagnitude":10,"updatedAt":"2026-09-01T00:00:00Z"}"#
+    guard let old = try? dec.decode(AIControlMetrics.self, from: Data(legacy.utf8)) else {
+        expect(false, "旧账本解码失败"); return
+    }
+    expect(old.temperatureWeightedSum == nil, "旧账本无加权字段 → nil")
+    expectClose(old.averageTemp, 75, 1e-9, "旧账本回退样本口径 150/2")
+    expectClose(old.temperatureStdDev, 1, 1e-9, "旧账本波动回退样本口径")
+    expectClose(old.averageOutput, 40, 1e-9, "旧账本均输出回退样本口径 80/2")
+    // R35 审查（P1）：跨版本混合账本——旧文件载入后第一拍 record 让加权键由 nil 变非 nil，
+    // 分母必须是"加权覆盖的秒"。原实现拿 activeSeconds 当分母 → 78×3/(10+3)=18.0°，
+    // 且被 saveAIMetrics 持久化（真机量级：7 天旧秒 → 均温 0.46°）。
+    var mixed = old
+    mixed.record(temp: 78, output: 50, seconds: 3)
+    expectClose(mixed.averageTemp, 78, 1e-9, "混合账本首拍不被升级前秒数稀释（旧实现 18.0）")
+    expectClose(mixed.averageOutput, 50, 1e-9, "混合账本均输出同口径")
+    expectClose(mixed.temperatureStdDev, 0, 1e-9, "混合账本波动同口径（单拍方差 0）")
+    expectClose(mixed.activeSeconds, 13, 1e-9, "activeSeconds 仍是总受控时长 10+3（语义未改）")
+    expectEqual(mixed.weightedSecondsTotal, 3, "加权覆盖秒单独记账")
+    // 垃圾解码（合法有限巨值，iso8601 日期）：sanitized 必须钳位，视图 Int() 才不 trap
+    let garbage = #"{"targetTemp":76,"activeSeconds":3,"sampleCount":2,"temperatureSum":1e300,"temperatureSquaredSum":1e300,"temperatureWeightedSum":1e300,"temperatureSquaredWeightedSum":-5,"peakTemp":80,"maxOvershoot":4,"highTempSeconds":0,"outputSum":1e300,"outputWeightedSum":1e300,"outputChangeCount":0,"outputChangeMagnitude":0,"updatedAt":"2026-09-01T00:00:00Z"}"#
+    do {
+        let clean = try dec.decode(AIControlMetrics.self, from: Data(garbage.utf8)).sanitized()
+        func bounded(_ v: Double?) -> Bool { v == nil || (v!.isFinite && v! >= 0 && v! < 1e12) }
+        expect(bounded(clean.temperatureWeightedSum) && bounded(clean.temperatureSquaredWeightedSum)
+               && bounded(clean.outputWeightedSum),
+               "加权巨值被 sanitized 钳位（得 \(String(describing: clean.temperatureWeightedSum)))")
+        expect(clean.averageTemp.isFinite && clean.temperatureStdDev.isFinite
+               && clean.averageOutput.isFinite, "钳位后统计量有限（视图 Int() 安全）")
+    } catch {
+        expect(false, "垃圾账本应可解码（Optional 字段容忍缺键）: \(error)")
+    }
 }

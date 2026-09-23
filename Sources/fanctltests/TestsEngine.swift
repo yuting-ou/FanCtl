@@ -328,7 +328,6 @@ func testFanLimitsCache() {
     smc.set("PSTR", 30)
     let fc = try! FanController(smc: smc)
     _ = fc.allStates()   // 首轮：读 Mn/Mx 建缓存
-    let w1 = smc.writes.count
     let reads1 = smc.reads.count
     _ = fc.allStates()   // 二轮：只读 Ac/Tg（每风扇 2 读而非 4）
     let delta = smc.reads.count - reads1
@@ -477,6 +476,12 @@ func testEngineWiring() {
         let engine = makeEngine(smc: smc, clock: clock, collector: col)
         engine.beat()
         expect(smc.lastWrite("F0Md") == 1, "唤醒前已接管")
+        // R35：睡前先让反馈健康锁存（85° 高目标 + 实际转速恒 0 = 持续失配），
+        // 用来验证 wake() 把锁存与基线一起作废——只看 F0Md 不判别（30s 试探协议
+        // 本身就会写 Md=1），必须看 status.controlFault
+        smc.set("Tp01", 85); smc.set("F0Ac", 0)
+        for _ in 0..<5 { clock.advance(3); engine.beat() }
+        expect(ConfigStore.loadStatus()?.controlFault == true, "前置：睡前反馈失配已锁存 controlFault")
         engine.enterSleep()
         expect(engine.isSuspendedForSleep, "enterSleep 置挂起")
         expect(smc.lastWrite("F0Md") == 0, "入睡交还系统")
@@ -486,6 +491,9 @@ func testEngineWiring() {
         expect(col.schedules.last == 0, "wake 立即安排一拍")
         clock.advance(3)
         engine.beat()
+        expect(ConfigStore.loadStatus()?.controlFault != true,
+               "R35：睡前的锁存不得带进新会话（wake 未 reset feedbackHealth/writeHealth 则此断言红）")
+        expect(ConfigStore.loadStatus()?.faultReason == nil, "唤醒首拍不再上报旧故障原因")
         expect(smc.lastWrite("F0Md") == 1, "唤醒后重新接管（强制模式重建）")
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
         for d in envDirs { try? FileManager.default.removeItem(at: d) }
@@ -2229,4 +2237,64 @@ func testCalibrationColdStart() {
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
         for d in envDirs { try? FileManager.default.removeItem(at: d) }
     }
+}
+
+// MARK: - R35：落盘失败保留脏旗（静默降级可以，静默失效不可以）
+
+/// 阶段设计让断言真正有牙（学习发生在落盘之前，故必须在"失败日志刚出现"那一拍
+/// 冻结学习，才能把"保留脏旗"与"清旗后靠新样本重新置脏"两种实现区分开）：
+///   ① 可写目录 + 稳态学习 → 落盘成功，磁盘有数据且无失败日志
+///   ② 目录改只读 → 出现一条失败日志后立刻冻结学习（温度每拍跳变，稳态门不过）
+///      → 脏旗必须仍在（旧实现无条件清旗，此处即红），且失败日志按边沿只一条
+///   ③ 恢复可写（学习仍冻结）→ 只有脏旗保留才会重试落盘，磁盘追平内存
+func testPersistenceFailureRetries() {
+    group("落盘失败保留脏旗(R35)")
+    let dir = engineTestEnv()
+    defer {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+    ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 76, envCompensation: false))
+    seedLearnTable()
+    let smc = makeFanSMC(); smc.set("Tp01", 78); smc.set("PSTR", 30)
+    let clock = FakeClock()
+    let col = EngineCollector()
+    let engine = makeEngine(smc: smc, clock: clock, collector: col)
+    func failLogs() -> [String] { col.logs.filter { $0.contains("落盘失败") } }
+    var jitterTick = 0
+    /// 一拍：follow=true 让 mock 风扇跟上命令（避免反馈故障排除学习）；
+    /// jitter 用自带计数器严格交替 78/82（温差 4°/拍 ≫ 稳态门 0.12°C/s），
+    /// 不依赖时钟奇偶——否则与上一拍同温，会再混进一个稳态样本
+    func beat(_ follow: Bool = true, jitter: Bool = false) {
+        if jitter { jitterTick += 1; smc.set("Tp01", jitterTick % 2 == 0 ? 78 : 82) }
+        engine.beat()
+        if follow, let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+        clock.advance(3)
+    }
+    // ①
+    for _ in 0..<24 { beat() }
+    expect(engine.thermalLearn.sampleTotal > 0, "① 稳态学习已发生（得 \(engine.thermalLearn.sampleTotal)）")
+    expect(failLogs().isEmpty, "① 可写目录下无失败日志")
+    expect((ConfigStore.loadLearn()?.sampleTotal ?? 0) > 0, "① 首个节流周期已落盘")
+    // ②
+    try? FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+    var guard1 = 0
+    while failLogs().isEmpty && guard1 < 40 { beat(); guard1 += 1 }
+    expect(failLogs().count == 1, "② 出现落盘失败日志（跑了 \(guard1) 拍）")
+    beat(false, jitter: true)                    // 过渡拍（可能仍记一个样本）后再冻结
+    let frozenSamples = engine.thermalLearn.sampleTotal
+    for _ in 0..<40 { beat(false, jitter: true) }
+    expectEqual(engine.thermalLearn.sampleTotal, frozenSamples, "② 学习已冻结（前提成立）")
+    expect(engine.learnDirty, "② 写失败后脏旗保留（旧实现无条件清旗 → 此断言红）")
+    expectEqual(failLogs().count, 1, "② 多个失败周期只打一条边沿日志（得 \(failLogs().count)）")
+    expect(failLogs().first?.contains("learn") ?? false, "② 日志点名失败的持久化项")
+    expect((ConfigStore.loadLearn()?.sampleTotal ?? 0) < frozenSamples,
+          "② 磁盘落后于内存（写失败，未落盘的增量仍在内存）")
+    // ③
+    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+    for _ in 0..<24 { beat(false, jitter: true) }
+    expectEqual(ConfigStore.loadLearn()?.sampleTotal, frozenSamples,
+                "③ 恢复可写后靠保留的脏旗重试落盘，磁盘追平内存")
+    expect(!engine.learnDirty, "③ 重试成功后清旗")
 }

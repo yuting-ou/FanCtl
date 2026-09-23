@@ -423,6 +423,51 @@ func testOffsetsAndReadings() {
         expect(!fh.faulted, "其后正常交还 3 拍仍自解")
     }
 
+    // R35：reset()（睡眠唤醒）——锁存、退避 streak、命令/RPM 基线与 warmedUp 必须一并作废。
+    // 中间那条 "!faulted" 是 warmedUp 的门：少复位它，reset 后第 5 拍即锁存（应为第 6 拍）。
+    do {
+        var fh = FanFeedbackHealth()
+        let dead = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [dead], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold { fh.record(states: [dead], commandedRPM: cmd) }
+        expect(fh.faulted && fh.faultStreak == 1, "reset 前置：已锁存且退避到 6 拍")
+        fh.reset()
+        expect(!fh.faulted && fh.consecutiveFailures == 0 && fh.faultStreak == 0
+               && fh.effectiveRecoverThreshold == FanFeedbackHealth.recoverThreshold,
+               "reset 清零锁存/失败计数/退避 streak")
+        for _ in 0..<FanFeedbackHealth.faultThreshold {
+            fh.record(states: [dead], commandedRPM: cmd)
+        }
+        expect(!fh.faulted,
+               "reset 后首拍只重建基线（5 拍仅累计 4 次失配；warmedUp 未复位则此断言红）")
+        fh.record(states: [dead], commandedRPM: cmd)
+        expect(fh.faulted, "reset 后仍按完整阈值判定（不永久免疫）")
+    }
+
+    // R35 审查：resetForWake() 与 reset() 的唯一差异 = 保留 faultStreak。反复故障扇的
+    // 指数退避是跨会话判决，睡一觉不该退回"3 拍就解除"的最高重接管频率。
+    do {
+        var fh = FanFeedbackHealth()
+        let dead = FanState(id: 0, actualRPM: 0, minRPM: 1000, maxRPM: 5000, targetRPM: 4000)
+        let cmd = [0: 4000.0]
+        fh.record(states: [dead], commandedRPM: cmd)
+        for _ in 0..<FanFeedbackHealth.faultThreshold { fh.record(states: [dead], commandedRPM: cmd) }
+        expect(fh.faulted && fh.faultStreak == 1, "唤醒前置：第一轮故障退避到 6 拍")
+        for _ in 0..<(FanFeedbackHealth.recoverThreshold + 1) {
+            fh.record(states: [], commandedRPM: [:])      // 交还拍自解（不归零 streak）
+        }
+        expect(!fh.faulted && fh.faultStreak == 1, "自解后 streak 仍留存")
+        for _ in 0..<FanFeedbackHealth.faultThreshold { fh.record(states: [dead], commandedRPM: cmd) }
+        expect(fh.faulted && fh.faultStreak == 2, "第二轮故障退避翻倍")
+        let before = fh.effectiveRecoverThreshold
+        fh.resetForWake()
+        expect(!fh.faulted && fh.consecutiveFailures == 0, "唤醒清锁存与失败计数")
+        expectEqual(fh.faultStreak, 2, "唤醒保留退避记忆（streak）")
+        expectEqual(fh.effectiveRecoverThreshold, before,
+                    "唤醒后解除阈值仍按退避放大（旧实现回 3 拍）")
+    }
+
     // controlFault 字段往返 + 旧 status 兼容
     do {
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
@@ -754,14 +799,20 @@ testCalibrationColdStart()
 testMetamorphicProperties()
 testGarbageCodable()
 testChaosTimelines()
+testHistorySalvage()
+testConfigLastGood()
+testAIMetricsWeighted()
+testPersistenceFailureRetries()
 print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
-// R33：CI 曾为 4400、源码 4550 双源漂移——已统一为 4550
-let minAssertions = 4550
+// R33：CI 曾为 4400、源码 4550 双源漂移——已统一；改数值必须两处同时改
+// R35：4.1.4 实测 4719 断言 / 81 组（+73 断言 / +4 组：last-good、history 抢救、秒加权、
+// 落盘重试，外加两路独立审查的 8 处修复与回归）
+let minAssertions = 4600
 // R23 测试基建：第二道门槛——distinct group 数。断言总数可被循环刷量虚高
 // （如 expectPersonalityOrdered 单次产 ~816 条），删掉整段测试但保留循环类断言时
 // 总数不降、覆盖却净损；group 数是粗粒度结构量，删函数即少一个 group，刷不出来。
-let minGroups = 75
+let minGroups = 79
 if failures == 0 {
     if checks < minAssertions {
         print("❌ 断言数 \(checks) 低于契约下限 \(minAssertions)（测试被删/跳过？）")

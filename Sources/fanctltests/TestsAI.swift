@@ -1229,22 +1229,25 @@ func testThermalModel() {
 
     // R29：样本多但 b 钉死在下限 → 不得宣称 mature（真机 b=1.0 预测恒 nil）
     var stuck = ThermalModel()
-    for _ in 0..<200 {
-        // 极弱风量效应样本：温度几乎不随 percent 变化 → b 推向下限
-        stuck.update(env: 30, power: 20, percent: 10 + Double.random(in: 0...80), temp: 70)
+    for i in 0..<1200 {
+        // 极弱风量效应样本：温度几乎不随 percent 变化 → b 推向下限。
+        // R35：原用未播种 Double.random——b 偶尔>2.5 时下面整段断言静默不执行
+        // （断言总数在 4690/4696 间随机漂移，CI 徽章与契约门槛都在说谎）。
+        // 改确定性伪随机序列 + 轮数 200→1200：审查实测 200 轮 b=2.44 只离诚实门 0.06，
+        // 改任何常量都会翻越门槛让段内 6 条断言静默失踪；1200 轮 b≈0.94，余量 64%。
+        stuck.update(env: 30, power: 20, percent: 10 + Double((i * 37) % 81), temp: 70)
     }
     expect(stuck.sampleCount >= ThermalModel.minSamples, "卡死模型样本数仍可很高")
-    if stuck.b <= 2.5 {
-        expect(!stuck.isMature, "b≤2.5 时 isMature=false（R29 诚实门）")
-        expect(stuck.predictedPercent(for: 30, power: 20, targetTemp: 50) == nil,
-               "b≤2.5 预测 nil")
-        var why: String? = nil
-        expect(stuck.resetIfUnusable(reason: &why), "未收敛模型可重置")
-        expect(stuck.sampleCount == 0 && stuck.b > 2.5, "重置后回到新模型")
-        expect(why != nil, "重置给出日志原因")
-        var why2: String? = nil
-        expect(!stuck.resetIfUnusable(reason: &why2), "新模型不再重置")
-    }
+    expect(stuck.b <= 2.5, "确定性弱风量样本把 b 压进诚实门下方（得 \(stuck.b)）")
+    expect(!stuck.isMature, "b≤2.5 时 isMature=false（R29 诚实门）")
+    expect(stuck.predictedPercent(for: 30, power: 20, targetTemp: 50) == nil,
+           "b≤2.5 预测 nil")
+    var why: String? = nil
+    expect(stuck.resetIfUnusable(reason: &why), "未收敛模型可重置")
+    expect(stuck.sampleCount == 0 && stuck.b > 2.5, "重置后回到新模型")
+    expect(why != nil, "重置给出日志原因")
+    var why2: String? = nil
+    expect(!stuck.resetIfUnusable(reason: &why2), "新模型不再重置")
 
     // 物理约束：异常样本不把参数推出合理域（归一化域 [0,100]×[1,100]）
     var m2 = ThermalModel()

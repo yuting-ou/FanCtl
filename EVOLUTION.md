@@ -163,6 +163,44 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R35（4.1.4(86) 硬化轮）：闭环状态残留 → 数据诚实 → 自愈退化 → 启动退避
+- **形态**：作者令"从第一性原理出发自己定计划"。全量通读 74 个受版本控制文件（45 Swift / 18,815 行 + 6 shell + CI + docs）后按目的函数（min 过冲/磨损/能耗/热误差，max 泛化/数据可信/可用性）选题，结论：**最高杠杆不在控制律**（"无 ≥7 天真机账本不动控制律"仍成立，dt 受控时长 ~3 天），而在 R33 未修清单里"状态与指标会说谎"那一类。
+- **五修（逐条改前→改后 + 变异证据）**：
+  1. **睡醒假 controlFault（B）**：`wake()` 原只复位 stuckDetector/AI 控制器，`WriteHealth`/`FanFeedbackHealth` 带着睡前的故障锁存、`lastCommanded`、`lastActualRPM`、`faultStreak` 进入新会话 → 醒后首拍即可判 mismatch（交还 + 学习采样被排除）。改 = 两者各加 `reset() { self = .init() }`（整值复位；逐字段重置正是 F9"漏一个字段静默失效"的温床）+ `wake()` 调用。**变异**：删 wake 里两行 reset → 引擎断言红（观测面是 `status.controlFault`，非 `F0Md` 写次数——R24b 已证后者不判别）；单元另锁"reset 后首拍是宽限拍"，漏 `warmedUp` 复位会早一拍红。
+  2. **history 一次局部损坏抹掉 30 天（C1）**：整表解码失败 → `nil → []` → 下一次 `archiveDay` 用空表覆盖 = 归档全灭。改 = 坏文件仍按既有协议备份，然后逐元素 re-encode 单独解码，坏 1 天丢 1 天，日志"逐日恢复 N/M 天（丢弃 K）"。**变异**：salvage 退化为 `return []` → 5 条红（含"archiveDay 后 3 天俱在"）。
+  3. **AI 评测按样本平均偏袒繁忙段（C2）**：`averageTemp/stdDev/averageOutput` 分母是 sampleCount，而自适应 1–20s 拍下"繁忙=快拍=样本多"→ 系统性高估均温与波动（与 v2.6.2 在 `DailyStats.avgTemp` 上用 tempSeconds 修掉的是同一类口径错误）。改 = 新增三个 Optional 秒加权累加器（合成 Codable 对旧文件解出 nil → 自动回退样本口径），分母改 `activeSeconds`。**口径变更记账见下**。**变异**：去掉 sanitized 对加权键的钳位 → 1 红（"加权巨值被钳位"）。
+  4. **落盘失败仍清 dirty 旗（C3）**：`enterSleep/shutdownSave` 原先丢弃 save* 返回值 → 入睡/退出那一刻的样本静默丢失。改 = `flushAll()` 失败置脏旗让主循环下个节流周期重试 + 边沿日志 `persistenceFailedLogged`（**静默降级可以，静默失效不可以**）；dirty 旗改 `public private(set)` 供引擎测试观察（同 thermalLearn/aiMetrics 惯例）。**变异**：3 红。测试阶段设计要点：学习发生在落盘之前，必须在"失败日志刚出现"那一拍冻结学习，才能把"保留脏旗"与"清旗后靠新样本重新置脏"两种实现区分开。
+  5. **配置损坏自愈抹掉用户意图（D1）+ SMC 启动竞态（D2）**：`loadConfig` 解码成功即滚动写 `config.last-good.json`（同 fd 纪律、同 664/root:admin → **不新增提权面**：能污染它的人本就能直接写 config.json）；损坏时按 **last-good → 默认** 恢复。**变异两处**：移除滚动写 → 7 红；绕过恢复分支 → 5 红。`bootstrapSMC` 进程内有界退避重试 3 次（0/2/8s）替代"一次失败即 exit(1)"（那是 KeepAlive + ThrottleInterval=10 下"每 10s 全量扫描→退出"的静默循环），原因留档 `exit-reason.flag` 由下次启动读出并删除。
+- **写盘纪律单实现化**：saveConfig 的 fd 序列（`O_CREAT|O_EXCL` 临时 + `fchmod 664` 穿透 umask + EINTR 重试写 + root 时 `fchown admin` + `rename` 永不跟随符号链接）抽出 `ConfigStore.writeAtomicFD`，last-good 复用同一实现——两处各写一遍正是 R23 修的提权原语重新长回来的地方。
+- **验证**：fanctltests **4719 断言 / 81 组全绿**（R34 的 4646/77 → +73 断言 / +4 组，其中两路独立审查追加 +22）；契约门槛双源同步 4550→**4600**、minGroups 75→**79**；`./scripts/build.sh` 全链路 EXIT 0、dist 三产物 codesign ok（App 身份 4.1.4/86）；`test-root-scripts.sh` 23 通过 / 0 失败（批次 A 未动，门禁不变）；清掉全部编译代码警告（ThermalLearn `var sortedBase`→`let`；TestsCore `()?` 推断的 `w1`；TestsEngine 从未使用的 `w1`——R34"零代码警告"状态的续作）。
+- **顺带抓到一处测试基座说谎（R35 尾巴）**：断言总数在 **4690/4696 之间随机漂移**（12 次跑 3 次低 6）。定位法：临时给 harness 的 `group()` 记累计断言数、多次跑取差分（注意差分归属的是**上一组**，标签会错位）。根因在 `testThermalModel`：`stuck` 模型用**未播种** `Double.random` 喂弱风量样本，`if stuck.b <= 2.5 { …6 条断言… }` 一旦不成立整段**静默不执行**——R29 的 `b>2.5` 诚实门（isMature/预测 nil/可重置）在某次 CI 里根本没跑过，而徽章照样绿。改 = 确定性伪随机序列 `(i*37)%81` + 把 `b≤2.5` 变成**显式断言**、段内 6 条无条件执行 → 6/6 次稳定（当时 4697；审查轮补完回归后 4719）。教训：**测试里的 `if <实现算出的值> { 断言 }` 与"注释描述行为"同罪**——它让覆盖率变成随机数；条件成立与否本身必须是断言。
+- **口径变更（跨版本比较失效，必须记账）**：4.1.4 起 AI 评测的均温/波动/均输出为**秒加权**。升级前后窗口的数值不可直接比较（同窗口内始终可比；旧账本文件解码后自动走样本口径）。本文件历史条目里引用的 stdDev/均温数字保持原样不改写——它们是样本口径产物。
+- **两条否决（进失败账本）**：support 目录 `chmod 1775`、`fanctld` engine 延迟初始化 + 常驻重试。理由见失败账本 R35 两行。
+- **批次 A（提权信任根）未开工，按计划独立发版 4.2.0**：R33 P1 清单里"bundle 内 `uninstall.sh`/`upgrade.sh` 被文档/UI 推 sudo 执行 + App 内嵌 base64 脚本随 `chown -R` 用户可写"**仍开放**——这是本仓当前唯一的同 uid→root 链，需要一次性迁移（旧 App 的内嵌脚本没有装 root 脚本的逻辑，Release zip 此前也不带 `upgrade.sh`），故不与 4.1.4 混发。
+- **R35 审查轮（两路独立对抗审查 + 逐条人工核实）**：两路分别攻「数据口径/可靠性」与「提权信任面/文档一致性」→ **8 项成立并修**（4697→**4719 断言**，每处新回归都做过"删掉修复即打红"的变异验证）、**3 项证伪**（把不存在的代码当成缺陷）、1 项记为已知边界：
+  - **修①（P1）秒加权在跨版本混合账本上必然给错值**：分母用了 `activeSeconds`（含升级前全部秒），而加权和从 0 起步——旧 ai-metrics.json 载入后第一拍 `record` 就让加权键由 nil 变非 nil，`averageTemp = 新拍加权和 /(旧 604800 秒 + 新秒)`，真机量级给 **0.46°（实际 78°）**，且被 `saveAIMetrics` 持久化、只有换目标档才清零。改 = 第四个可选累加器 `weightedSecondsTotal`（四元组同拍累加、共用一份分母），`weightedSpan` 为 nil 时各视图才回退样本口径。**变异**：分母退回 activeSeconds → 3 红（18.0 vs 78.0）。**我上一轮的"证伪"是错的**：当时只查了"无部分扣减路径"，漏了"nil→0 起点 + 旧秒做分母"这条，见下方证伪①的更正。
+  - 修②（P2）last-good 存**消毒后字节**：`refreshLastGoodConfig(FanConfig)` 重编码 `sanitized()` 结果（与 saveConfig 同 options）——"能解码"≠"可用"，组内用户直写 `manualPercent=450` 解码成功，原样进副本等于把越界配置预备成将来的"好消息"。变异：退回原始字节 → 2 红。
+  - 修③（P2）last-good **写失败必须留话**：原实现丢弃 `writeAtomicFD` 返回值，磁盘满时"有副本可回"的承诺静默失效。现失败打一条 NSLog；单槽/无代际记为已知边界（多槽是另一个决定，不在本轮扩）。
+  - 修④（P2）唤醒保留**故障退避记忆**：`FanFeedbackHealth.resetForWake()` 与 `reset()` 唯一差异是保留 `faultStreak`——streak 是"这把风扇反复故障过"的跨会话判决，不是睡前的瞬时测量；清零等于让 R24b 的 3→48 拍退避在笔记本上每个 sleep/wake 归零重来。安全向核对过：保留 streak 只让解除更慢，期间系统调度兜底，不欠冷。**变异**：resetForWake 退回整值复位 → 2 红。
+  - 修⑤（P3）`salvageHistory` **元素级 cast**：原 `as? [[String: Any]]` 是整表转换，数组里混进一个标量/null 就整体失败、好日子全丢——恰在"逐日抢救"最想救的形态上失效。补 `[day, 42, "junk", null, day]` 回归；变异：复现整表语义 → 2 红。
+  - 修⑥（P3）临时文件清扫**按家族白名单**：`cleanupStaleConfigTemps` 更名 `cleanupStaleTemps`，判据从 `hasPrefix(".") && contains(".config.")` 改成三条精确前缀（config / config.last-good / exit-reason）——`writeAtomicFD` 泛化后 exit-reason 的临时件原本永不清扫，而旧判据又能误删组内命名的 `.not-ours.config.json`；清扫调用同时**提前到 SMC 引导之前**（否则退避循环根本走不到它）。变异：退回旧判据 → 2 红。
+  - 修⑦（P3）`exit-reason.flag` 两处写改走 `writeAtomicFD`（不再绕过 R23/R28 的 fd 纪律）；`loadConfig` 损坏备份改复用 `backupCorrupted`（内联版用秒级时间戳，同秒二次损坏被 O_EXCL 拒写丢证据）；`archiveDay` 不再丢弃 `saveHistory` 返回值（失败打日志）。
+  - 修⑧（P3）`b≤2.5` 断言余量：确定性改写只走到"能复现"，审查实测 200 轮 b=2.44 距门槛 0.06——任何常量改动都会让段内 6 条断言静默失踪。轮数 200→1200（b≈0.94，余量 64%）。
+  - **更正·证伪①（原判"不成立"，复审推翻）**："污染清洗路径不做秒加权记账"——清洗确实只整体替换 `AIControlMetrics`（无部分扣减路径，这点当时核实无误），但同一处的 `activeSeconds` 跨升级存活恰好构成 P1（见修①）。**教训：证伪一条指控不等于被指控的机制没问题**——我核了"没有部分扣减"，没核"分母与分子的覆盖域是否同段"。
+  - 证伪②："FanCtlApp 的 `#if RELEASE` 门失效"——App 目标内 `#if` 出现 **0 次**，合成遥测由 `--snapshot` 参数门控（参数门比构建配置门更难在生产路径误触发）。
+  - 证伪③：`install.sh` 的 `.permission-fix-hint` 写点不存在（全仓 grep 无该文件名）。
+  - 已知边界（记账不修）：其余六处 root 侧 `Data.write(.atomic)`（status/stats/history/learn/model/ai-metrics）仍是 umask 决定的 mode 且不归组 admin——`.atomic` 的 rename 不跟随符号链接故无 R28 类提权面，差异只在权限位；ENOSPC 下这些路径泄漏的临时件不在清扫面内。
+  - **元经验**：11 项指控里 3 项是把不存在的代码当成缺陷（含一处"实测得 nan"的假证据），**但另一路的 P1 恰好推翻我这边的证伪**——独立审查的产出必须逐条核实才能进修复清单，而"核实"要核到机制的覆盖域，不能只核提问的字面。
+  - 修①（P2）**last-good 存的是消毒后字节**：原实现把 `Data` 原样滚动进副本，而"能解码"≠"可用"——组内用户直写 `manualPercent=450` 解码成功，就等于把越界配置预备成将来损坏时的"好消息"。现 `refreshLastGoodConfig(FanConfig)` 重编码消毒结果（与 saveConfig 同 options，正常态两份字节一致）。
+  - 修②（P3）**salvageHistory 元素级 cast**：原 `as? [[String: Any]]` 是整表转换，数组里混进一个标量/null 就整体失败、好日子全丢——恰在"逐日抢救"最想救的形态上失效。改 `[Any]` + 逐元素 cast；新增 `[day, 42, "junk", null, day]` 回归。
+  - 修③（P3）**exit-reason.flag 走 fd 纪律**：两处 `Data.write(.atomic)` 换成 `ConfigStore.writeAtomicFD(mode: 0o644)`（`.atomic` 用进程 umask 建临时文件，且整个 R23/R28 的 `O_EXCL|NOFOLLOW` 面被绕过）。
+  - 修④（P3）**b≤2.5 断言的余量**：确定性改写只走到"能复现"，审查实测 200 轮 b=2.44 距门槛 0.06——改任何常量都会让段内 6 条断言静默失踪。轮数 200→1200（b≈0.94，余量 64%）。
+  - 证伪①：**"污染清洗路径不做秒加权记账 → stdDev NaN"** 不成立。全仓 `temperatureSum` 的写入点只有 `record()`（六个累加器同拍更新）与 `sanitized()`（成对钳位），AIControlMetrics 只做整体替换（`ControlEngine:191/1082`），没有任何部分扣减路径；且方差走 `sqrt(max(0, …))`、均值分母有 `sampleCount > 0` 守卫。
+  - 证伪②：**"FanCtlApp.swift 的 `#if RELEASE` 门失效"** 不成立——仓库内 `#if RELEASE`/`#if DEBUG` 出现 0 次，合成遥测由 `CommandLine.arguments.contains("--snapshot")` 门控（参数门比构建配置门更难在生产路径误触发）。
+  - 证伪③：`install.sh` 的 `.permission-fix-hint` 写入不存在（全仓无该文件名的写点）。
+  - **元经验**：独立审查的产出必须过"逐条核实"这一关才能进修复清单——本轮 7 项里 3 项是把不存在的代码当成缺陷（含一处"实测得 nan"的假证据）。指控要能被 grep/复现反驳，否则修的是想象。
+- **真机待验（作者执行，AI 不碰 sudo）**：装 4.1.4 后走一轮睡眠/唤醒，看 status/`fanprobe` 是否仍打 `controlFault`；手工截断一次 config.json，看是否回 last-good 而非出厂默认。
+
 ### R34（4.1.3(85) 全面自审 + root 门禁可移植性修复）：测试基座误导性红根修
 - **形态**：作者令「从第一性原理出发自己审查、执行、最终检查、做成品」。五路复审（安全提权 / 控制安全 / 数据诚实 / 升级发行 / 性能可靠）+ 基线回归对比。R33 五路阻断项均已在 (84) 修复面内，本轮生产代码无新缺陷。
 - **唯一红项根因**：`test-root-scripts.sh` 硬编码 `mktemp -d /tmp/...`——/tmp 只读的受限环境下 mktemp 直接失败，`set -e` 让整个 root 门禁跑不了，红诊断报「输出缺少汇总行」而非真实原因（误导性红，掩盖真实失败点）。修复：暂存跟随 `$TMPDIR`（macOS 惯例），`${TMPDIR:-/tmp}` 保底。负控双向验证：`TMPDIR=/System`（只读）与 unset TMPDIR 均显式报 mktemp 失败，失败点不再被吞成「汇总行缺失」。
@@ -687,6 +725,8 @@ init 参数静默吞值）——审查计划本身也是审查。UI 教训：Cha
 | #0-pre(UI) | thickMaterial 托盘吸收投影 | 观感更干净 | 用户否决（要原生液态玻璃） | 材质观感是硬性偏好不是参数 | 同上 |
 | #0-pre(外部审计轮) | τ 自适应可压过冲 | 过冲↓ | 真机数据 +18.8° 在硬件散热极限内（族最坏 +42.8° 是 env33/R1.3 物理边界） | 硬件问题不是算法问题 | **永远不要**再动控制律追过冲，除非换机型后 maxOvershoot 突破物理预期 |
 | #0-pre(v2.6 网络教训) | ①快拖滑块时反馈失配判故障 ②review 发现迟滞接线静默失败 | — | P0/P1 级误判 | 快拍语义与接线验证缺失 | 任何"快速路径"改动必须配引擎级拍序列测试；接线改动必须 grep 验证落点 |
+| R35(计划期) | support 目录 `chmod 1775`（sticky）可堵住组内换文件 | 消 R23 剩余竞态面 | **未实施——解析否决** | `rename(2)` 的 S_ISVTX 检查落在**目标文件**上，而 config.json 恒 root 所有 → 非 root 的 App 把自己临时文件 rename 覆盖它必 EPERM，**App 唯一写配置通道全断**；`config.corrupted.*`"保留 5 个"上限也会因删不掉 root 备份而静默失效 | 不要再给 support 目录加 sticky。跨进程换文件的安全已由 fd 纪律覆盖（`O_CREAT\|O_EXCL\|O_NOFOLLOW` + `fchmod` + rename 永不跟随） |
+| R35(计划期) | SMC init 失败改「engine 延迟初始化 + 常驻重试」 | 消 10s 重启循环 | **未实施——不成比例** | `engine` 从 `let` 改 `var` 会波及 ConfigWatch / SleepHandler / 看门狗（无 engine 时 heartbeat 语义要重定义），而真实故障形态只是"开机瞬间 IOKit 未就绪" | 启动竞态用进程内有界退避（0/2/8s）覆盖即可，不要为此重构 daemon 生命周期 |
 
 ## 策略元经验
 

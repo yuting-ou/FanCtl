@@ -925,6 +925,9 @@ public enum FanCtlPaths {
         return overrideLogDir ?? URL(fileURLWithPath: "/Library/Logs/FanCtl")
     }
     public static var configFile: URL { supportDir.appendingPathComponent("config.json") }
+    /// R35：最后一份"解码成功且已消毒"的配置副本。损坏自愈优先回它，而不是出厂默认
+    /// （旧实现一次磁盘抖动即抹掉用户的曲线/模式/偏移）
+    public static var configLastGoodFile: URL { supportDir.appendingPathComponent("config.last-good.json") }
     public static var statusFile: URL { supportDir.appendingPathComponent("status.json") }
     public static var statsFile: URL { supportDir.appendingPathComponent("stats.json") }
     public static var historyFile: URL { supportDir.appendingPathComponent("history.json") }
@@ -993,24 +996,47 @@ public enum ConfigStore {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         do {
-            let config = try decoder.decode(FanConfig.self, from: data)
-            return config.sanitized()
+            let clean = try decoder.decode(FanConfig.self, from: data).sanitized()
+            // R35 审查修正：last-good 存"消毒后的字节"，不是原始字节——"能解码"不等于"可用"。
+            // admin 组用户直写 percent=450 / manualPercent=200 这类越界值照样解码成功，
+            // 原样进副本就等于把"最后一份好配置"预备成坏配置（越界值在将来损坏时被救回）。
+            // 消毒后重编码与 saveConfig 的写出形态一致（同 options），正常态两份字节相同。
+            refreshLastGoodConfig(clean)
+            return clean
         } catch {
-            // 配置损坏：备份坏文件，写回默认配置
-            // R23（P3）：备份加保留上限 5（对齐 loadCorruptionAware）——此前无上限，
-            // 组内用户高频写非法 config 可让 root 在组可写目录持续落盘撑爆磁盘
-            let backupPath = FanCtlPaths.supportDir
-                .appendingPathComponent("config.corrupted.\(Int(Date().timeIntervalSince1970)).json")
-            // R28 P1：禁止跟随符号链接；O_EXCL 防预置同名链接
-            FanCtlPaths.writeNewFileExclusive(data, to: backupPath)
-            let stale = (try? FileManager.default.contentsOfDirectory(
-                at: FanCtlPaths.supportDir, includingPropertiesForKeys: nil))?
-                .filter { $0.lastPathComponent.hasPrefix("config.corrupted.") && $0.pathExtension == "json" }
-                .sorted { $0.lastPathComponent > $1.lastPathComponent } ?? []
-            for old in stale.dropFirst(5) { try? FileManager.default.removeItem(at: old) }
-            NSLog("fanctld: config.json 损坏，已备份到 \(backupPath.path)，使用默认配置")
+            // R35 审查：备份改走 backupCorrupted（与 learn/stats/history 同一实现）——
+            // 原内联版用**秒级**时间戳命名，同秒内二次损坏会被 O_EXCL 拒写、直接丢证据。
+            backupCorrupted(data, name: "config", error: error)
+            // R35：先回"最后一份能解码的配置"。旧实现直接写回出厂默认——用户曲线/
+            // 模式/偏移被一次截断或磁盘抖动抹掉，而刚备份的文件里存的就是坏字节，救不回来
+            if let good = try? Data(contentsOf: FanCtlPaths.configLastGoodFile),
+               let restored = try? decoder.decode(FanConfig.self, from: good) {
+                NSLog("fanctld: 已从 last-good 恢复配置（mode=\(restored.mode.rawValue)）")
+                saveConfig(restored)
+                return restored.sanitized()
+            }
+            NSLog("fanctld: 无可用 last-good，回退默认配置")
             saveConfig(defaultConfig)
             return defaultConfig
+        }
+    }
+
+    /// 滚动刷新 last-good 副本（R35）：与 config.json 同 fd 纪律、同 664；组归属看首建者——
+    /// App 首建时为 user:staff，daemon 下次 root 写会归 admin（R35 审查修正原注释的
+    /// "同 664/root:admin"过头表述；两态都无损，同目录同权限）。
+    /// 内容未变即跳过写盘——配置读写都是事件驱动的，不制造无谓 IO。
+    private static func refreshLastGoodConfig(_ config: FanConfig) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(config) else { return }
+        let url = FanCtlPaths.configLastGoodFile
+        if let existing = try? Data(contentsOf: url), existing == data { return }
+        // R35 审查（P2）：单槽副本写失败必须留话——否则磁盘满/权限坏时"有 last-good 可回"
+        // 这个承诺静默失效，将来真损坏时无从判断是"没有副本"还是"副本没写进去"。
+        // 多槽/代际留作已知边界（批次 A 之后按真机需要再议），至少要可审计。
+        if !writeAtomicFD(data, to: url) {
+            NSLog("fanctld: last-good 副本写入失败（下次配置损坏将只能回退默认）")
         }
     }
 
@@ -1022,21 +1048,26 @@ public enum ConfigStore {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(sanitized) else { return false }
-        // R23（P1 修复）：旧实现 Data.write(.atomic) 后按路径 setAttributes——chmod/chown
-        // 跟随符号链接，而 support 目录 root:admin 775（组内用户可自由 unlink/rename），
-        // 攻击者可在 rename→chmod 窗口把 config.json 换成 ln -s /etc/sudoers，
-        // 让 root 把链接目标改成 664 = 本地提权原语。现全部改 fd 级操作：
-        // O_EXCL 建临时文件、fchmod 强制 664、fchown 走 fd、rename 替换符号链接本身
-        // 永不跟随——竞态窗口不存在。
-        // 再审修正：open 的 mode 参数受进程 umask 掩码（umask 022 会把 0664 削成 0644，
-        // 重新引入 v3.6.2 修过的"App 失去写权限"bug）——必须显式 fchmod（不受 umask 影响）。
-        let dir = FanCtlPaths.configFile.deletingLastPathComponent()
-        let tmp = dir.appendingPathComponent(".config.json.\(UUID().uuidString)")
-        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o664)
+        return writeAtomicFD(data, to: FanCtlPaths.configFile)
+    }
+
+    /// R23（P1 修复）写盘纪律的唯一实现（R35 从 saveConfig 抽出，config.json /
+    /// config.last-good.json / exit-reason.flag 共用）：O_CREAT|O_EXCL 建临时文件、
+    /// fchmod 强制 mode（穿透 umask 掩码）、EINTR 重试写、root 写入时 fchown 归组 admin、
+    /// rename 替换（永不跟随符号链接）。
+    /// 为什么必须是 fd 级：support 目录 root:admin 775（组内用户可自由 unlink/rename），
+    /// 旧的"Data.write(.atomic) + 按路径 setAttributes"里 chmod/chown 会跟随符号链接——
+    /// 攻击者可在 rename→chmod 窗口把目标换成 ln -s /etc/sudoers，让 root 把链接目标
+    /// 改成 664 = 本地提权原语。Data.write(.atomic) 另有一宗：mode 由进程 umask 决定。
+    @discardableResult
+    public static func writeAtomicFD(_ data: Data, to url: URL, mode: mode_t = 0o664) -> Bool {
+        let tmp = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString)")
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, mode)
         guard fd >= 0 else { return false }
         // R23 再审（P3-2）：fchmod 失败则 mode 回落 open 的 umask 掩码值（可能 644），
         // 静默复发"App 失去写权限"——失败必须显式中止并清理，不留半态
-        if fchmod(fd, 0o664) != 0 {
+        if fchmod(fd, mode) != 0 {
             close(fd); try? FileManager.default.removeItem(at: tmp); return false
         }
         var written = 0
@@ -1063,7 +1094,7 @@ public enum ConfigStore {
             try? FileManager.default.removeItem(at: tmp)
             return false
         }
-        guard rename(tmp.path, FanCtlPaths.configFile.path) == 0 else {
+        guard rename(tmp.path, url.path) == 0 else {
             try? FileManager.default.removeItem(at: tmp)
             return false
         }
@@ -1072,14 +1103,18 @@ public enum ConfigStore {
 
     /// R23 打磨（P3-2）：saveConfig 崩溃/断电可能残留 `.config.json.<uuid>` 临时文件
     /// （失败路径已清理，成功 rename 后无残留；仅进程被 kill 于 open↔rename 之间会漏）。
-    /// 启动时清扫一次，只删 mtime 早于 1 小时的——绝不可能命中任何进程此刻在途的临时文件，
-    /// 规避跨进程（App 与 daemon 都会写）误删竞态。
-    public static func cleanupStaleConfigTemps(olderThan: TimeInterval = 3600) {
+    /// 启动时清扫崩溃/断电残留的原子写临时文件（R23 P3-2 起，R35 扩到全部 writeAtomicFD 家族）。
+    /// 失败路径自己清理、成功 rename 后无残留，只有进程被 kill 于 open↔rename 之间才漏。
+    /// 只删 mtime 早于 1 小时的——绝不可能命中任何进程此刻在途的临时文件，规避跨进程
+    /// （App 与 daemon 都会写）误删竞态。判据按**精确家族前缀**列白名单，不做泛化匹配：
+    /// root 的删除力只给它自己的临时文件，不给组内用户随手命名的点文件。
+    public static func cleanupStaleTemps(olderThan: TimeInterval = 3600) {
         let dir = FanCtlPaths.configFile.deletingLastPathComponent()
         guard let items = try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        let families = [".config.json.", ".config.last-good.json.", ".exit-reason.flag."]
         let cutoff = Date().addingTimeInterval(-olderThan)
-        for u in items where u.lastPathComponent.hasPrefix(".config.json.") {
+        for u in items where families.contains(where: { u.lastPathComponent.hasPrefix($0) }) {
             let mtime = (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate ?? Date.distantFuture
             if mtime < cutoff { try? FileManager.default.removeItem(at: u) }
@@ -1123,8 +1158,38 @@ public enum ConfigStore {
     public static func loadHistory() -> [DailyStats] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (loadCorruptionAware([DailyStats].self, from: FanCtlPaths.historyFile, name: "history", decoder: decoder) ?? []).map { $0.sanitized() }
+        guard let data = try? Data(contentsOf: FanCtlPaths.historyFile) else { return [] }
+        if let days = try? decoder.decode([DailyStats].self, from: data) {
+            return days.map { $0.sanitized() }
+        }
+        // R35：整表解码失败 ≠ 无历史。旧实现 `loadCorruptionAware(...) ?? []` 让
+        // archiveDay 随后用空表覆盖 history.json——一次局部损坏（手改/截断/磁盘满）
+        // 即抹掉 30 天归档，且它正是曲线优化器与"AI 效果对比"的唯一数据底座。
+        // 坏文件仍按既有协议备份，然后逐元素抢救可读的日子。
+        backupCorrupted(data, name: "history", error: JSONErrorDecodingFailure())
+        return salvageHistory(data, decoder: decoder)
     }
+
+    /// 逐日抢救（纯函数，daemon 与测试共用）：顶层数组里能单独解码的元素保留，
+    /// 其余丢弃。非数组/全部不可解码 → 空（与旧行为一致，但绝不覆盖式清空磁盘）
+    /// R35 审查修正：逐元素判据用 `[Any]` + 元素级 cast。原写法 `as? [[String: Any]]`
+    /// 是**整表**转换——数组里混进一个非对象元素（手改成 `[day, 42]`）就整体 cast 失败、
+    /// 好日子全丢，正好在"逐日抢救"最想救的形态上失效。
+    static func salvageHistory(_ data: Data, decoder: JSONDecoder) -> [DailyStats] {
+        guard let array = try? JSONSerialization.jsonObject(with: data) as? [Any] else { return [] }
+        var days: [DailyStats] = []
+        for element in array {
+            guard let dict = element as? [String: Any],
+                  let blob = try? JSONSerialization.data(withJSONObject: dict),
+                  let day = try? decoder.decode(DailyStats.self, from: blob) else { continue }
+            days.append(day.sanitized())
+        }
+        NSLog("fanctld: history 逐日恢复 \(days.count)/\(array.count) 天（丢弃 \(array.count - days.count)）")
+        return days
+    }
+
+    /// backupCorrupted 需要一个 Error 参数（日志用）；此处只是损坏原因的占位类型
+    private struct JSONErrorDecodingFailure: Error {}
 
     @discardableResult
     public static func saveHistory(_ days: [DailyStats]) -> Bool {
@@ -1146,7 +1211,11 @@ public enum ConfigStore {
         days.append(day)
         days.sort { $0.date < $1.date }
         if days.count > 30 { days.removeFirst(days.count - 30) }
-        saveHistory(days)
+        // R35 审查（P3）：归档落盘失败不再静默——saveHistory 返回 Bool 却无人读，
+        // 磁盘满/权限坏时那一日数据直接蒸发，而它正是 C1 逐日抢救想保的 30 天底座。
+        if !saveHistory(days) {
+            NSLog("fanctld: 归档落盘失败（\(day.date) 未入档，依赖下次跨天重试）")
+        }
     }
 
     @discardableResult

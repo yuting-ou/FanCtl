@@ -219,6 +219,10 @@ public struct WriteHealth: Equatable {
 
     public init() {}
 
+    /// 控制上下文重置（睡眠唤醒）：整值复位。逐字段列举是 F9「漏一个字段静默失效」
+    /// 的复发温床，故走 self = .init()
+    public mutating func reset() { self = .init() }
+
     public mutating func record(loopSuccess: Bool) {
         if loopSuccess {
             consecutiveFailures = 0
@@ -246,6 +250,8 @@ public struct WriteHealth: Equatable {
 //      响应证据（即使试探窗 risingGrace=false）。恒 <100 / 恒低速不升 / 升后停住仍 fault。
 // R27（L3-F1）：滞后路径的「仅靠 rpmRising」宽限封顶 riseOnlyGraceMaxBeats 拍——
 //      无界 +50/拍爬升会把「退化但未死」的风扇永久算作响应（真故障探测与学习排除门失效）。
+// R35：唤醒等控制上下文切换走 reset()——睡前的锁存/命令与 RPM 基线/退避都属于
+//      上一次清醒会话，带进新会话会在醒后头几拍挂假 controlFault（交还、学习被排除）。
 public struct FanFeedbackHealth: Equatable {
     public static let faultThreshold = 5
     public static let recoverThreshold = 3      // 故障后连续匹配/交还拍数（首次故障的基准）
@@ -273,6 +279,22 @@ public struct FanFeedbackHealth: Equatable {
     }
 
     public init() {}
+
+    /// 控制上下文重置（睡眠唤醒）：锁存、失败计数、退避 streak、命令/RPM 基线与
+    /// warmedUp 一并作废（整值复位，理由同 WriteHealth.reset）
+    public mutating func reset() { self = .init() }
+
+    /// 唤醒专用复位（R35 审查）：同 reset，但**保留 faultStreak 退避记忆**。
+    /// streak 是"这台机器上这把风扇反复故障过"的跨会话判决，不是睡前的瞬时测量——
+    /// 清零会让反复故障扇每个 sleep/wake 周期回到 3 拍就解除的最高重接管频率，
+    /// R24b 的指数退避（3→48 拍）在笔记本上等于没生效。
+    /// 安全向核对：保留 streak 只让"解除锁存"更慢，期间风扇由系统调度兜底（不欠冷）；
+    /// 结构上仍不可能永久锁存（自解路径永在，且 streak 不参与判定只参与节奏）。
+    public mutating func resetForWake() {
+        let keptStreak = faultStreak
+        self = .init()
+        faultStreak = keptStreak
+    }
 
     public mutating func record(states: [FanState], commandedRPM: [Int: Double],
                                 risingGrace: Bool = true,

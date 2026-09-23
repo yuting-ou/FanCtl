@@ -84,9 +84,12 @@ public final class ControlEngine {
     public private(set) var dtLedger: DTLedgerState
     var aiMetricsUserTarget: Double? = nil   // 评测的用户目标基准（有效目标随环境/夜间漂移，不能用作重置判据）
     var thermalModel: ThermalModel
-    var learnDirty = false
-    var modelDirty = false
-    var dtLedgerDirty = false
+    // public private(set)：落盘重试语义需要被引擎测试观察（同 thermalLearn/aiMetrics 惯例）
+    public private(set) var learnDirty = false
+    public private(set) var modelDirty = false
+    public private(set) var dtLedgerDirty = false
+    // R35：落盘失败的边沿日志标志（静默降级可以，静默失效不可以）
+    var persistenceFailedLogged = false
     var envCompLogged = false
     var lastAIOutput: Double? = nil
     var lastAIIntent: AIIntent? = nil
@@ -238,11 +241,7 @@ public final class ControlEngine {
             lastWrittenRPM.removeAll()
             hooks.log("系统入睡：已交还自动调度")
         }
-        ConfigStore.saveStats(statsKeeper.stats)
-        ConfigStore.saveLearn(thermalLearn)
-        ConfigStore.saveModel(thermalModel)
-        ConfigStore.saveAIMetrics(aiMetrics)
-        ConfigStore.saveDTLedger(dtLedger)
+        flushAll()
     }
 
     /// 系统唤醒（主队列调用）：清理残留状态、重扫传感器、立即跑一拍
@@ -262,6 +261,8 @@ public final class ControlEngine {
         currentLoopInterval = LOOP_INTERVAL_DEFAULT
         lastLoopStart = nil
         stuckDetector.reset()
+        writeHealth.reset()          // R35：睡前的闭环故障锁存/基线属上一段清醒会话
+        feedbackHealth.resetForWake()  // R35 审查：故障退避 streak 跨会话保留（见该方法注释）
         belowAmbientSeconds = 0
         belowAmbientFaulted = false
         lastPlausibleEnvTemp = nil
@@ -281,11 +282,21 @@ public final class ControlEngine {
 
     /// 退出前落盘（SIGTERM/看门狗外的正常退出路径）
     public func shutdownSave() {
-        ConfigStore.saveStats(statsKeeper.stats)
-        ConfigStore.saveLearn(thermalLearn)
-        ConfigStore.saveModel(thermalModel)
-        ConfigStore.saveAIMetrics(aiMetrics)
-        ConfigStore.saveDTLedger(dtLedger)
+        flushAll()
+    }
+
+    /// 全量落盘（入睡/退出共用）。R35：返回值不再被丢弃——失败时置脏旗让主循环
+    /// 下个节流周期重试并记一条日志（进程随后可能被 launchd 拉起，静默丢数不可接受）
+    private func flushAll() {
+        var failed: [String] = []
+        if !ConfigStore.saveStats(statsKeeper.stats) { failed.append("stats") }
+        if !ConfigStore.saveLearn(thermalLearn) { learnDirty = true; failed.append("learn") }
+        if !ConfigStore.saveModel(thermalModel) { modelDirty = true; failed.append("model") }
+        if !ConfigStore.saveAIMetrics(aiMetrics) { failed.append("ai-metrics") }
+        if !ConfigStore.saveDTLedger(dtLedger) { dtLedgerDirty = true; failed.append("dt-ledger") }
+        if !failed.isEmpty {
+            hooks.log("落盘失败(\(failed.joined(separator: ", ")))：数据保留待重试")
+        }
     }
 
     private func setSuspended(_ value: Bool) {
@@ -1141,20 +1152,25 @@ public final class ControlEngine {
             // 约每 60 秒落盘一次（自适应间隔下用累计秒数判断，不依赖 loopCount）
             if statsAccumSeconds >= 60 {
                 statsAccumSeconds = 0
-                ConfigStore.saveStats(statsKeeper.stats)
+                // R35：写失败保留脏旗，下个节流周期重试——此前无条件清旗，
+                // 一次磁盘/权限抖动即静默丢掉该窗口的学习、模型与账本增量
+                var failed: [String] = []
+                if !ConfigStore.saveStats(statsKeeper.stats) { failed.append("stats") }
                 if learnDirty {
-                    ConfigStore.saveLearn(thermalLearn)
-                    learnDirty = false
+                    if ConfigStore.saveLearn(thermalLearn) { learnDirty = false } else { failed.append("learn") }
                 }
                 if modelDirty {
-                    ConfigStore.saveModel(thermalModel)
-                    modelDirty = false
+                    if ConfigStore.saveModel(thermalModel) { modelDirty = false } else { failed.append("model") }
                 }
-                ConfigStore.saveAIMetrics(aiMetrics)
-                // 4.0.1（4.1-A1）：账本与评测指标同节流落盘（变化驱动，无变化不写盘）
+                if !ConfigStore.saveAIMetrics(aiMetrics) { failed.append("ai-metrics") }
                 if dtLedgerDirty {
-                    ConfigStore.saveDTLedger(dtLedger)
-                    dtLedgerDirty = false
+                    if ConfigStore.saveDTLedger(dtLedger) { dtLedgerDirty = false } else { failed.append("dt-ledger") }
+                }
+                if failed.isEmpty {
+                    persistenceFailedLogged = false
+                } else if !persistenceFailedLogged {
+                    persistenceFailedLogged = true
+                    hooks.log("落盘失败(\(failed.joined(separator: ", ")))：数据保留待重试")
                 }
             }
         }
