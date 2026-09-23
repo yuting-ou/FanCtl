@@ -399,6 +399,11 @@ public struct DaemonStatus: Codable {
     public var thermalModelUsable: Bool?
     public var thermalModelB: Double?
     public var thermalModelSamples: Int?
+    /// R38：产生这份 status 的 daemon 版本串（如 "4.2.3 (94)"）。诊断包此前只能靠
+    /// "App plist 版本 + daemon 二进制 mtime"推断装的是什么，遇到"App 已升级、daemon
+    /// 留在旧版"这种半途状态就只能猜。旧 daemon 不写此字段 → 解码为 nil。
+    /// 解码侧限长 64 字符：status.json 在组可写目录里，超长串会被 App 直接渲染。
+    public var daemonVersion: String?
     public var cpuTemp: Double { sensors.cpuDie }
     public var gpuTemp: Double { sensors.gpuDie }
 
@@ -428,7 +433,8 @@ public struct DaemonStatus: Codable {
                 calibrating: Bool? = nil,
                 thermalModelUsable: Bool? = nil,
                 thermalModelB: Double? = nil,
-                thermalModelSamples: Int? = nil) {
+                thermalModelSamples: Int? = nil,
+                daemonVersion: String? = nil) {
         self.sensors = sensors
         self.mode = mode
         self.appliedPercent = appliedPercent
@@ -464,6 +470,7 @@ public struct DaemonStatus: Codable {
         // v3.8：与 F9（v3.6.0 起静默吞 learnEnvelopeGap）同一教训——Optional 字段
         // 也必须显式赋值，"没赋值"与"值为 nil"语义不同。
         self.hardwareProfile = hardwareProfile
+        self.daemonVersion = daemonVersion
         self.calibrating = calibrating
         self.thermalModelUsable = thermalModelUsable
         self.thermalModelB = thermalModelB
@@ -506,6 +513,7 @@ public struct DaemonStatus: Codable {
         case hardwareProfile
         case calibrating
         case thermalModelUsable, thermalModelB, thermalModelSamples
+        case daemonVersion
         case cpuTemp, gpuTemp
     }
 
@@ -557,6 +565,14 @@ public struct DaemonStatus: Codable {
         thermalModelUsable = try container.decodeIfPresent(Bool.self, forKey: .thermalModelUsable)
         thermalModelB = try container.decodeIfPresent(Double.self, forKey: .thermalModelB)
         thermalModelSamples = try container.decodeIfPresent(Int.self, forKey: .thermalModelSamples)
+        // R38：版本串来自组可写目录里的 JSON——限长 64 且只收可打印 ASCII（含换行/控制
+        // 字符或超长的一律当没有），否则一条被改写的 status.json 就能往展示层塞文本
+        if let v = try container.decodeIfPresent(String.self, forKey: .daemonVersion),
+           !v.isEmpty, v.count <= 64, v.utf8.allSatisfy({ $0 >= 0x20 && $0 <= 0x7e }) {
+            daemonVersion = v
+        } else {
+            daemonVersion = nil
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -594,6 +610,7 @@ public struct DaemonStatus: Codable {
         try container.encodeIfPresent(thermalModelUsable, forKey: .thermalModelUsable)
         try container.encodeIfPresent(thermalModelB, forKey: .thermalModelB)
         try container.encodeIfPresent(thermalModelSamples, forKey: .thermalModelSamples)
+        try container.encodeIfPresent(daemonVersion, forKey: .daemonVersion)
         // 同时写旧字段，保证回滚到旧版本 App/daemon 时也能读
         try container.encode(sensors.cpuDie, forKey: .cpuTemp)
         try container.encode(sensors.gpuDie, forKey: .gpuTemp)
@@ -1281,6 +1298,9 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
     // 4.0 审查修复：calibrating 翻转参与变化感知——此前校准进出/超时接管那一拍
     // summary 不含此字段，状态不落盘，App 的"校准中"提示要等 10s 心跳才消失
     let calibStr = s.calibrating == true ? "CAL" : "-"
+    // R38：daemon 版本进摘要——它只在升级/重启那一刻变，漏掉它会让"升级后第一拍"
+    // 因其它字段未变而不落盘，诊断包就只能看到旧版本串
+    let verStr = s.daemonVersion ?? "-"
     return [
         String(r(s.sensors.cpuDie)),
         String(r(s.sensors.gpuDie)),
@@ -1305,6 +1325,7 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
         heatsinkStr,
         palmCompStr,
         envGapStr,
-        calibStr
+        calibStr,
+        verStr
     ].joined(separator: "|")
 }

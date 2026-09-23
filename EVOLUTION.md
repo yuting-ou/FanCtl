@@ -163,6 +163,20 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R38（4.2.3(94) 契约补一轮）：daemon 自报版本，诊断包不再靠推断
+- **选题**：R37 的诊断包把"陌生人机器上首问的那一串问题"收进了一条命令，但它自己的**残余风险第一条**就是"报告不含 daemon 版本串"——只能拿 App plist 版本 + `/usr/local/libexec/fanctld` 的 mtime 推断。真机第一次 dogfood 就撞出这种推断无从判断的形态：App 是 4.2.0(91)、daemon 二进制是 9-21 装的，"到底是 App 新 daemon 旧、还是 daemon 也升过只是被复制过一次"没人能答。杠杆排序里这属于"状态与指标会说谎"，高于交付链，故先做它。
+- **改动**（`git diff` 面很小，价值在契约）：`DaemonStatus.daemonVersion: String?`（`Config.swift:404`）由 fanctld 把编译期常量 `fanctldVersion` 经 `ControlEngine.Hooks.daemonVersion`（默认 nil，测试/工具不注入即不落盘）带进**三处**构造：常规拍与两个传感器故障分支（故障态恰恰最需要知道是谁在说话）。诊断包"装机"小节改成三件套：App 版本 + daemon 自报版本 + 二进制落盘时间。
+- **红线自查**：新 JSON 字段走 `decodeIfPresent` + 默认 nil ✓；进 `statusChangeSummary`（版本变化的那一拍必须落盘，否则升级后诊断包还报旧版）✓；写盘节奏未变（版本串进程内恒定，只在启动那一拍造成一次差异）✓。解码侧另加**外来值守卫**：限长 64、只收 0x20–0x7e——`status.json` 是 `root:admin 664`、同组可写的文件，不能假设里面的字符串干净（它会进用户粘贴的诊断文本）。
+- **测试**（新组 `daemon 版本自报（R38）`，`TestsReport.swift`）：往返不丢 / 旧 status 无字段解为 nil / 超长·含控制字符·空串一律拒 / 仅版本不同也算摘要变化 / **两条 F9 同族守卫**——① 用 `DaemonStatus(..., daemonVersion:)` 的 **init 参数**构造后断言字段非空（属性直赋的往返测试抓不到"init 漏赋值"，而 Optional 存储属性漏赋值是静默的：v3.6.0 的 `learnEnvelopeGap` 就这样整版失效）；② 源码里 `daemonVersion: hooks.daemonVersion` 计数须为 3。
+- **本轮自己踩到的两个坑（都是"假绿"）**：
+  - 手写 JSON 夹具用了 raw 串 `#"…"#`，值前那个 `"` 与分隔符 `"#` 粘连，导致整条 JSON 非法 → 四条"外来值守卫"断言全部**空过**（它们期望 nil，而解码失败也返回 nil）。加一条"基线：常规版本串可解出"才暴露。教训与 R37 同源：**任何依赖前提成立的断言，前面必须有一条断言证明前提成立**。
+  - 变异验证 M-A（删掉 init 里的 `self.daemonVersion = daemonVersion`）**第一次没有打红**——因为往返测试走的是属性直赋。补上 init 参数那条断言后 M-A 立刻红。这是本轮最值钱的一次自我证伪：我以为已经覆盖了 F9 那一类。
+- **残余风险（不许静默当已修）**：
+  - 版本串是 **daemon 自报**，而 `status.json` 在同组可写目录里——它证明的是"写这份状态的那个二进制自称哪版"，不是"root 落点上的二进制确实是它"。目前没有任何代码拿它做决策（全仓仅诊断包渲染消费），所以伪造只能骗人眼；一旦将来有人用它做升级判断，必须换成"从 root 拥有路径读出的身份"（如 sha256 或 `-v` 实读）。
+  - `Version.generated.swift` 是 build.sh 生成的 checked-in 占位件：改了代码却**没走 build.sh** 而直接 `swift build` 装上去，自报版本会停在上一版。发行链有 tag==VERSION 与 `dist/fanctld -v` 双断言，缺的是"源码树直装"这条路的守卫。
+  - 接线门是**文本计数**（构造点数 == 带版本点数），注释里出现 `DaemonStatus(` 会把它撑红——失败方向是响铃而非静默，可接受；真正的新构造点由 `sites == 3` 那条一起兜。
+- **记账**：4836/84 → **4852 断言 / 85 组**（契约门槛双源同步 **4840 / 84**）；root 脚本门禁 45 通过 / 0 失败；变异 5 处（init 漏赋值 / 版本不进摘要 / 去掉限长 / 故障分支漏传 / fanctld 不注入）全部打红后复绿；`./scripts/build.sh` 全链路 EXIT 0，真机 `dist/fanprobe --report` 首行如实报 `daemon 版本未落盘（daemon 早于 4.2.3）`（本机装的仍是旧 daemon）。
+
 ### R37（4.2.2(93) 可诊断性轮）：诊断包落地，顺手挖出"只读工具其实会写 root 的数据目录"
 - **选题依据**：目的函数里"可诊断性"是陌生人机器上的第一约束——本仓全部调参证据来自一台机器（N=1），而 Release 在往陌生硬件发。R33 就把"fanprobe --report + issue 模板收诊断"记进未修清单，本轮兑现（纯加法、可全自动验证）。
 - **做了什么**：① `SMCCore/DiagnosticReport.swift`——纯函数渲染 19 小节定长文本（不碰文件/SMC/时钟，时间戳由调用方注入，所以无权限环境也能全测）；② `fanprobe --report`——副作用（读 JSON、试开 SMC、读 Info.plist 与 daemon mtime）全在薄壳里，且放在 SMC 探测之前：诊断包最大的价值恰恰在"东西坏了"的时候；③ `.github/ISSUE_TEMPLATE/bug_report.yml` 新增必填 `report` 项；④ 发行说明改由仓库 `RELEASE-NOTES.md` 单一来源提供。

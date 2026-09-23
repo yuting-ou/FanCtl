@@ -163,7 +163,9 @@ let engine = ControlEngine(
         schedule: { scheduleNextLoop(interval: $0) },
         onBattery: { isOnBattery() },
         powerComponents: { powerComposition.current() },
-        setPowerInterval: { powerComposition.updateInterval($0) }))
+        setPowerInterval: { powerComposition.updateInterval($0) },
+        // R38：把编译期版本串带进 status.json——诊断包/App 才能回答"这台机器上跑的是哪版"
+        daemonVersion: fanctldVersion))
 
 // MARK: - 退出时恢复自动调度
 

@@ -112,7 +112,9 @@ func testDiagnosticReport() {
     // ④ 装机版本：App 版本串与 daemon 落盘时间都要出现（issue 第一问=什么版本）
     let fullText = fullLines.joined(separator: "\n")
     expect(fullText.contains("4.2.2 (93)"), "满输入含 App 版本串")
-    expect(fullText.contains("daemon 装于 2023-11-"), "满输入含 daemon 安装时间")
+    expect(fullText.contains("二进制装于 2023-11-"), "满输入含 daemon 安装时间")
+    expect(fullText.contains("版本未落盘（daemon 早于 4.2.3）"),
+           "status 里没有版本时如实报未落盘")
     expect(fullText.contains("模式 ai"), "满输入含调速模式")
     expect(fullText.contains("fan0: 2600/2800RPM"), "满输入含风扇实际/目标转速")
     expect(fullText.contains("口径 秒加权"), "有秒分母的指标标注为新口径")
@@ -326,4 +328,82 @@ func testProbeReadOnlyLoads() {
            "fanprobe 不得碰 loadConfig（它会建目录/备份/回写默认配置）")
     expect(!text.contains("ensureDirectories") && !text.contains("ConfigStore.save"),
            "fanprobe 不得碰建目录或任何 save 路径")
+}
+
+/// R38：`status.daemonVersion` —— 诊断包此前只能靠"App plist + 二进制 mtime"推断装的是
+/// 什么版本；这个字段让 daemon 自报。它是**跨进程 JSON 契约**（旧 daemon 不写、新 App 要读），
+/// 所以锁四件事：往返不丢、旧档解为 nil、外来值限长限字符集、进变化感知摘要。
+func testDaemonVersionField() {
+    group("daemon 版本自报（R38）")
+    let enc = JSONEncoder()
+    let dec = JSONDecoder()
+    dec.dateDecodingStrategy = .iso8601
+    enc.dateEncodingStrategy = .iso8601
+
+    var st = DaemonStatus(cpuTemp: 70, gpuTemp: 55, mode: .ai, appliedPercent: 40, fans: [])
+    st.daemonVersion = "4.2.3 (94)"
+    guard let data = try? enc.encode(st), let back = try? dec.decode(DaemonStatus.self, from: data)
+    else { expect(false, "status 往返可编解码"); return }
+    expectEqual(back.daemonVersion, "4.2.3 (94)", "daemonVersion 往返不丢")
+
+    // F9 同族守卫：引擎是用**参数**把版本传进 DaemonStatus 的，而 Optional 存储属性
+    // 默认 nil——init 里漏一行赋值不会报错，只会让字段永远为空（v3.6.0 的
+    // learnEnvelopeGap 就是这么静默失效了一整版）。上面那条往返走的是属性直赋，
+    // 抓不到这种漏赋值，必须再走一次 init 参数。
+    let viaInit = DaemonStatus(sensors: SensorReadings(cpuDie: 70, gpuDie: 55), mode: .ai,
+                              appliedPercent: 40, fans: [], daemonVersion: "4.2.3 (94)")
+    expectEqual(viaInit.daemonVersion, "4.2.3 (94)", "init 参数必须真赋到字段（F9 同族）")
+
+    // 旧 daemon 的 status.json（无此字段）→ nil，而不是崩溃或空串
+    let legacy = #"{"cpuTemp":70,"gpuTemp":55,"mode":"ai","appliedPercent":40,"fans":[],"timestamp":"2026-09-23T10:00:00Z"}"#
+        .data(using: .utf8)
+    expect(legacy != nil, "旧 status 样本可构造")
+    if let legacy, let old = try? dec.decode(DaemonStatus.self, from: legacy) {
+        expectEqual(old.daemonVersion, nil, "旧 status 无该字段时解为 nil")
+    } else {
+        expect(false, "旧 status 应能解码")
+    }
+
+    // 外来值守卫（status.json 在 root:admin 775 目录，同组用户可写）
+    func decoded(_ raw: String) -> String? {
+        // 手写 JSON 拼接（不用 raw 串：值前面那个引号会被 #"…"# 的分隔符吃掉，
+        // 结果整条 JSON 非法、四个守卫断言全部空过——基线那条就是抓这个的）
+        let json = "{\"cpuTemp\":70,\"gpuTemp\":55,\"mode\":\"ai\",\"appliedPercent\":40,"
+            + "\"fans\":[],\"timestamp\":\"2026-09-23T10:00:00Z\",\"daemonVersion\":\"" + raw + "\"}"
+        guard let d = json.data(using: .utf8) else { return nil }
+        return (try? dec.decode(DaemonStatus.self, from: d))?.daemonVersion
+    }
+    expectEqual(decoded("4.2.3 (94)"), "4.2.3 (94)", "基线：常规版本串可解出")
+    expectEqual(decoded(String(repeating: "9", count: 64)), String(repeating: "9", count: 64),
+                "64 字符以内保留")
+    expectEqual(decoded(String(repeating: "9", count: 65)), nil, "超长版本串按污染处理")
+    expectEqual(decoded("4.2.3\\nrm -rf"), nil, "含控制字符的版本串不收")
+    expectEqual(decoded(""), nil, "空串按缺省处理（报告里走未落盘措辞）")
+
+    // 红线：新 status 字段必须进变化感知——只改版本也要判定"有变化"
+    var a = st; var b = st
+    a.daemonVersion = "4.2.2 (93)"
+    b.daemonVersion = "4.2.3 (94)"
+    expect(statusChangeSummary(a) != statusChangeSummary(b),
+           "仅版本不同也算状态变化（升级后第一拍必须落盘）")
+    expect(statusChangeSummary(a).contains("4.2.2 (93)"), "摘要里能看到版本串")
+    var noVer = st; noVer.daemonVersion = nil
+    expect(statusChangeSummary(noVer) != statusChangeSummary(a),
+           "版本从缺到有也算变化（旧 daemon 升到新版）")
+
+    // 接线守卫：fanctld 必须把编译期常量注入 hooks，引擎必须把它带进每一处 status 构造
+    let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    func source(_ path: String) -> String {
+        (try? String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)) ?? ""
+    }
+    expect(source("Sources/fanctld/main.swift").contains("daemonVersion: fanctldVersion"),
+           "fanctld 把编译期版本串注入 Hooks")
+    let engine = source("Sources/SMCCore/ControlEngine.swift")
+    // 数量对齐而不是钉死 3：钉死只防"删掉一处"，不防"新增一处构造忘了传版本"。
+    // 构造点数 == 带版本点数 才是"每个 DaemonStatus 都带版本"这个不变量本身。
+    let sites = engine.components(separatedBy: "DaemonStatus(").count - 1
+    let wired = engine.components(separatedBy: "daemonVersion: hooks.daemonVersion").count - 1
+    expectEqual(sites, 3, "引擎里的 status 构造点数量（常规 + 两个传感器故障分支）")
+    expectEqual(wired, sites, "每个 status 构造点都必须带 daemonVersion（漏加即红）")
 }

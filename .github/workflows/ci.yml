@@ -36,8 +36,8 @@ jobs:
           swift run -c release --disable-sandbox fanctltests 2>&1 | tee test-output.txt
           N=$(grep -oE '全部通过：[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1)
           echo "断言数: $N"
-          if [ -z "$N" ] || [ "$N" -lt 4830 ]; then
-            echo "::error::断言数 $N 低于契约下限 4830（测试被删/跳过？）"
+          if [ -z "$N" ] || [ "$N" -lt 4840 ]; then
+            echo "::error::断言数 $N 低于契约下限 4840（测试被删/跳过？）"
             exit 1
           fi
           echo "ASSERTIONS=$N" >> "$GITHUB_ENV"

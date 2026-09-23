@@ -109,11 +109,14 @@ public enum DiagnosticReport {
         // 版本必须是第二行：issue 的第一问永远是"你装的什么版本"。daemon 二进制没有
         // 可低成本读出的版本串（读它要 exec），所以用"App plist 版本 + daemon 落盘时间"
         // 这对组合——两者不一致（App 新、daemon 旧）正是升级半途失败的特征。
-        let daemonWhen: String = i.daemonBinaryInstalledAt.map { "装于 " + stamp.string(from: $0) }
-            ?? "缺失（未装守护进程，或落点不可读）"
+        let daemonWhen: String = i.daemonBinaryInstalledAt.map { "二进制装于 " + stamp.string(from: $0) }
+            ?? "二进制缺失（未装守护进程，或落点不可读）"
+        // 版本串取自 status.json（daemon 自报，4.2.3 起）——"App 新、daemon 旧"这类半途
+        // 状态只有自报版本能证实，mtime 只能提示"何时装的"
+        let daemonVer: String = one(s?.daemonVersion, fallback: "版本未落盘（daemon 早于 4.2.3）")
         out.append("装机: App " + one(i.installedAppVersion,
                                       fallback: "未找到（\(FanCtlPaths.installedAppBundle)）")
-                   + " · daemon " + daemonWhen)
+                   + " · daemon " + daemonVer + " · " + daemonWhen)
 
         let profile: String = s.flatMap { $0.hardwareProfile }?.oneLine
             ?? "未知（daemon 未运行或状态未落盘）"

@@ -49,19 +49,24 @@ public final class ControlEngine {
         public let powerComponents: () -> (cpu: Double?, gpu: Double?)
         /// 分项功耗采样间隔自适应
         public let setPowerInterval: (TimeInterval) -> Void
+        /// R38：产生 status 的 daemon 版本串（fanctld 传入编译期常量）。nil = 调用方未注入
+        /// （测试与快照工具），字段就不落盘——与"旧 daemon 没这字段"同形，不造假
+        public let daemonVersion: String?
 
         public init(now: @escaping () -> Date,
                     log: @escaping (String) -> Void,
                     schedule: @escaping (TimeInterval) -> Void,
                     onBattery: @escaping () -> Bool,
                     powerComponents: @escaping () -> (cpu: Double?, gpu: Double?),
-                    setPowerInterval: @escaping (TimeInterval) -> Void) {
+                    setPowerInterval: @escaping (TimeInterval) -> Void,
+                    daemonVersion: String? = nil) {
             self.now = now
             self.log = log
             self.schedule = schedule
             self.onBattery = onBattery
             self.powerComponents = powerComponents
             self.setPowerInterval = setPowerInterval
+            self.daemonVersion = daemonVersion
         }
     }
 
@@ -504,7 +509,8 @@ public final class ControlEngine {
                 let s = DaemonStatus(sensors: SensorReadings(cpuDie: 0, gpuDie: 0),
                                      mode: config.mode, appliedPercent: 0, fans: [],
                                      timestamp: hooks.now(),
-                                     controlFault: true, faultReason: .sensorUnavailable)
+                                     controlFault: true, faultReason: .sensorUnavailable,
+                                     daemonVersion: hooks.daemonVersion)
                 ConfigStore.saveStatus(s)
                 lastStatus = s
             }
@@ -603,7 +609,8 @@ public final class ControlEngine {
                 let s = DaemonStatus(sensors: SensorReadings(cpuDie: 0, gpuDie: 0),
                                      mode: config.mode, appliedPercent: 0, fans: [],
                                      timestamp: hooks.now(),
-                                     controlFault: true, faultReason: .sensorImplausible)
+                                     controlFault: true, faultReason: .sensorImplausible,
+                                     daemonVersion: hooks.daemonVersion)
                 ConfigStore.saveStatus(s)
                 lastStatus = s
             }
@@ -1254,7 +1261,9 @@ public final class ControlEngine {
             calibrating: calibrating ? true : nil,
             thermalModelUsable: thermalModel.isMature,
             thermalModelB: thermalModel.b,
-            thermalModelSamples: thermalModel.sampleCount
+            thermalModelSamples: thermalModel.sampleCount,
+            // R38：版本随每拍落盘（升级/重启后第一拍即改变摘要 → 立刻刷新）
+            daemonVersion: hooks.daemonVersion
         )
 
         let summary = statusChangeSummary(status)
