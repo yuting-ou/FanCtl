@@ -463,13 +463,17 @@ extension ConfigStore {
     /// v3.6.1：解码失败可观测协议——备份坏文件 + NSLog（与 loadConfig 同模式）。
     /// 此前 `try?` 静默吞掉，数周学习数据损坏后无提示清零，用户无从察觉。
     /// v3.6.2：备份保留最近 5 个——损坏+重启循环下时间戳备份无限累积（F7）
+    /// `readOnly: true` 供 fanprobe 使用：解码口径完全一致，但损坏时**不落任何副作用**。
+    /// support 目录是 root:admin 775 且无 sticky 位，登录用户跑一次诊断工具若能写
+    /// `.corrupted` 备份，就能顺带轮转删除 root 写的旧备份——"只读快照"就变成写工具了。
     static func loadCorruptionAware<T: Decodable>(_ type: T.Type, from url: URL,
-                                                  name: String, decoder: JSONDecoder = JSONDecoder()) -> T? {
+                                                  name: String, decoder: JSONDecoder = JSONDecoder(),
+                                                  readOnly: Bool = false) -> T? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         do {
             return try decoder.decode(type, from: data)
         } catch {
-            backupCorrupted(data, name: name, error: error)
+            if !readOnly { backupCorrupted(data, name: name, error: error) }
             return nil
         }
     }
@@ -492,8 +496,9 @@ extension ConfigStore {
         NSLog("fanctld: \(name) 损坏，已备份到 \(backupPath.path)（\(error.localizedDescription)）")
     }
 
-    public static func loadLearn() -> ThermalLearn? {
-        loadCorruptionAware(ThermalLearn.self, from: FanCtlPaths.learnFile, name: "learn")
+    public static func loadLearn(readOnly: Bool = false) -> ThermalLearn? {
+        loadCorruptionAware(ThermalLearn.self, from: FanCtlPaths.learnFile, name: "learn",
+                            readOnly: readOnly)
     }
 
     @discardableResult
@@ -505,8 +510,9 @@ extension ConfigStore {
         } catch { return false }
     }
 
-    public static func loadAIMetrics() -> AIControlMetrics? {
-        loadCorruptionAware(AIControlMetrics.self, from: FanCtlPaths.aiMetricsFile, name: "ai-metrics")?
+    public static func loadAIMetrics(readOnly: Bool = false) -> AIControlMetrics? {
+        loadCorruptionAware(AIControlMetrics.self, from: FanCtlPaths.aiMetricsFile, name: "ai-metrics",
+                            readOnly: readOnly)?
             .sanitized()   // R23 打磨（F1 同族）：合法 JSON 的超大有限值不被解码器拒，视图 Int() 前须钳位
     }
 
@@ -523,8 +529,9 @@ extension ConfigStore {
     /// 不迁移旧 ai-metrics.json 里的账本字段：4.1-A3 修订后的裁决口径需要
     /// slopeWeightedSum（legacy 数据没有），且原始比值口径已被证伪（选择偏差）——
     /// 自 4.0.1 起重新起算，受控时长门槛按新账本计（EVOLUTION R17 记账）。
-    public static func loadDTLedger() -> DTLedgerState? {
-        loadCorruptionAware(DTLedgerState.self, from: FanCtlPaths.dtLedgerFile, name: "dt-ledger")
+    public static func loadDTLedger(readOnly: Bool = false) -> DTLedgerState? {
+        loadCorruptionAware(DTLedgerState.self, from: FanCtlPaths.dtLedgerFile, name: "dt-ledger",
+                            readOnly: readOnly)
     }
 
     @discardableResult

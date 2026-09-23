@@ -36,8 +36,8 @@ jobs:
           swift run -c release --disable-sandbox fanctltests 2>&1 | tee test-output.txt
           N=$(grep -oE '全部通过：[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1)
           echo "断言数: $N"
-          if [ -z "$N" ] || [ "$N" -lt 4720 ]; then
-            echo "::error::断言数 $N 低于契约下限 4720（测试被删/跳过？）"
+          if [ -z "$N" ] || [ "$N" -lt 4830 ]; then
+            echo "::error::断言数 $N 低于契约下限 4830（测试被删/跳过？）"
             exit 1
           fi
           echo "ASSERTIONS=$N" >> "$GITHUB_ENV"
@@ -113,9 +113,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 发行说明取自 tag 批注（作者写的迁移提示随 tag 走，不再硬编码在流水线里：
-          # 4.2.0 的关键一条是"升级链路径变更，需先 sudo ./install.sh 一次"）
-          NOTES=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME" | head -40)
+          # 发行说明取自仓库内 RELEASE-NOTES.md（R37：tag 批注在 CI 上不可靠——
+          # actions/checkout 检出 tag 建的是 lightweight 引用，git tag -l --format='%(contents)'
+          # 会退化成 commit message，v4.2.1 实测丢了迁移警示）。文件随代码评审、可被静态门检查。
+          # 说明与 tag 必须同源：notes 是仓库里的固定文件，发版只改 VERSION 而忘了改说明
+          # 就会把"上一版的迁移警示"贴到新版本上（这条链上唯一没人复核的一环，故设硬门）
+          TAG_V="${GITHUB_REF_NAME#v}"
+          if ! grep -qF -- "$TAG_V" RELEASE-NOTES.md; then
+            echo "::error::RELEASE-NOTES.md 未提到本版 ${TAG_V}（说明与 tag 不同源，拒绝发布）"
+            exit 1
+          fi
           gh release create "$GITHUB_REF_NAME" "$ASSET" \
             --title "清风 $GITHUB_REF_NAME" \
-            --notes "${NOTES:-解压后：sudo ./install.sh 安装（详见 README 快速安装）。macOS 26+ Apple Silicon。}"
+            --notes-file RELEASE-NOTES.md

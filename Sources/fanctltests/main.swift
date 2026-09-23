@@ -804,16 +804,18 @@ testHistorySalvage()
 testConfigLastGood()
 testAIMetricsWeighted()
 testPersistenceFailureRetries()
+testDiagnosticReport()
+testProbeReadOnlyLoads()
 print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
 // R33：CI 曾为 4400、源码 4550 双源漂移——已统一；改数值必须两处同时改
-// R35/R36：4.2.1 实测 4736 断言 / 82 组（R34 的 4646/77 → +90/+5：last-good、history
-// 抢救、秒加权、落盘重试、两路独立审查的 9 处修复，以及批次 A 的特权脚本信任判据组）
-let minAssertions = 4720
+// R35/R36：4.2.1 实测 4736 断言 / 82 组；R37：4.2.2 实测 4836 / 84（+100/+2：诊断包结构
+// 与口径、只读零副作用两组，含审查轮补的哨兵 0/陈旧快照/无样本断言与白名单源码门）
+let minAssertions = 4830
 // R23 测试基建：第二道门槛——distinct group 数。断言总数可被循环刷量虚高
 // （如 expectPersonalityOrdered 单次产 ~816 条），删掉整段测试但保留循环类断言时
 // 总数不降、覆盖却净损；group 数是粗粒度结构量，删函数即少一个 group，刷不出来。
-let minGroups = 81
+let minGroups = 83
 if failures == 0 {
     if checks < minAssertions {
         print("❌ 断言数 \(checks) 低于契约下限 \(minAssertions)（测试被删/跳过？）")

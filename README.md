@@ -31,6 +31,9 @@ sudo ./install.sh          # 路径 a（Release 解压目录）
 sudo ./scripts/install.sh  # 路径 b（源码构建，仓库根执行）
 # 3) 菜单栏出现「清风」图标即完成；建议在面板菜单里打开「登录时启动」
 
+# 报 bug / 求诊断：一条命令产出可粘贴的运行时快照（无需 root、只读）
+/usr/local/bin/fanprobe --report      # 源码构建版：swift run -c release --disable-sandbox fanprobe --report
+
 # 卸载（完全卸载：登录项 / daemon / App / 数据 / 日志一并清理；脚本名同上两处之一）
 sudo ./uninstall.sh
 # 已装过 4.2.0 的机器也可以直接执行装到系统里的卸载脚本：
@@ -117,7 +120,7 @@ Sources/
 ├── FanCtlApp/          SwiftUI 菜单栏 App(FanCtlApp/FanModel/PanelView/CurveViews/
 │                       GaugeViews/MonitorViews/MenuBarState/FanControlActions/
 │                       NotificationService/SelfUpgradeService)
-├── fanprobe/main.swift 只读诊断工具(无需 root)
+├── fanprobe/main.swift 只读诊断工具(无需 root;--report 出可粘贴诊断包)
 └── fanctltests/        纯逻辑测试(自带断言 harness;断言数见顶部 tests 徽章)
 scripts/                 build.sh / install.sh / deploy.sh / uninstall.sh / upgrade.sh
 dist/                    构建产物(FanCtl.app + fanctld)
@@ -192,6 +195,7 @@ sudo /usr/local/libexec/fanctl-uninstall.sh
 
 # 诊断(只读)
 swift run -c release --disable-sandbox fanprobe
+swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行数诊断包,issue 直接粘
 ```
 
 日志:`/Library/Logs/FanCtl/fanctld.log`(512KB 轮转)。UI 快照验证:`FanCtlApp --snapshot [curve|auto|manual|ai|hotspots|today|custom|label] [dark] [warn|lens|boost|dead]` 渲染 PNG 到 /tmp（模式取 FanMode 原值 + 附加视图；dark 深色、warn/lens/boost/dead 为排版/状态开关）。
@@ -235,7 +239,13 @@ swift run -c release --disable-sandbox fanprobe
   `dist/fanctld -v` 与 `Info.plist` 三方对齐 `VERSION`，防"静默拷进陈旧中间件"；
   `test-root-scripts.sh` 新增静态门：root 脚本落点、目录信任门、zip 携带 `upgrade.sh`、
   内嵌机制不得复活、`$VAR` 紧跟非 ASCII 的展开（真在 CI 上炸过一次 bash 3.2 变量名吞字节）。
-- 测试 **4646 → 4732 断言 / 82 组**（契约门槛双源同步 4700/81）；两路独立对抗审查共报
+- **诊断包（4.2.2，`fanprobe --report`）**：陌生人机器上的 issue 不再靠截图猜——一条命令出
+  19 小节定长快照（装机版本 + daemon 落盘时间、硬件画像、状态新鲜度、电源/目标叠加、故障与
+  安全托底、学习/热模型/评测/dt 账本口径、上次异常退出、日志可读性、SMC 直读结果）。渲染是
+  SMCCore 纯函数（不碰文件/SMC/时钟），缺数据一律出声成"—/未落盘"而不是省略小节；模板新增
+  必填项要求贴该输出。发行说明改由仓库 `RELEASE-NOTES.md` 提供（CI 上轻量 tag 无批注，
+  原先"从批注取说明"会静默退化成 commit message，迁移警示就丢了）。
+- 测试 **4646 → 4836 断言 / 84 组**（契约门槛双源同步 4830/83，见顶部徽章）；两路独立审查共报
   11 项 → 9 修 3 证伪（其中一项的 P1 推翻了我自己先前的证伪，详见 EVOLUTION R35/R36）。
 ## 9. 4.0 变更摘要(2026-09,冷启动校准与诚实形态 + 审查修复轮)
 

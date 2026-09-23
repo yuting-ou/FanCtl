@@ -943,6 +943,14 @@ public enum FanCtlPaths {
     public static var stdLogFile: URL { logDir.appendingPathComponent("fanctld.out.log") }
     public static var errLogFile: URL { logDir.appendingPathComponent("fanctld.err.log") }
 
+    /// 装机落点（只读诊断用）：**不受 overrideSupportDir 影响**——诊断包要回答的是
+    /// "这台机器上真正装了什么"，重定向测试目录时也必须读真实路径。
+    /// 与 shell 侧的跨语言防漂移由 scripts/test-root-scripts.sh 的「装机落点常量与脚本
+    /// 同源」门承担（它把这两个常量从源码里抠出来逐字比对 install/upgrade/uninstall）；
+    /// fanctltests 里那两条断言只是常量自比，防的是"有人改了字面量却没改测试预期"。
+    public static let installedAppBundle = "/Applications/清风.app"
+    public static let installedDaemonBinary = "/usr/local/libexec/fanctld"
+
     // 确保所需目录存在
     public static func ensureDirectories() {
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
@@ -1147,15 +1155,16 @@ public enum ConfigStore {
             .attributesOfItem(atPath: FanCtlPaths.configFile.path)[.modificationDate] as? Date
     }
 
-    public static func loadStats() -> DailyStats? {
+    public static func loadStats(readOnly: Bool = false) -> DailyStats? {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return loadCorruptionAware(DailyStats.self, from: FanCtlPaths.statsFile, name: "stats", decoder: decoder)?.sanitized()
+        return loadCorruptionAware(DailyStats.self, from: FanCtlPaths.statsFile, name: "stats",
+                                   decoder: decoder, readOnly: readOnly)?.sanitized()
     }
 
     // MARK: 历史战报（按天归档，保留 30 天）
 
-    public static func loadHistory() -> [DailyStats] {
+    public static func loadHistory(readOnly: Bool = false) -> [DailyStats] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let data = try? Data(contentsOf: FanCtlPaths.historyFile) else { return [] }
@@ -1166,7 +1175,7 @@ public enum ConfigStore {
         // archiveDay 随后用空表覆盖 history.json——一次局部损坏（手改/截断/磁盘满）
         // 即抹掉 30 天归档，且它正是曲线优化器与"AI 效果对比"的唯一数据底座。
         // 坏文件仍按既有协议备份，然后逐元素抢救可读的日子。
-        backupCorrupted(data, name: "history", error: JSONErrorDecodingFailure())
+        if !readOnly { backupCorrupted(data, name: "history", error: JSONErrorDecodingFailure()) }
         return salvageHistory(data, decoder: decoder)
     }
 

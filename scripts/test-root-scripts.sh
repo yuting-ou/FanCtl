@@ -270,6 +270,53 @@ run_expect 3 "暂存 upgrade.sh 授权后被换掉 → 哈希门 exit 3（正文
     env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$_stage_tamper" "$_stage_tamper/.m" 4.2.0 \
         "$_td" "$_ta" "$_tu" "$_tn"
 
+echo "== 发行说明与诊断入口（R37）=="
+if grep -q -- "--notes-file RELEASE-NOTES.md" "$ROOT/.github/workflows/ci.yml"; then
+    ok "Release 说明来自仓库文件（不再依赖 tag 批注——CI 上会退化成 commit message）"
+else
+    bad "ci.yml 未使用 --notes-file（发行说明可能丢迁移警示）"
+fi
+if [[ -f "$ROOT/RELEASE-NOTES.md" ]] && grep -q "sudo ./install.sh" "$ROOT/RELEASE-NOTES.md"; then
+    ok "RELEASE-NOTES.md 在场且含首装/迁移指引"
+else
+    bad "RELEASE-NOTES.md 缺失或没有 sudo ./install.sh 指引"
+fi
+# 说明里必须点名本版的完整版本号（只提旧系列 = 迁移警示过期；发 4.2.9 贴 4.2.2 的
+# 说明也在此红）。V 为空时必须直接判负——`grep -qF ""` 是恒真，空串会把这道门变成摆设。
+V=$(head -1 "$ROOT/VERSION" | awk '{print $1}')
+if [[ -n "$V" ]] && grep -qF -- "$V" "$ROOT/RELEASE-NOTES.md" 2>/dev/null; then
+    ok "RELEASE-NOTES.md 提到本版 ${V}"
+else
+    bad "RELEASE-NOTES.md 未提到本版 ${V:-<VERSION 读空>}，迁移警示会过期"
+fi
+# 配对门要命中代码本身而不是注释：`--report` 三个字符在注释里也算数
+if grep -q 'contains("--report")' "$ROOT/Sources/fanprobe/main.swift" \
+   && grep -q "id: report" "$ROOT/.github/ISSUE_TEMPLATE/bug_report.yml"; then
+    ok "诊断入口成对存在（fanprobe --report 分支 ↔ issue 模板要求它）"
+else
+    bad "诊断入口脱节：fanprobe 的 --report 分支或 issue 模板必填项缺失"
+fi
+
+echo "== 装机落点常量与脚本同源（R37 审查 P1）=="
+# Swift 侧的两个常量只被 fanprobe 用来"报装了什么样子的机器"，写错不会崩，但会让诊断包
+# 第 2 行谎报 App 未找到/daemon 缺失——正是 issue 的第一问。此处与 install/upgrade/uninstall
+# 里的字面量逐字比对，任何一侧漂移即红（Swift 测试里那句"与脚本一致"只是常量自比，锁不住）。
+SW_DAEMON=$(grep -o 'installedDaemonBinary = "[^"]*"' "$ROOT/Sources/SMCCore/Config.swift" | cut -d'"' -f2)
+SW_APP=$(grep -o 'installedAppBundle = "[^"]*"' "$ROOT/Sources/SMCCore/Config.swift" | cut -d'"' -f2)
+if [[ -n "$SW_DAEMON" ]] && grep -qF -- "$SW_DAEMON" "$ROOT/scripts/install.sh" \
+   && grep -qF -- "$SW_DAEMON" "$ROOT/scripts/upgrade.sh" \
+   && grep -qF -- "$SW_DAEMON" "$ROOT/scripts/uninstall.sh"; then
+    ok "daemon 落点常量与三个 root 脚本同源：${SW_DAEMON}"
+else
+    bad "daemon 落点常量（${SW_DAEMON:-读空}）与 install/upgrade/uninstall 字面量不一致"
+fi
+if [[ -n "$SW_APP" ]] && grep -qF -- "$SW_APP" "$ROOT/scripts/install.sh" \
+   && grep -qF -- "$SW_APP" "$ROOT/scripts/upgrade.sh"; then
+    ok "App 落点常量与安装/升级脚本同源：${SW_APP}"
+else
+    bad "App 落点常量（${SW_APP:-读空}）与 install/upgrade 字面量不一致"
+fi
+
 echo "root 脚本门禁：$pass 通过 / $fail 失败"
 if [[ "$fail" -gt 0 ]]; then exit 1; fi
 exit 0

@@ -47,6 +47,19 @@ body:
     validations:
       required: true
   - type: textarea
+    id: report
+    attributes:
+      label: 诊断包（必填）
+      description: |
+        已装发行版的机器直接运行这条（只读、无需管理员密码）：
+        `/usr/local/bin/fanprobe --report`
+        源码构建的机器改用：`swift run -c release --disable-sandbox fanprobe --report`
+        或发行包解压目录里的 `./fanprobe --report`。把整段输出粘贴到这里。
+        这份快照决定我们能不能远程判断"是硬件没风扇、daemon 没跑，还是控制被红线接管"。
+      render: shell
+    validations:
+      required: true
+  - type: textarea
     id: logs
     attributes:
       label: 相关日志

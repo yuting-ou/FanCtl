@@ -212,9 +212,10 @@ extension ThermalModel: Equatable {
 // MARK: - 持久化（与学习数据同目录）
 
 extension ConfigStore {
-    public static func loadModel() -> ThermalModel? {
+    public static func loadModel(readOnly: Bool = false) -> ThermalModel? {
         // v3.6.2：接入损坏可观测协议——此前 `try?` 静默，数天辨识参数损坏后无提示清零
-        loadCorruptionAware(ThermalModel.self, from: FanCtlPaths.modelFile, name: "thermal-model")
+        loadCorruptionAware(ThermalModel.self, from: FanCtlPaths.modelFile, name: "thermal-model",
+                            readOnly: readOnly)
     }
 
     @discardableResult

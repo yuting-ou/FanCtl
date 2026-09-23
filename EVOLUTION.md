@@ -163,6 +163,23 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R37（4.2.2(93) 可诊断性轮）：诊断包落地，顺手挖出"只读工具其实会写 root 的数据目录"
+- **选题依据**：目的函数里"可诊断性"是陌生人机器上的第一约束——本仓全部调参证据来自一台机器（N=1），而 Release 在往陌生硬件发。R33 就把"fanprobe --report + issue 模板收诊断"记进未修清单，本轮兑现（纯加法、可全自动验证）。
+- **做了什么**：① `SMCCore/DiagnosticReport.swift`——纯函数渲染 19 小节定长文本（不碰文件/SMC/时钟，时间戳由调用方注入，所以无权限环境也能全测）；② `fanprobe --report`——副作用（读 JSON、试开 SMC、读 Info.plist 与 daemon mtime）全在薄壳里，且放在 SMC 探测之前：诊断包最大的价值恰恰在"东西坏了"的时候；③ `.github/ISSUE_TEMPLATE/bug_report.yml` 新增必填 `report` 项；④ 发行说明改由仓库 `RELEASE-NOTES.md` 单一来源提供。
+- **真机 dogfood 首跑就产出两条硬事实**：本机 App 是 4.2.0(91) 而 `/usr/local/libexec/fanctld` 的 mtime 是 9-21——"装机: App 版本 + daemon 落盘时间"这一行的全部意义就是暴露这种半途；旧 daemon 不写 `controlFault/targetUnreachable/safetyFloorPercent`，所以"未落盘"必须与"—/false"三分，不能混成一个破折号。
+- **设计约束（每条都有断言）**：小节数恒定（省略=谎报"没问题"）；非有限值→"—"；传感器哨兵 0→"0(哨兵=无有效读数)"（`ControlEngine` 在 sensorUnavailable/sensorImplausible 两分支直接写 `cpuDie:0`）；缺字段→"未落盘"；加权口径标签与 `weightedSpan` **同一条**判据；停更 >30s 时数值小节逐个带"陈旧快照"；磨损行自带战报日期；不写用户数据目录路径。
+- **R37 独立审查轮（两路 fresh subagent，15 项 → 8 修 / 2 证伪 / 5 记为已知边界）**：
+  - **修（P1）｜"只读诊断工具"其实会在 root 的数据目录里写文件**：`loadCorruptionAware` 解码失败时调 `backupCorrupted`——新建 `*.corrupted.<ms>.json` **并轮转删除旧备份**。fanprobe 从 v2.x 起就在调这些 loader，而 support 目录是 `root:admin 775` 且**无 sticky 位**：登录用户跑一次 `fanprobe` 就能在 root 的地盘造文件、并删掉 root 写的损坏证据。修法：`readOnly:` 参数贯穿 5 个 loader 与 history 的抢救分支（解码口径一字不动，只关副作用），fanprobe 全部改只读；防回潮 = **白名单式源码门**（黑名单点名 6 个不够——副作用最重的 `loadConfig` 会建目录+备份+回写默认配置，它没进黑名单就能悄悄加回来）+ 行为对照测试（同一份坏数据：正常加载留 1 个备份、只读加载留 0 个）。**这条是自查+两路审查共同撞见的，我自己的计划自审没发现。**
+  - **修（P1）｜跨语言常量的"双向锁定"门禁是空的**：`FanCtlPaths.installed{AppBundle,DaemonBinary}` 的注释声称"由 fanctltests 与 root 脚本门禁双向锁定"，实际 Swift 侧那句断言是**常量与测试里同一串字面量自比（恒真）**，从不读脚本，注释还点了个不存在的测试名。后果：改 install/upgrade/uninstall 任一处落点，全部门禁仍绿，而诊断包第 2 行谎报"App 未找到/daemon 缺失"。修 = 新 shell 门把两个常量从源码里抠出来逐字比对三个脚本（变异验证：`libexec`→`bin` 立刻红），注释改为如实描述。
+  - **修（P2）｜口径标签会给数字镀金**：`weightedSecondsTotal != nil` 与 getter 的真实回退条件（`>1e-6`；`sanitized()` 把非法值钳成 0）不是同一条 → 走样本口径除法的数字被标成"秒加权"。改成同条件，并加"有样本但加权分母=0"的断言。
+  - **修（P2）｜四处措辞会让读者判错**：status 文件在但解不出时报"运行中"（下面八个小节全是"—"）；`age` 未钳负（时钟回拨→"停更 -0 分钟"）；两个"受控"不同寿命（指标换目标档清零、账本不清零）却同名；"今日"无日期守卫（daemon 停三天就拿三天前的战报称今日）；"SMC 直读: 正常"其实只证明能打开、未取读数；热模型归一化只标 b 且"内存≠落盘 = 未加载"的推论方向错（落盘约 60s 节流，差一个窗口是常态）。
+  - **修（P2）｜notes 链三处摆设门**：`grep -qF "$MM"` 在 VERSION 读空时是 `grep -qF ""` 恒真；配对门 `grep -- "--report"` 命中的是注释行；发版 step 不校验 tag↔notes 同源（发 4.2.9 贴 4.2.2 的说明照绿）。三处都换成硬门，其中 release job 里 `grep -qF "${GITHUB_REF_NAME#v}" RELEASE-NOTES.md || exit 1`。
+  - **证伪｜"BSD `install` 保留源文件 mtime，所以『daemon 装于 X』是构建时刻"**：实测 `install -m 755 src dst`——src mtime=2020-01-01、dst=当场时间，**不保留**。审查方给的"实测"结论是错的，"装于 X"确实就是最后一次装/升级时刻，措辞保留（另把 label 写成"装于"→"最后装/升级于"级别的精确化留作后续，不再动）。
+  - **证伪｜issue 模板 maxLength 不够**：GitHub textarea 上限 65535，19 行诊断包约 1–2KB。
+  - **已知边界（记档不修）**：`attributesOfItem`/`Data(contentsOf:)` 跟随符号链接 → 组内用户可伪造"装于 X/停更 N 分钟"，但报告文本没有任何代码消费者，伪造只能骗人眼；`/Applications/清风.app` 在 App 侧仍是三处字面量（PanelView 文案 + 升级 watcher 的 `open`），改读常量会把展示文案与 AppleScript 元字符校验搅在一起，单独一轮做；"风扇数量 —"与同行 fan0 明细并存不算矛盾（画像缺失 ≠ 风扇缺失）。
+- **记账**：fanctltests 4736/82 → **4836 断言 / 84 组**（契约门槛双源同步 **4830 / 83**）；root 脚本门禁 39 → **45 通过 / 0 失败**；变异验证 8 处（少一节 / 按条件省略 / 去 `isFinite` / 不压平换行 / 口径恒称加权 / 常量漂移 / 只读守卫失效 / 源码白名单越线）全部打红后复绿；`./scripts/build.sh` 全链路 EXIT 0。
+- **残余风险（不许静默当已修）**：诊断包仍**不含 daemon 版本串**——读它要 exec，于是退化成"App plist 版本 + daemon mtime"的代理对，两者一致性靠 `install.sh`/`upgrade.sh` 同源安装来保证；`status.json` 没有版本字段，跨版本对照仍需人推（要正解就得给 DaemonStatus 加字段并走一轮 JSON 契约变更）；陌生机器的真实形态分布（passive 机型、无功耗键、传感器全 0、`/usr/local` 用户可写）至今没有第二台机器验证过——这正是本轮做诊断包的原因，也是它本身尚未被验证的证据。
+
 ### R36（4.2.0(91) 批次 A）：特权信任根落地 + 发版链第四根因
 - **批次 A 做了什么**：把"root 执行的代码"从用户可写的 App bundle 里彻底搬走。三代演进的同一威胁：v3.9 让 root 读 bundle 内 `upgrade.sh`（bundle 被 `chown -R` 给登录用户 → 驻留进程可篡改正文 → 用户下次输密码即提权）；R23 改成构建期 base64 内嵌进二进制（堵住文件面，但**二进制本身还在同一个可写 bundle 里**，换 App 即换被授权内容）；批次 A 定死规范落点 `/usr/local/libexec/fanctl-{upgrade,uninstall}.sh`（root:wheel 755），install.sh 首装、upgrade.sh 每次升级自我刷新，App 侧 exec 前 `lstat` 校验落点身份，**不合规直接拒绝提权，绝不回退内嵌/包内副本**。
 - **四道闸（每道都有名字）**：
@@ -755,6 +772,8 @@ init 参数静默吞值）——审查计划本身也是审查。UI 教训：Cha
 | #0-pre(v2.6 网络教训) | ①快拖滑块时反馈失配判故障 ②review 发现迟滞接线静默失败 | — | P0/P1 级误判 | 快拍语义与接线验证缺失 | 任何"快速路径"改动必须配引擎级拍序列测试；接线改动必须 grep 验证落点 |
 | R35(计划期) | support 目录 `chmod 1775`（sticky）可堵住组内换文件 | 消 R23 剩余竞态面 | **未实施——解析否决** | `rename(2)` 的 S_ISVTX 检查落在**目标文件**上，而 config.json 恒 root 所有 → 非 root 的 App 把自己临时文件 rename 覆盖它必 EPERM，**App 唯一写配置通道全断**；`config.corrupted.*`"保留 5 个"上限也会因删不掉 root 备份而静默失效 | 不要再给 support 目录加 sticky。跨进程换文件的安全已由 fd 纪律覆盖（`O_CREAT\|O_EXCL\|O_NOFOLLOW` + `fchmod` + rename 永不跟随） |
 | R35(计划期) | SMC init 失败改「engine 延迟初始化 + 常驻重试」 | 消 10s 重启循环 | **未实施——不成比例** | `engine` 从 `let` 改 `var` 会波及 ConfigWatch / SleepHandler / 看门狗（无 engine 时 heartbeat 语义要重定义），而真实故障形态只是"开机瞬间 IOKit 未就绪" | 启动竞态用进程内有界退避（0/2/8s）覆盖即可，不要为此重构 daemon 生命周期 |
+
+| R37(审查轮) | 采信审查方"BSD `install` 保留源文件 mtime"的实测结论 → 要把"daemon 装于 X"改成构建时刻 | 该字段谎报安装时间 | 本机 `install -m 755 src dst` 实测：src=2020-01-01、dst=当场时间，**不保留**；mtime 就是最后一次装/升级 | 审查给的"实测"必须是**自己能重跑的命令**；涉及系统调用语义的指控，先在同一台机器上重跑一遍再改代码 |
 
 ## 策略元经验
 

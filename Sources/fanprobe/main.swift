@@ -2,6 +2,73 @@ import Foundation
 import SMCCore
 
 // fanprobe — 只读诊断工具：打印温度传感器、风扇状态、daemon 实时状态与 AI 学习进度（无需 root）
+// "只读"是硬承诺：任何路径（含 --report 读 JSON）都不得在 /Library/Application Support/FanCtl
+// 留下写入痕迹。那里是 root:admin 775 且无 sticky 位——登录用户写得进去，也会连带轮转删掉
+// root 写的 .corrupted 备份。故所有加载器一律 readOnly: true。
+
+// R37 `--report`：一条命令产出"陌生人机器上首问的那一串答案"，整段可直接粘进 issue。
+// 放在 SMC 探测之前且独立成块：诊断包最大的价值恰恰在"东西坏了"的时候——SMC 打不开、
+// daemon 没跑、配置损坏时都必须照样出全小节（缺失项渲染成 —/未知）。
+if CommandLine.arguments.contains("--report") {
+    func exists(_ u: URL) -> Bool { FileManager.default.fileExists(atPath: u.path) }
+    let status = ConfigStore.loadStatus()
+    // 状态新鲜度用文件 mtime 而非 status.timestamp：后者由 daemon 自己写，进程挂死时
+    // 两者会分叉，而"这份报告能不能信"取决于文件多久没被写过
+    var age: Double?
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: FanCtlPaths.statusFile.path),
+       let mtime = attrs[.modificationDate] as? Date {
+        age = Date().timeIntervalSince(mtime)
+    }
+    let probeError: String?
+    do {
+        let c = try SMCConnection()
+        _ = try FanController(smc: c)
+        probeError = nil
+    } catch {
+        probeError = "SMC 打不开：\(error)"
+    }
+    var exitReason: String? = nil
+    if let data = try? Data(contentsOf: FanCtlPaths.exitReasonFile),
+       let text = String(data: data, encoding: .utf8), !text.isEmpty {
+        exitReason = text
+    }
+    // 装机版本：读 App 的 Info.plist（纯数据，不 exec 任何二进制）；daemon 侧只能拿到
+    // 文件 mtime——版本串要 exec 才读得到，诊断工具不该为此拉起别人的进程
+    var appVersion: String? = nil
+    let plistURL = URL(fileURLWithPath: FanCtlPaths.installedAppBundle)
+        .appendingPathComponent("Contents/Info.plist")
+    if let plistData = try? Data(contentsOf: plistURL),
+       let plist = (try? PropertyListSerialization.propertyList(from: plistData,
+                                                                options: [], format: nil))
+        as? [String: Any],
+       let short = plist["CFBundleShortVersionString"] as? String, !short.isEmpty {
+        let build = plist["CFBundleVersion"] as? String
+        if let build, !build.isEmpty {
+            appVersion = "\(short) (\(build))"
+        } else {
+            appVersion = short
+        }
+    }
+    var daemonAt: Date? = nil
+    if let attrs = try? FileManager.default.attributesOfItem(
+            atPath: FanCtlPaths.installedDaemonBinary) {
+        daemonAt = attrs[.modificationDate] as? Date
+    }
+    let input = DiagnosticReport.Input(
+        generatedAt: Date(), status: status, statusAgeSeconds: age,
+        learn: ConfigStore.loadLearn(readOnly: true), metrics: ConfigStore.loadAIMetrics(readOnly: true),
+        ledger: ConfigStore.loadDTLedger(readOnly: true), model: ConfigStore.loadModel(readOnly: true),
+        stats: ConfigStore.loadStats(readOnly: true),
+        configPresent: exists(FanCtlPaths.configFile),
+        lastGoodPresent: exists(FanCtlPaths.configLastGoodFile),
+        exitReason: exitReason,
+        logReadable: FileManager.default.isReadableFile(atPath: FanCtlPaths.logFile.path),
+        probeError: probeError,
+        installedAppVersion: appVersion,
+        daemonBinaryInstalledAt: daemonAt)
+    print(DiagnosticReport.text(input))
+    exit(0)
+}
 
 do {
     let smc = try SMCConnection()
@@ -38,7 +105,7 @@ do {
     }
 
     // AI 热经验学习进度
-    if let learn = ConfigStore.loadLearn() {
+    if let learn = ConfigStore.loadLearn(readOnly: true) {
         print("AI 热经验: \(learn.sampleTotal) 样本 / \(learn.learnedBucketCount) 个温度点")
         // R31：生效查表（含 R27 单调包络）vs 桶 raw EMA——展示与控制可能不同
         print("学习生效查表 percent(for:)（raw=同桶 samples≥min 的 EMA）:")
@@ -62,7 +129,7 @@ do {
         print(String(format: "学习图包络健康度: %.1f°（→0 = 高温段已自愈）", s.learnEnvelopeGap!))
     }
     // 今日战报摘要（调速次数 = |输出Δ|≥3% 的拍数，风扇寿命代理指标）
-    if let s = ConfigStore.loadStats(), s.date == DailyStats.today(), s.tempCount > 0 {
+    if let s = ConfigStore.loadStats(readOnly: true), s.date == DailyStats.today(), s.tempCount > 0 {
         print("今日: 最高 \(String(format: "%.1f", s.maxTemp))°C · 调速 \(Int(s.speedChanges)) 次 · 启停抑制 \(Int(s.aiCyclingGuards)) 次\(s.overshootPeak >= 3 ? " · 过冲峰值 +\(Int(s.overshootPeak.rounded()))°" : "") · 静音/安静 \(Int(s.quietSeconds / 60)) 分钟")
         print(String(format: "  磨损速率: %.2f 次/受控分（R29 口径；批次B门看趋势）",
                      s.speedChangesPerMinute))
@@ -71,11 +138,11 @@ do {
     // 防御性按日期排序：archiveDay 维护有序，但损坏/手改 JSON 不保证；suffix(14) 才是「最近」
     do {
         var rows: [(String, Double, Double)] = []
-        let hist = ConfigStore.loadHistory().sorted { $0.date < $1.date }
+        let hist = ConfigStore.loadHistory(readOnly: true).sorted { $0.date < $1.date }
         for d in hist.suffix(14) where d.tempSeconds > 30 {
             rows.append((d.date, d.speedChanges, d.speedChangesPerMinute))
         }
-        if let s = ConfigStore.loadStats(), s.date == DailyStats.today(), s.tempSeconds > 30 {
+        if let s = ConfigStore.loadStats(readOnly: true), s.date == DailyStats.today(), s.tempSeconds > 30 {
             if let last = rows.last, last.0 == s.date { rows.removeLast() }
             rows.append((s.date, s.speedChanges, s.speedChangesPerMinute))
         }
@@ -86,7 +153,7 @@ do {
             }
         }
     }
-    if let m = ConfigStore.loadAIMetrics(), m.sampleCount > 0 {
+    if let m = ConfigStore.loadAIMetrics(readOnly: true), m.sampleCount > 0 {
         print(String(format: "AI 指标: %.1f 分钟 | 平均 %.1f°C | 波动 %.1f°C | 平均输出 %.1f%% | 超温 %.0f 秒",
                      m.activeSeconds / 60, m.averageTemp, m.temperatureStdDev,
                      m.averageOutput, m.highTempSeconds))
@@ -96,7 +163,7 @@ do {
     //   （选择偏差保证 ≥3），该比值只作诊断；裁决 = 快拍秒占比门槛 + VM 危害测试。
     //   P 基线跨桶不等 = 选择偏差的预期表现（4.0.1 起退役"校准线"语义）。
     // 4.0.1（4.1-A1）：账本在独立 dt-ledger.json（生命周期 = 控制律版本，与评测指标解耦）。
-    let ledger = ConfigStore.loadDTLedger()
+    let ledger = ConfigStore.loadDTLedger(readOnly: true)
     let buckets: [(String, DTermLedgerBucket?)] = [
         ("快拍<1.5s", ledger?.fast), ("标称1.5-4.5s", ledger?.nominal), ("长拍>4.5s", ledger?.slow)]
     if let l = ledger, buckets.contains(where: { $0.1?.seconds ?? 0 > 0 }) {
@@ -126,7 +193,7 @@ do {
         }
     }
     // R32：磁盘热模型明细（status 只带 b/samples/usable；辨识带与 a 仅文件有）
-    if let m = ConfigStore.loadModel() {
+    if let m = ConfigStore.loadModel(readOnly: true) {
         let pw: String
         if let lo = m.minPower, let hi = m.maxPower {
             pw = String(format: "%.1f–%.1fW", lo, hi)

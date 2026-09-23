@@ -1,0 +1,329 @@
+import Foundation
+import SMCCore
+
+// DiagnosticReport（R37，fanprobe --report 的渲染层）
+// 诊断包是 issue 里的第一手证据——它自己说谎比没有它更糟。所以这里锁三件事：
+//   1. 小节数恒定（缺数据必须出声成"—/未知"，不许整段省略：省略＝"报告变短"被读成"没问题"）；
+//   2. 不外泄 Swift 的 Optional/NaN/inf 渲染；
+//   3. 关键口径（新旧账本、字段是否落盘、装机版本）显式标注。
+
+/// 全空输入：daemon 没跑、没有任何 JSON、App 也没装（陌生机器上"啥都没装"的最坏路径）
+private func emptyReportInput() -> DiagnosticReport.Input {
+    DiagnosticReport.Input(generatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                           status: nil, statusAgeSeconds: nil, learn: nil, metrics: nil,
+                           ledger: nil, model: nil, stats: nil,
+                           configPresent: false, lastGoodPresent: false,
+                           exitReason: nil, logReadable: false)
+}
+
+/// 满输入：每个小节都有真值可渲染
+private func fullReportInput() -> DiagnosticReport.Input {
+    var st = DaemonStatus(cpuTemp: 71.5, gpuTemp: 55, mode: .ai, appliedPercent: 62,
+                          fans: [FanStatusEntry(id: 0, actualRPM: 2_600, targetRPM: 2_800,
+                                                minRPM: 1_400, maxRPM: 5_600)],
+                          onBattery: true, batteryOverride: true, reason: .ai, aiIntent: .rising)
+    st.loopInterval = 3
+    st.controlFault = false
+    st.targetUnreachable = true
+    st.safetyFloorPercent = 78
+    st.baseTargetPercent = 55
+    st.curveTargetPercent = 41
+    st.nightOverride = false
+    st.envTemp = 27.5
+    st.powerWatts = 33
+    st.aiTargetEffective = 74
+    st.palmComp = 1.5
+    st.calibrating = false
+    st.learnEnvelopeGap = 0.4
+    st.thermalModelUsable = true
+    st.thermalModelB = 1.2
+    st.thermalModelSamples = 312
+    st.hardwareProfile = HardwareProfile(
+        modelID: "Mac14,10", chipName: "Apple M2 Pro", osVersion: "26.1",
+        fanCount: 1, sensorCounts: .init(cpu: 3, gpu: 1, nand: 2, batt: 3, palm: 1,
+                                         heatsink: 4, other: 9),
+        hasPowerKey: true, collectedAt: Date(timeIntervalSince1970: 1_690_000_000))
+
+    var learn = ThermalLearn()
+    for _ in 0..<7 { learn.record(temp: 70, percent: 50, now: Date(timeIntervalSince1970: 1)) }
+    var met = AIControlMetrics(targetTemp: 74)
+    met.record(temp: 80, output: 70, seconds: 20)          // 有秒加权分母 → 新口径
+    var led = DTLedgerState()                             // 1s 快拍 + 20s 长拍 = 21s
+    led.record(temp: 70, output: 50, seconds: 1, dDelta: nil, pDelta: nil,
+               slopeRate: nil, now: Date(timeIntervalSince1970: 1))
+    led.record(temp: 70, output: 50, seconds: 20, dDelta: nil, pDelta: nil,
+               slopeRate: nil, now: Date(timeIntervalSince1970: 2))
+    let model = ThermalModel()
+    var stats = DailyStats(date: "2026-09-23")
+    stats.speedChanges = 1_200
+    stats.aiCyclingGuards = 40
+
+    return DiagnosticReport.Input(
+        generatedAt: Date(timeIntervalSince1970: 1_700_000_000), status: st,
+        statusAgeSeconds: 4, learn: learn, metrics: met, ledger: led, model: model,
+        stats: stats, configPresent: true, lastGoodPresent: true,
+        exitReason: "watchdog: 控制环 90s 无心跳", logReadable: true,
+        installedAppVersion: "4.2.2 (93)",
+        daemonBinaryInstalledAt: Date(timeIntervalSince1970: 1_699_000_000))
+}
+
+func testDiagnosticReport() {
+    group("诊断包结构与口径（R37）")
+
+    // ① 行数恒定：空/满/半满三种输入必须同数——任何"按条件省略小节"都会在此红
+    let emptyLines = DiagnosticReport.lines(emptyReportInput())
+    let fullLines = DiagnosticReport.lines(fullReportInput())
+    var halfInput = emptyReportInput()
+    halfInput.status = DaemonStatus(cpuTemp: 70, gpuTemp: 55, mode: .auto, appliedPercent: 0,
+                                    fans: [])
+    let halfLines = DiagnosticReport.lines(halfInput)
+    expectEqual(emptyLines.count, DiagnosticReport.sectionCount, "空输入行数=小节数")
+    expectEqual(fullLines.count, DiagnosticReport.sectionCount, "满输入行数=小节数")
+    expectEqual(halfLines.count, DiagnosticReport.sectionCount, "半满输入行数=小节数")
+    expect(DiagnosticReport.sectionCount >= 19, "小节数不得倒退（当前只增不减）")
+    for (idx, line) in emptyLines.enumerated() {
+        expect(!line.isEmpty, "空输入第 \(idx) 行不得为空串（省略小节=谎报）")
+    }
+
+    // ② 渲染卫生：Optional / nil / NaN / inf 一律不得出现在给用户粘的文本里
+    for (name, lines) in [("空", emptyLines), ("满", fullLines), ("半", halfLines)] {
+        let text = lines.joined(separator: "\n")
+        expect(!text.contains("Optional("), "\(name) 输入无 Optional 外泄")
+        expect(!text.contains("nil"), "\(name) 输入无 nil 外泄")
+        expect(!text.lowercased().contains("nan"), "\(name) 输入无 NaN 外泄")
+        expect(!text.lowercased().contains("inf"), "\(name) 输入无 inf 外泄")
+        // 诊断包只报状态，不得外泄用户数据文件路径（配置内容/用户目录都不进报告）
+        expect(!text.contains("Application Support"), "\(name) 输入不含用户数据目录路径")
+    }
+
+    // ③ 缺数据必须"出声"：空输入的每个关键小节都有明确缺态措辞
+    let emptyText = emptyLines.joined(separator: "\n")
+    expect(emptyText.contains("未运行（无 status.json）"), "空输入报 daemon 未运行")
+    expect(emptyText.contains("硬件画像: 未知"), "空输入报硬件画像未知")
+    expect(emptyText.contains("controlFault=未落盘"), "空输入把 controlFault 报成未落盘而非 false")
+    expect(emptyText.contains("上次异常退出: 无记录"), "空输入的退出原因=无记录")
+    expect(emptyText.contains("SMC 可打开: 是（未取读数）"),
+           "probeError 缺省只报可打开，不冒充取到了读数")
+    expect(emptyText.contains("daemon 缺失") || emptyText.contains("缺失（未装守护进程"),
+           "空输入报 daemon 二进制缺失")
+    expect(emptyText.contains("App 未找到"), "空输入报 App 版本未找到")
+    expect(emptyText.contains("缺（损坏将回出厂默认）"), "无 last-good 时明说会回出厂默认")
+
+    // ④ 装机版本：App 版本串与 daemon 落盘时间都要出现（issue 第一问=什么版本）
+    let fullText = fullLines.joined(separator: "\n")
+    expect(fullText.contains("4.2.2 (93)"), "满输入含 App 版本串")
+    expect(fullText.contains("daemon 装于 2023-11-"), "满输入含 daemon 安装时间")
+    expect(fullText.contains("模式 ai"), "满输入含调速模式")
+    expect(fullText.contains("fan0: 2600/2800RPM"), "满输入含风扇实际/目标转速")
+    expect(fullText.contains("口径 秒加权"), "有秒分母的指标标注为新口径")
+    expect(fullText.contains("累计受控"), "dt 账本用「累计」字样与本轮受控区分")
+    expect(fullText.contains("电池") && fullText.contains("电池降档 是"), "电源态进报告")
+
+    // ⑤ 口径标签必须与 getter 的回退条件同一条：加权秒被钳成 0（sanitized 的产物）时
+    //    走的是样本口径除法，标签若仍写"秒加权"就是在给数字镀金
+    var legacyInput = fullReportInput()
+    var legacyMet = AIControlMetrics(targetTemp: 74)
+    legacyMet.record(temp: 80, output: 70, seconds: 20)
+    legacyMet.weightedSecondsTotal = 0            // 有样本、无加权分母
+    legacyInput.metrics = legacyMet
+    let legacyText = DiagnosticReport.text(legacyInput)
+    expect(legacyText.contains("口径 样本口径(旧账本)"), "加权分母≤0 时标注为样本口径")
+    expect(!legacyText.contains("口径 秒加权"), "样本口径的数字不得被标成秒加权")
+
+    // ⑤b 全 0 与"还没开始统计"必须可分辨：指标换目标档即清零
+    var freshInput = fullReportInput()
+    freshInput.metrics = AIControlMetrics(targetTemp: 74)       // sampleCount = 0
+    let freshText = DiagnosticReport.text(freshInput)
+    expect(freshText.contains("本轮尚无样本"), "零样本指标出声，不冒充实测 0")
+    expect(!freshText.contains("均温 0.0"), "零样本不得渲染成均温 0.0")
+
+    // ⑥ 非有限值渲染成"—"而不是 0（0 会被读成"真的很低"）；每个数值小节都喂一遍，
+    //    黑名单只有配合真实非有限输入才有鉴别力
+    var nanInput = fullReportInput()
+    var nanStatus = DaemonStatus(cpuTemp: .nan, gpuTemp: 55, mode: .auto,
+                                 appliedPercent: .infinity,
+                                 fans: [FanStatusEntry(id: 0, actualRPM: .nan, targetRPM: .infinity,
+                                                       minRPM: 0, maxRPM: .nan)])
+    nanStatus.envTemp = .nan
+    nanStatus.powerWatts = .infinity
+    nanStatus.sensors = SensorReadings(cpuDie: .nan, cpuAverage: nil, gpuDie: .nan,
+                                       ssd: .infinity, palmRest: .nan, heatsink: .nan)
+    nanInput.status = nanStatus
+    let nanText = DiagnosticReport.text(nanInput)
+    expect(nanText.contains("CPU —"), "NaN 温度渲染为—")
+    expect(nanText.contains("输出 —%"), "inf 输出渲染为—")
+    expect(nanText.contains("环境 —") && nanText.contains("功耗 —W"),
+           "环境/功耗的非有限值也走—")
+    expect(!nanText.lowercased().contains("nan") && !nanText.lowercased().contains("inf"),
+           "整份报告在任何小节都喂了非有限值后仍无 nan/inf 外泄")
+
+    // ⑥b 传感器故障哨兵：daemon 无有效读数时写 cpuDie:0——报成"CPU 0.0"是谎
+    var sentinelInput = fullReportInput()
+    var sentinel = DaemonStatus(cpuTemp: 0, gpuTemp: 0, mode: .auto, appliedPercent: 0, fans: [])
+    sentinel.controlFault = true
+    sentinel.faultReason = .sensorUnavailable
+    sentinelInput.status = sentinel
+    let sentinelText = DiagnosticReport.text(sentinelInput)
+    expect(sentinelText.contains("CPU 0(哨兵=无有效读数)"), "哨兵 0 标注为无有效读数")
+    expect(!sentinelText.contains("CPU 0.0 "), "不把哨兵 0 当实测温度")
+
+    // ⑦ 多行字符串不得破坏"一小节一行"（退出原因可能带换行）
+    var multilineInput = fullReportInput()
+    multilineInput.exitReason = "第一行\n第二行"
+    let multilineLines = DiagnosticReport.lines(multilineInput)
+    expectEqual(multilineLines.count, DiagnosticReport.sectionCount, "换行被压平后行数不变")
+    expect(multilineLines.contains(where: { $0 == "上次异常退出: 第一行 第二行" }),
+           "退出原因的换行被压成空格")
+
+    // ⑧ 状态新鲜度三态（能否信这份 status 取决于文件多久没写）
+    var staleInput = fullReportInput()
+    staleInput.statusAgeSeconds = 3_600
+    expect(DiagnosticReport.text(staleInput).contains("停更 60 分钟"), "过期状态标注停更时长")
+    staleInput.statusAgeSeconds = nil
+    expect(DiagnosticReport.text(staleInput).contains("未运行（无 status.json）"),
+           "无 status.json 时报未运行")
+
+    // ⑧b 数字来自哪一刻：停更超过 30s 的快照必须在每个数值小节上标出来，
+    //     否则读者会把十分钟前的温度当成现在温度去判断"风扇是不是该降速"
+    var staleViewInput = fullReportInput()
+    staleViewInput.statusAgeSeconds = 600
+    let staleLines = DiagnosticReport.lines(staleViewInput)
+    expect(staleLines.contains(where: { $0.hasPrefix("温度:") && $0.contains("陈旧快照") }),
+           "温度小节带陈旧标记")
+    expect(staleLines.contains(where: { $0.hasPrefix("风扇:") && $0.contains("陈旧快照") }),
+           "风扇小节带陈旧标记")
+    expect(staleLines.contains(where: { $0.hasPrefix("daemon:") && $0.contains("停更 10 分钟") }),
+           "停更时长与标记同源（10 分钟）")
+
+    // ⑧c 文件在但解不出（损坏或跨版本）：不得说"运行中"，也不得说"无 status.json"
+    var undecodableInput = fullReportInput()
+    undecodableInput.status = nil
+    undecodableInput.statusAgeSeconds = 5
+    let undecText = DiagnosticReport.text(undecodableInput)
+    expect(undecText.contains("状态文件在但解不出"), "mtime 新但解不出时报解不出")
+    expect(!undecText.contains("运行中"), "解不出时不谎报运行中")
+    expect(!undecText.contains("未运行（无 status.json）"), "文件确实在场，不报成没有文件")
+
+    // ⑧d 磨损战报的"今天"必须自己声明日期：daemon 停三天不能拿三天前的表称今日
+    var oldStatsInput = fullReportInput()
+    oldStatsInput.stats?.date = "2020-01-01"
+    let oldStatsText = DiagnosticReport.text(oldStatsInput)
+    expect(oldStatsText.contains("磨损(陈旧 2020-01-01)"), "非今日战报标陈旧并给出日期")
+    expect(oldStatsText.contains("次/采样分"), "磨损速率分母口径写明是采样分（非 AI 受控分）")
+
+    // ⑨ SMC 不可用也要出全小节（诊断包最大的价值恰恰在坏掉的时候）
+    var brokenInput = emptyReportInput()
+    brokenInput.probeError = "SMC 打不开: io_connect 失败"
+    let brokenLines = DiagnosticReport.lines(brokenInput)
+    expectEqual(brokenLines.count, DiagnosticReport.sectionCount, "SMC 故障时行数不减")
+    expect(brokenLines.joined(separator: "\n").contains("SMC 打不开"), "SMC 错误原文进报告")
+    expect(brokenLines.joined(separator: "\n").contains("SMC 可打开: SMC 打不开"),
+           "错误出现在「SMC 可打开」小节名下（措辞与小节名一致）")
+
+    // ⑩ passive 机型（无风扇）：数量与措辞都不能假
+    var passiveInput = fullReportInput()
+    passiveInput.status?.fans = []
+    passiveInput.status?.hardwareProfile?.fanCount = 0
+    let passiveText = DiagnosticReport.text(passiveInput)
+    expect(passiveText.contains("数量 0"), "passive 机型报风扇数 0")
+    expect(passiveText.contains("passive"), "passive 机型给出可解释措辞")
+
+    // ⑫ dt 账本口径：天数与快拍占比直接决定"能不能调控制律"，格式化错一位就误导裁决
+    expect(fullText.contains("累计受控 0.00 天"), "21s 账本按天渲染到小数点后两位")
+    var tenDayInput = fullReportInput()
+    var tenLedger = DTLedgerState()
+    tenLedger.record(temp: 70, output: 50, seconds: 60, dDelta: nil, pDelta: nil,
+                     slopeRate: nil, now: Date(timeIntervalSince1970: 1))   // 60s 标称拍
+    tenLedger.nominal = nil
+    tenDayInput.ledger = tenLedger
+    expect(DiagnosticReport.text(tenDayInput).contains("累计受控 0.00 天"),
+           "60s 账本按 86400 除得 0.00 天（除数错成 8640 会变 0.01 立刻显形）")
+    expect(fullText.contains("快拍秒占比 4.8%"), "快拍占比按秒加权真实渲染")
+    expect(fullText.contains("裁决门槛 ≥7 天且 >5%"), "账本行自带裁决门槛，防读者凭感觉放行")
+
+    // ⑪ 装机落点常量：与 scripts/install.sh 的另一半真相必须逐字相同（漂移即红），
+    //     且不受 overrideSupportDir 影响——诊断要读真实装机状态，不能读测试目录
+    let dir = engineTestEnv()
+    expectEqual(FanCtlPaths.installedDaemonBinary, "/usr/local/libexec/fanctld",
+                "daemon 落点常量与安装脚本一致")
+    expectEqual(FanCtlPaths.installedAppBundle, "/Applications/清风.app",
+                "App 落点常量与安装脚本一致")
+    expect(FanCtlPaths.installedDaemonBinary.hasPrefix("/usr/local/libexec/"),
+           "daemon 落点常量不随测试目录漂移")
+    expect(!FanCtlPaths.installedDaemonBinary.contains(dir.path),
+           "daemon 落点常量与 override 目录无关")
+}
+
+/// R37 审查（自查发现的 P1）：诊断工具承诺"只读"，而 loadCorruptionAware 在解码失败时
+/// 会写 `.corrupted` 备份并轮转删除旧备份——support 目录 root:admin 775 且无 sticky，
+/// 登录用户跑一次 fanprobe 就能在 root 的数据目录里造文件、删掉 root 写的证据。
+/// 这里锁两件事：只读路径真的零留痕，且 fanprobe 源码不许再退回带副作用的加载器。
+func testProbeReadOnlyLoads() {
+    group("诊断工具零副作用（R37）")
+    let dir = engineTestEnv()
+    let fm = FileManager.default
+    FanCtlPaths.ensureDirectories()   // 临时目录不会自己出现；缺它则读写全失败=假绿
+    // 选 dt-ledger 做样本：它是合成 Codable（类型不符必抛错），不像 learn/metrics 那样
+    // 带"尽力抢救"的自定义解码器——损坏分支必须真的走到，断言才有意义
+    let ledgerURL = FanCtlPaths.dtLedgerFile
+    let garbage = Data("{\"fast\": 42}".utf8)
+
+    func corruptedBackups() -> [String] {
+        (try? fm.contentsOfDirectory(atPath: dir.path))?.filter { $0.contains(".corrupted.") } ?? []
+    }
+
+    // 只读：坏文件照旧解不出，但目录里不得留下任何备份
+    try? garbage.write(to: ledgerURL)
+    expect(fm.fileExists(atPath: ledgerURL.path), "前提：坏 dt-ledger 确实落到了盘上")
+    expect(ConfigStore.loadDTLedger(readOnly: true) == nil, "只读加载坏 dt-ledger 返回 nil")
+    expectEqual(corruptedBackups().count, 0, "只读加载不得在数据目录写损坏备份")
+
+    // 对照（同一份坏数据）：daemon/App 侧的正常加载确实会留痕——证明上一条断言有牙，
+    // 而不是"备份机制本身没写成功"造成的假绿
+    expect(ConfigStore.loadDTLedger() == nil, "正常加载坏 dt-ledger 同样返回 nil")
+    expectEqual(corruptedBackups().count, 1, "正常加载会留损坏备份（对照组，证上一条有牙）")
+    try? fm.removeItem(at: ledgerURL)
+    for name in corruptedBackups() {
+        try? fm.removeItem(atPath: dir.appendingPathComponent(name).path)
+    }
+
+    // history 的逐日抢救分支同样要能只读
+    let histURL = FanCtlPaths.historyFile
+    try? Data("[[{\"bad\":1}],42]".utf8).write(to: histURL)
+    expect(fm.fileExists(atPath: histURL.path), "前提：坏 history 确实落到了盘上")
+    expect(ConfigStore.loadHistory(readOnly: true).isEmpty, "只读 history 对全坏数据给空表")
+    expectEqual(corruptedBackups().count, 0, "只读 history 不写 history.corrupted.*")
+    _ = ConfigStore.loadHistory()
+    expect(corruptedBackups().contains { $0.hasPrefix("history.corrupted.") },
+           "正常 history 加载会留损坏备份（对照组）")
+    try? fm.removeItem(at: histURL)
+    for name in corruptedBackups() {
+        try? fm.removeItem(atPath: dir.appendingPathComponent(name).path)
+    }
+
+    // 源码门：fanprobe 是"只读诊断工具"——凡调用有副作用的加载器即红（loadStatus 除外，
+    // 它本来就是纯 try? 解码）
+    let src = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()      // fanctltests
+        .deletingLastPathComponent()      // Sources
+        .appendingPathComponent("fanprobe/main.swift")
+    guard let text = try? String(contentsOf: src, encoding: .utf8) else {
+        expect(false, "读到 fanprobe 源码做静态门")
+        return
+    }
+    // 白名单式：fanprobe 里每一次 ConfigStore 调用都必须显式只读。点名黑名单不够——
+    // 副作用最重的是 loadConfig（ensureDirectories + 备份坏文件 + 回写默认配置 + 刷
+    // last-good），它没进黑名单就能悄悄加回来；白名单让"新接一个会写的 loader"默认就红。
+    let pureReaders = ["ConfigStore.loadStatus"]     // 纯 try? 解码：无备份、无回写、无建目录
+    let offenders = text.split(separator: "\n").filter { line in
+        line.contains("ConfigStore.") && !line.contains("readOnly: true")
+            && !pureReaders.contains { line.contains($0) }
+    }
+    let firstOffender = offenders.first.map { String($0.prefix(70)) } ?? "无"
+    expectEqual(offenders.count, 0,
+                "fanprobe 的 ConfigStore 调用全部只读（越线首行: " + firstOffender + "）")
+    expect(!text.contains("ConfigStore.loadConfig"),
+           "fanprobe 不得碰 loadConfig（它会建目录/备份/回写默认配置）")
+    expect(!text.contains("ensureDirectories") && !text.contains("ConfigStore.save"),
+           "fanprobe 不得碰建目录或任何 save 路径")
+}
