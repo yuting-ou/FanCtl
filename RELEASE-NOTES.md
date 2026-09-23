@@ -25,10 +25,12 @@
 
 ## 本版变更要点
 
-- 4.2.4：诊断包对**身份类字符串**统一消毒——`/Applications/清风.app` 被安装脚本 chown 给登录
-  用户，属主可往 `CFBundleShortVersionString` 里写任何东西（含 `ESC[2J` 这类 ANSI 转义，粘进
-  终端会被真解释）。现在 App 版本与 daemon 自报版本都限长 64、只收可打印 ASCII，可疑值整体
-  替换成固定标记「版本串可疑（已拒绝渲染）」，不保留原文任何片段。
+- 4.2.4：诊断包里所有**从盘上读来的自由文本**统一消毒。动因：`/Applications/清风.app` 被安装脚本
+  chown 给登录用户，属主可往 `CFBundleShortVersionString` 写任何东西（含 `ESC[2J` 这类 ANSI 转义，
+  报告粘进终端会被真解释）；`exit-reason.flag` 与 SMC 错误串同理。规则：身份类（版本）限长 64、
+  只收可打印 ASCII，可疑值整体替换成固定标记不保留片段；其余文本压平换行、控制字符转空格、超 200
+  字符截断并如实报出原长。另修一处自锁死：build.sh 里"回归测试"排在"重生成版本常量"之前，
+  于是提了 VERSION 就必然构建失败——顺序已调正。
 - 4.2.3：`status.json` 新增 daemon 自报版本（`daemonVersion`），诊断包的"装机"小节从此能
   直接回答"这台机器上跑的 daemon 是哪一版"——此前只能靠 App plist 版本与二进制 mtime 推断，
   遇到"App 已升级、daemon 留在旧版"的半途状态无从判断。旧 daemon（或该值被改/被拒收）不写

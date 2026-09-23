@@ -232,6 +232,26 @@ func testDiagnosticReport() {
     expect(DiagnosticReport.sanitizeVersion("4.2.3 (94)") == "4.2.3 (94)",
            "常规版本串照常通过（守卫不是照单全拒）")
 
+    // ⑧b3 其余自由文本出口同样要过消毒：exit-reason.flag 与 SMC 错误串都是**盘上读来**的，
+    //       support 目录组可写 → 里面可以是 ANSI 转义或几百 KB 文本
+    var hostileInput = fullReportInput()
+    let hostileReason = "watchdog \u{001B}[2J" + String(repeating: "z", count: 400)
+    hostileInput.exitReason = hostileReason
+    hostileInput.probeError = "io_connect \u{0007} 失败"
+    let hostileLines = DiagnosticReport.lines(hostileInput)
+    let hostileText = hostileLines.joined(separator: "\n")
+    expectEqual(hostileLines.count, DiagnosticReport.sectionCount, "敌意文本不改变小节数")
+    expect(!hostileText.contains("\u{001B}") && !hostileText.contains("\u{0007}"),
+           "整份报告不含 ESC/BEL（控制字符只在原文里，不在输出里）")
+    expect(hostileText.contains("已截断，原长 \(hostileReason.count)"),
+           "超长退出原因如实报出**输入原长**并截断（\(hostileReason.count) 由构造侧给出，防手算错）")
+    // 尾巴是否真被截掉：数 z 的个数（前缀 200 字符里只有 188 个 z，原文有 400 个）。
+    // 用计数而不是 `contains(50 个 z)`——前缀本身就含 188 个连续 z，后者会必然假红
+    let zCount = hostileText.filter { $0 == "z" }.count
+    expect(zCount > 100 && zCount <= 200, "只保留前缀、尾巴不漏进报告（实得 z 数 \(zCount)）")
+    expect(DiagnosticReport.text(fullReportInput()).contains("主因 AI 自动接管"),
+           "中文标签照常通过（消毒不是照单全拒）")
+
     // ⑧c 文件在但解不出（损坏或跨版本）：不得说"运行中"，也不得说"无 status.json"
     var undecodableInput = fullReportInput()
     undecodableInput.status = nil

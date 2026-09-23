@@ -103,10 +103,24 @@ public enum DiagnosticReport {
         guard let s, !s.isEmpty, s.count <= limit else { return nil }
         return s.utf8.allSatisfy { $0 >= 0x20 && $0 <= 0x7e } ? s : nil
     }
+    /// 所有"从盘上读来的自由文本"的统一出口：压平换行、剥掉控制字符（含 ESC/ BEL——
+    /// 这些会在"把报告粘进终端"时被真的解释）、限长（超长只留前缀 + 截断标记，
+    /// 否则一个 200KB 的 exit-reason.flag 就能把 19 行快照变成不可读巨块）。
+    /// 非 ASCII 的**可见**字符保留：中文小节标签本来就带中文。
+    static func safeText(_ s: String, limit: Int = 200) -> String {
+        // 控制字符换成空格而不是删掉：`a\nb` 删成 `ab` 会把两个词焊在一起
+        let kept = s.unicodeScalars.map { $0.value < 0x20 || $0.value == 0x7f ? " " : String($0) }
+        var out = kept.joined()
+        if out.count > limit {
+            out = String(out.prefix(limit)) + "…（已截断，原长 " + String(s.count) + "）"
+        }
+        return out
+    }
     /// 把可选字符串安全收成一行（去换行，防破坏"一行一小节"结构）
     private static func one(_ s: String?, fallback: String = "—") -> String {
         guard let s, !s.isEmpty else { return fallback }
-        return s.replacingOccurrences(of: "\n", with: " ")
+        let flat = safeText(s).trimmingCharacters(in: .whitespaces)
+        return flat.isEmpty ? fallback : flat
     }
 
     /// 生成报告行（每小节恰一行）。刻意写成"一行一个 let"：把多段 `+` 嵌进单个
