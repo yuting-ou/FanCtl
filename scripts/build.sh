@@ -89,23 +89,32 @@ echo "==> 编译 release（非 UI 目标：默认系统 SDK）..."
 swift build -c release --disable-sandbox --target fanctld
 swift build -c release --disable-sandbox --target fanprobe
 
+# 产物目录一律问 SwiftPM，不硬编码 .build/release：不同工具链/构建后端
+# （llbuild 与 SwiftBuild）会把它放在 .build/release 或 .build/<triple>/release
+# 等不同位置——CI runner 更新 Xcode 后，硬编码路径的 cp 直接失败（v4.1.4 首次发版即栽在这）。
+BIN=$(swift build -c release --disable-sandbox --show-bin-path)
+
 if [ -n "$APP_SDKROOT" ]; then
     # 钉住 SDK 的 App 构建走独立 scratch——避免与默认 SDK 构建互相失效缓存反复全量重编
     echo "==> 编译 release（App 目标：${APP_SDKROOT} ）..."
-    APP_BIN="$ROOT/.build-app-sdk/release"
+    APP_BIN=$(SDKROOT="$APP_SDKROOT" swift build -c release --disable-sandbox \
+        --scratch-path "$ROOT/.build-app-sdk" --show-bin-path)
     SDKROOT="$APP_SDKROOT" swift build -c release --disable-sandbox \
         --scratch-path "$ROOT/.build-app-sdk" --target FanCtlApp
 else
     echo "==> 编译 release（App 目标：默认系统 SDK）..."
-    APP_BIN="$ROOT/.build/release"
+    APP_BIN=$(swift build -c release --disable-sandbox --show-bin-path)
     swift build -c release --disable-sandbox --target FanCtlApp
 fi
 
-BIN="$ROOT/.build/release"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
 # 守护进程二进制 + 只读诊断工具（R32：磨损速率/热模型 dogfood 入口）
+# 缺产物必须响亮报错，不能留给 cp 的"No such file or directory"当谜面
+for f in "$BIN/fanctld" "$BIN/fanprobe" "$APP_BIN/FanCtlApp"; do
+    [ -f "$f" ] || { echo "❌ 缺少产物：$f（SwiftPM 报的产物目录：BIN=$BIN APP_BIN=$APP_BIN）" >&2; exit 1; }
+done
 cp "$BIN/fanctld" "$DIST/fanctld"
 cp "$BIN/fanprobe" "$DIST/fanprobe"
 
