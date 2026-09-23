@@ -12,7 +12,7 @@ fanctl_config_perm_safe() {
     local p="$1"
     [[ -f "$p" && ! -L "$p" ]]
 }
-if [[ "${FANCTL_TEST_CONFIG_GUARD:-}" == "1" ]]; then
+if [[ $EUID -ne 0 && "${FANCTL_TEST_CONFIG_GUARD:-}" == "1" ]]; then
     fanctl_config_perm_safe "${1:-}"
     exit $?
 fi
@@ -30,10 +30,11 @@ fanctl_dir_trusted() {
     [[ $(( 0$mode & 0022 )) -eq 0 ]]
 }
 
-# FANCTL_TEST_DIR_TRUST=1：无 root 回归钩子，对 $1 求谓词后退出（0=可信，1=不可信）。
-# 安全向的两支可在无 root 下测（普通用户属主、775/777 写位）；"root 属主正例"只能
-# 真机验证——诚实记档，不在门禁里假称已测。
-if [[ "${FANCTL_TEST_DIR_TRUST:-}" == "1" ]]; then
+# FANCTL_TEST_DIR_TRUST=1（仅非 root 生效）：对 $1 求谓词后退出（0=可信，1=不可信）。
+# 安全向两支可无 root 测（普通用户属主、组可写）；"root 属主正例"无法无 root 构造，
+# 诚实记档为仅真机验证。限非 root 是因为 osascript 会透传调用方环境（R36 实测），
+# root 运行中任何测试后门都必须失效。
+if [[ $EUID -ne 0 && "${FANCTL_TEST_DIR_TRUST:-}" == "1" ]]; then
     fanctl_dir_trusted "${1:-}"
     exit $?
 fi
@@ -69,7 +70,7 @@ echo "==> 安装守护进程..."
 # 目录信任门（批次 A）：/usr/local 与 /usr/local/libexec 必须 root 拥有且组/其他不可写。
 # Homebrew 机器常把 /usr/local 交给登录用户——那种机器上"把 root 执行的代码放进去"
 # 等于给同 uid 进程留一条提权道，宁可拒绝安装也不装个假安全。
-LIBEXEC="${FANCTL_LIBEXEC_DIR:-/usr/local/libexec}"
+LIBEXEC=/usr/local/libexec   # 生产路径写死：plist 的 ProgramArguments 硬编码同一绝对路径，两者不许漂移
 mkdir -p "$LIBEXEC"
 if ! fanctl_dir_trusted "$LIBEXEC" || ! fanctl_dir_trusted "$(dirname "$LIBEXEC")"; then
     echo "❌ 拒绝安装：${LIBEXEC} 或其父目录不是 root 拥有且组/其他不可写。" >&2

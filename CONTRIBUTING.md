@@ -34,7 +34,7 @@ swift build -c release --disable-sandbox --target fanctld --target fanprobe
 4. **防御 NaN/Inf**：传感器读数和外部 JSON 都可能携带坏值；Double→Int 转换必须钳位（isFinite 检查）。
 5. **时间语义**：自适应循环间隔 1~20s，所有"每拍"参数按 3s 标称拍标定；按秒的计时用秒。
 6. **fd 生命周期**：文件监控（DispatchSource）重建时 fd 只由 cancelHandler 关闭，严禁 eager close 后 open。
-7. **改动 SMCCore 后必须跑 fanctltests**：测试与 daemon 共用同一份决策代码，防止镜像漂移。改动 `scripts/upgrade.sh`/`install.sh` 同样必须跑（会自动调 root 脚本门禁）；改 upgrade.sh 后记得 `./scripts/build.sh` 重生成内嵌占位。
+7. **改动 SMCCore 后必须跑 fanctltests**：测试与 daemon 共用同一份决策代码，防止镜像漂移。改动 `scripts/upgrade.sh`/`install.sh` 同样必须跑（会自动调 root 脚本门禁）。4.2.0 起 root 执行脚本不再有内嵌占位（`install.sh` 装进 `/usr/local/libexec`、`upgrade.sh` 每次升级自我刷新），改完只需跑门禁。
 
 ## 提交 PR
 

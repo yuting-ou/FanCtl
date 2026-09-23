@@ -110,11 +110,12 @@ artifact() {  # $1=SwiftPM 产物名 $2=产物文件名 $3=scratch 目录 $4=SDK
     if [ -n "$p" ] && [ -f "$p/$name" ]; then printf '%s\n' "$p/$name"; return 0; fi
     # 回退搜索用 -L（跟随符号链接）：SwiftBuild 后端会把 .build 里的目录做成指向
     # scratch 外的链接，find 默认不跟随 → -type f 一个都不命中（CI 第四红的根因假设）。
-    # 排除 dist：那里有上一轮的产物副本，宁缺不"静默拷陈旧件"（自证门也拦不住同号陈旧件）。
+    # 只在工作树的两个构建目录里找：整树搜会把 dist（上一轮产物副本）与源码树里的同名件
+    # 一起选中——宁缺也不"静默拷陈旧件"（同号陈旧件版本自证门也拦不住，靠的是下面的 mtime）。
     # -n 判空后再喂 xargs：BSD xargs 对空输入仍会执行一次 `ls -t`，那是在列当前目录
     found=""
-    hits=$(find -L "$ROOT" -name "$name" -type f -perm +111 2>/dev/null \
-        | grep -v -e "^$ROOT/Sources" -e "^$ROOT/dist" || true)
+    hits=$(find -L "$ROOT/.build" "$ROOT/.build-app-sdk" -name "$name" -type f \
+        -perm +111 2>/dev/null || true)
     if [ -n "$hits" ]; then
         found=$(printf '%s\n' "$hits" | xargs ls -t 2>/dev/null | head -1 || true)
     fi
@@ -218,9 +219,15 @@ STRINGS
 
 # ad-hoc 签名（本机运行足够）。R23（P3）：失败必须红——此前 `|| true` 把签名失败
 # 静默吞掉，可能让未签名二进制混进 dist/ 发行资产，装机后才在 Gatekeeper/升级链炸。
-# 发行链自证（R35）：组装完必须能回答"dist 里到底是不是本次代码"——
+# 发行链自证（R35/R36）。能回答的是"拷进 dist 的是不是本次构建刚产出的那一份"：
+#   ① daemon 自己报的版本 == VERSION（二进制内常量，非恒真）——版本号是唯一
+#      跨构建可靠的身份信号，因此每次改代码必须提 VERSION（同号不同码 = P1）；
+#   ③ App 的 Info.plist 两字段 == VERSION（由本脚本写出，只防"生成/拷贝错位"，
+#      单看它接近恒真——别把它当独立证据，见 EVOLUTION R36）。
 # 产物定位失败的最坏形态不是报错，而是静默拷进一个陈旧的中间件（同号不同码）。
 # daemon 自己报的版本与 App 的 Info.plist 都对齐 VERSION 才算过。
+# （不设 mtime 门：实测 SwiftPM 以硬链接摆放产物，mtime 属于更早那次构建——
+#   R36 加过这道、当场自己报红，故撤除。防陈旧件靠的是"只在 .build*/ 里找 + 版本自证"。）
 DAEMON_V=$("$DIST/fanctld" -v 2>/dev/null || true)
 if [ "$DAEMON_V" != "fanctld ${APP_VERSION} (${BUILD_NUMBER})" ]; then
     echo "ERROR: dist/fanctld version mismatch: got [$DAEMON_V] want [fanctld ${APP_VERSION} (${BUILD_NUMBER})]" >&2

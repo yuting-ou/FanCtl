@@ -72,6 +72,16 @@ func testSelfUpgrade() {
             return Data()
         }
     }
+    // 批次 A：特权脚本正文必须在弹窗前就验在场（缺则这次升级刷新不了 root 侧链路）
+    expect(SelfUpgrade.stagedMissingPrivilegedScripts(hasUpgradeScript: true,
+                                                      hasUninstallScript: true) == nil,
+           "两份特权脚本俱在 → 放行")
+    expect(SelfUpgrade.stagedMissingPrivilegedScripts(hasUpgradeScript: false,
+                                                      hasUninstallScript: true)
+           == .missingPrivilegedScripts, "缺 upgrade.sh → 弹窗前拒")
+    expect(SelfUpgrade.stagedMissingPrivilegedScripts(hasUpgradeScript: true,
+                                                      hasUninstallScript: false)
+           == .missingPrivilegedScripts, "缺 uninstall.sh → 弹窗前拒")
     expect(SelfUpgrade.validateStaged(appInfoPlistData: nil, hasDaemonBinary: true,
                                       tag: "v3.9.0") == .missingApp, "缺 App 拒绝")
     expect(SelfUpgrade.validateStaged(appInfoPlistData: plistData(version: "3.9.0"),
@@ -151,6 +161,12 @@ func testPrivilegedScriptTrust() {
     expect(!ok(true, false, 0, 0o757), "其他可写 → 拒")
     expect(!ok(true, true, 0, 0o755), "符号链接 → 拒（哪怕属主是 root）")
     expect(!ok(false, false, 0, 0o755), "非常规文件（目录/fifo）→ 拒")
+    // 参数顺序 = App↔upgrade.sh 的跨语言契约；写错一位就是"哈希永远对不上"的静默升级失败
+    expectEqual(SelfUpgrade.upgradeArguments(stage: "S", marker: "M", tag: "4.2.0",
+                                             shaDaemon: "d", shaAppBinary: "a",
+                                             shaUpgradeScript: "u", shaUninstallScript: "n"),
+                ["S", "M", "4.2.0", "d", "a", "u", "n"],
+                "升级参数 7 元顺序（与 upgrade.sh 的位置解析一致）")
     // 落点常量：文案与脚本侧的安装路径必须同字（漂移=App 校验了个不存在的路径）
     expectEqual(SelfUpgrade.privilegedUpgradeScript, "/usr/local/libexec/fanctl-upgrade.sh",
                 "升级脚本落点常量")

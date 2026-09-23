@@ -55,6 +55,18 @@ public enum SelfUpgrade {
         case unreadablePlist = "暂存包 Info.plist 不可读"
         case missingDaemon = "暂存包缺 fanctld 二进制"
         case versionMismatch = "暂存包版本与 Release tag 不符"
+        case missingPrivilegedScripts = "暂存包缺特权脚本（upgrade.sh / uninstall.sh）"
+    }
+
+    /// 批次 A 追加的门（授权弹窗**之前**判，不是 root 侧事后拒）：暂存包必须自带两份
+    /// root 执行脚本正文。缺任一份即意味这次升级无法刷新 root 侧链路——若等用户输完
+    /// 密码才被 upgrade.sh 的 exit 2 拒掉，代价是"打了密码还留下半迁移状态"。
+    /// 与 validateStaged 分两个函数而非塞进同一个：前者的输入是 plist 数据，后者只是
+    /// 存在性判断，合并会让调用方为了喂参数去做无谓的读取。
+    public static func stagedMissingPrivilegedScripts(hasUpgradeScript: Bool,
+                                                      hasUninstallScript: Bool) -> StagedError? {
+        guard hasUpgradeScript, hasUninstallScript else { return .missingPrivilegedScripts }
+        return nil
     }
 
     /// tag 消毒：只接受 "3.9" / "v3.9.0" 形态（去 v 前缀后全为数字+点，≤4 段，≤24 字符）。
@@ -102,6 +114,17 @@ public enum SelfUpgrade {
     public static func authorizationPrompt(tag: String) -> String {
         let v = sanitizeTag(tag) ?? "新版本"
         return "清风升级到 v\(v)：需要管理员授权替换系统守护进程与菜单栏 App"
+    }
+
+    /// 授权脚本的参数顺序（App ↔ upgrade.sh 的跨语言契约，两侧共用一份定义）。
+    /// 7 项全必填：upgrade.sh 侧 fail-closed，少任一项即 exit 3 拒绝动手。
+    /// 两份**脚本正文**的哈希与两份二进制同等待遇：批次 A 后它们会被 root 装成
+    /// "将被 root 执行的代码"，不复核就等于把注入口留在一个无摘要、路径公开的目录。
+    public static func upgradeArguments(stage: String, marker: String, tag: String,
+                                        shaDaemon: String, shaAppBinary: String,
+                                        shaUpgradeScript: String,
+                                        shaUninstallScript: String) -> [String] {
+        [stage, marker, tag, shaDaemon, shaAppBinary, shaUpgradeScript, shaUninstallScript]
     }
 
     /// 暂存二进制文件的 sha256 十六进制（R23：授权命令携带，upgrade.sh root 侧复核）。

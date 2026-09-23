@@ -66,22 +66,25 @@ run_expect 1 "暂存不存在 → exit 1" env FANCTL_TEST_GATES_ONLY=1 bash "$UP
 ST="$(make_stage 4.1.3)"
 D_SHA=$(sha256 "$ST/fanctld")
 A_SHA=$(sha256 "$ST/FanCtl.app/Contents/MacOS/FanCtl")
+# 批次 A：暂存的**特权脚本正文**也在 root 侧复核之列（它们会被装成 root 执行代码）
+U_SHA=$(sha256 "$ST/upgrade.sh")
+N_SHA=$(sha256 "$ST/uninstall.sh")
 M="$TMP/marker-ok"
 
 run_expect 0 "tag 与暂存版本一致 → gates-ok" \
-    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.3" "$D_SHA" "$A_SHA"
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.3" "$D_SHA" "$A_SHA" "$U_SHA" "$N_SHA"
 
 run_expect 3 "R29 fail-closed：缺 tag/哈希 → exit 3（不得跳过门禁）" \
     env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M"
 
 run_expect 3 "R29 fail-closed：仅有 marker 无 tag → exit 3" \
-    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "" "$D_SHA" "$A_SHA"
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "" "$D_SHA" "$A_SHA" "$U_SHA" "$N_SHA"
 
 run_expect 3 "P1-A：传 v 前缀 tag（v4.1.3）必拒 — App 侧必须 sanitizeTag" \
-    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "v4.1.3" "$D_SHA" "$A_SHA"
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "v4.1.3" "$D_SHA" "$A_SHA" "$U_SHA" "$N_SHA"
 
 run_expect 3 "暂存版本 ≠ 授权版本 → exit 3" \
-    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.4" "$D_SHA" "$A_SHA"
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.4" "$D_SHA" "$A_SHA" "$U_SHA" "$N_SHA"
 
 # --- sha256 复核 ---
 ST="$(make_stage 4.1.3)"
@@ -98,7 +101,7 @@ run_expect 3 "App 哈希不符 → exit 3" \
     env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.3" "$D_SHA" "$HASH_B"
 
 run_expect 0 "双哈希命中 → gates-ok" \
-    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.3" "$D_SHA" "$A_SHA"
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.3" "$D_SHA" "$A_SHA" "$U_SHA" "$N_SHA"
 
 # 授权后偷换暂存内容 → 哈希门必须红（TOCTOU 复核语义）
 ST="$(make_stage 4.1.3)"
@@ -106,7 +109,7 @@ D_SHA=$(sha256 "$ST/fanctld")
 A_SHA=$(sha256 "$ST/FanCtl.app/Contents/MacOS/FanCtl")
 echo "tampered" > "$ST/fanctld"
 run_expect 3 "授权后偷换 fanctld → 哈希门 exit 3" \
-    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.3" "$D_SHA" "$A_SHA"
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$M" "4.1.3" "$D_SHA" "$A_SHA" "$U_SHA" "$N_SHA"
 
 # --- marker 符号链接（P2-B / P3-1）---
 ST="$(make_stage 4.1.3)"
@@ -117,7 +120,7 @@ echo "keep-me" > "$VICTIM"
 MLINK="$TMP/marker-link"
 ln -s "$VICTIM" "$MLINK"
 run_expect 4 "marker 是符号链接 → exit 4（bootout 前拒）" \
-    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$MLINK" "4.1.3" "$D_SHA" "$A_SHA"
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$ST" "$MLINK" "4.1.3" "$D_SHA" "$A_SHA" "$U_SHA" "$N_SHA"
 if [[ "$(cat "$VICTIM")" == "keep-me" ]]; then
     ok "victim 文件未被截断"
 else
@@ -212,7 +215,7 @@ rm -f "$_stage_no_scripts/upgrade.sh"
 _sha_d=$(sha256 "$_stage_no_scripts/fanctld")
 _sha_a=$(sha256 "$_stage_no_scripts/FanCtl.app/Contents/MacOS/FanCtl")
 run_expect 2 "暂存包缺 upgrade.sh → exit 2（拒绝半个升级链）" \
-    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$_stage_no_scripts" "$_stage_no_scripts/.m" 4.2.0 "$_sha_d" "$_sha_a"
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$_stage_no_scripts" "$_stage_no_scripts/.m" 4.2.0 "$_sha_d" "$_sha_a" "deadbeef" "deadbeef"
 # 目录信任谓词（无 root 可测的安全向两支：普通用户属主 / 组可写）
 _trust_dir="$TMP/trust-user"
 mkdir -p "$_trust_dir"
@@ -222,6 +225,50 @@ chmod 775 "$_trust_dir" 2>/dev/null || true
 run_expect 1 "谓词：组可写目录 → 不可信（root 代码落点必须无组写位）" \
     env FANCTL_TEST_DIR_TRUST=1 bash "$INSTALL" "$_trust_dir"
 # 正例（root 属主 + 755）需要 root 才能构造，诚实记档为"仅真机验证"，不在门禁里假称已测
+
+echo "== R36 审查轮修复的防回潮门 =="
+# (1) 函数**定义必须先于调用**：R36 的 P1 就是这个（调用早于定义 → bash 报
+#     "command not found"（127），`if ! fn` 把 127 反成判真 → 健康机器上拒支 exit 5，
+#     App 内一键升级 100% 失败；而测试钩子恰好跳过那块，32 项门全绿）。
+for f in "$INSTALL" "$UPGRADE"; do
+    def_line=$(grep -n '^fanctl_dir_trusted() {' "$f" | head -1 | cut -d: -f1 || true)
+    call_line=$(grep -n 'if ! fanctl_dir_trusted' "$f" | head -1 | cut -d: -f1 || true)
+    if [[ -z "$call_line" ]]; then
+        bad "$(basename "$f") 找不到目录信任调用（门被删了？）"
+    elif [[ -z "$def_line" || "$def_line" -gt "$call_line" ]]; then
+        bad "$(basename "$f")：fanctl_dir_trusted 定义(:$def_line) 必须先于调用(:$call_line)"
+    else
+        ok "$(basename "$f")：信任谓词定义先于调用（bash 顺序解析，错序即静默死锁）"
+    fi
+done
+# (2) 全局测试后门必须限非 root：osascript 的 do shell script 会透传调用方环境
+if grep -q 'FANCTL_TEST_GATES_ONLY' "$UPGRADE" && \
+   ! grep -qE '^if \[\[ "\$\{FANCTL_TEST_GATES_ONLY' "$UPGRADE"; then
+    ok "upgrade.sh 的 gates-only 后门带非 root 前置条件"
+else
+    bad "upgrade.sh 的 gates-only 后门未限非 root（root 运行中可被 env 注入跳过实装）"
+fi
+for h in FANCTL_TEST_DIR_TRUST FANCTL_TEST_CONFIG_GUARD; do
+    if grep -qE "\[\[ .*EUID -ne 0.*$h" "$INSTALL" "$UPGRADE"; then
+        ok "后门 $h 要求非 root"
+    else
+        bad "后门 $h 未限非 root"
+    fi
+done
+# (3) 落点路径不得由 env 决定（plist 里 ProgramArguments 是硬编码绝对路径）
+if grep -q 'FANCTL_LIBEXEC_DIR' "$INSTALL" || grep -q 'FANCTL_LIBEXEC_DIR' "$UPGRADE"; then
+    bad "仍存在 FANCTL_LIBEXEC_DIR 覆写（env 能把 root 代码装到别处而 plist 仍指死路径）"
+else
+    ok "特权落点写死 /usr/local/libexec（无 env 漂移面）"
+fi
+# (4) 行为面：暂存的 upgrade.sh 在授权后被换掉 → 哈希门必须 exit 3
+_stage_tamper=$(make_stage "4.2.0")
+_td=$(sha256 "$_stage_tamper/fanctld"); _ta=$(sha256 "$_stage_tamper/FanCtl.app/Contents/MacOS/FanCtl")
+_tu=$(sha256 "$_stage_tamper/upgrade.sh"); _tn=$(sha256 "$_stage_tamper/uninstall.sh")
+printf 'evil\n' > "$_stage_tamper/upgrade.sh"   # 授权后被偷换（App 传的是换前的哈希）
+run_expect 3 "暂存 upgrade.sh 授权后被换掉 → 哈希门 exit 3（正文也是 root 执行代码）" \
+    env FANCTL_TEST_GATES_ONLY=1 bash "$UPGRADE" "$_stage_tamper" "$_stage_tamper/.m" 4.2.0 \
+        "$_td" "$_ta" "$_tu" "$_tn"
 
 echo "root 脚本门禁：$pass 通过 / $fail 失败"
 if [[ "$fail" -gt 0 ]]; then exit 1; fi

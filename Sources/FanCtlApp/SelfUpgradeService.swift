@@ -4,7 +4,7 @@ import SMCCore
 // SelfUpgradeService — 一键升级的副作用编排（v3.9.0）
 // 状态机：idle → downloading → validating → installing（等授权+装）→ 成功=进程被脚本杀掉重启；
 // 任何失败回 .failed(reason)（菜单给"重试"），用户取消授权回 idle。
-// 特权边界：本服务只准备"暂存包"（用户态 /tmp），root 干什么由
+// 特权边界：本服务只准备"暂存包"（用户态 $TMPDIR 下 App 私有目录），root 干什么由
 // /usr/local/libexec/fanctl-upgrade.sh（root:wheel 755）决定——exec 前先 lstat 校验
 // 该落点（常规文件 + root 拥有 + 组/其他无写位），不合规直接拒绝提权。
 // 下载物仅作为数据被安装（校验门 SelfUpgrade.validateStaged 在授权弹窗之前执行）。
@@ -115,6 +115,15 @@ final class SelfUpgradeService: ObservableObject {
                                                     hasDaemonBinary: hasDaemon, tag: tag) {
                 throw Failure(err.rawValue)
             }
+            // 批次 A：暂存包还得自带两份 root 执行脚本正文（缺则这次升级刷新不了链路）。
+            // 与 root 侧的 exit 2 同源，但放在弹窗之前——别让用户为注定失败的升级输密码。
+            if let err = SelfUpgrade.stagedMissingPrivilegedScripts(
+                hasUpgradeScript: FileManager.default.fileExists(
+                    atPath: innerDir.appendingPathComponent("upgrade.sh").path),
+                hasUninstallScript: FileManager.default.fileExists(
+                    atPath: innerDir.appendingPathComponent("uninstall.sh").path)) {
+                throw Failure(err.rawValue)
+            }
             // 4) 授权 + 安装（osascript 弹原生密码框；本 App 会被脚本 pkill 并重启，
             //    本 Task 随进程死亡——这是设计内的终点，不是错误）。
             //    审查修复①：传 innerDir（含 FanCtl.app 的顶层目录）而非解压根——
@@ -148,6 +157,13 @@ final class SelfUpgradeService: ObservableObject {
             guard let shaAppBin = SelfUpgrade.sha256Hex(
                 of: appDir.appendingPathComponent("Contents/MacOS/FanCtl")) else {
                 throw Failure("暂存 App 二进制不可读，无法校验完整性，已中止升级")
+            }
+            // 两份特权脚本正文同样入摘要（root 会把它们装成 root 执行代码）
+            guard let shaUpgrade = SelfUpgrade.sha256Hex(
+                of: innerDir.appendingPathComponent("upgrade.sh")),
+                  let shaUninstall = SelfUpgrade.sha256Hex(
+                    of: innerDir.appendingPathComponent("uninstall.sh")) else {
+                throw Failure("暂存特权脚本不可读，无法校验完整性，已中止升级")
             }
             phase = .installing(tag: tag)
             // R23 再审（P1-A）：传给 root 脚本与 watcher 比对的必须是剥掉 v 前缀的规范
@@ -191,10 +207,17 @@ final class SelfUpgradeService: ObservableObject {
                   applescriptSafe(SelfUpgrade.authorizationPrompt(tag: tag)) else {
                 throw Failure("暂存路径/提示含 AppleScript 元字符，已拒绝提权")
             }
+            let args = SelfUpgrade.upgradeArguments(
+                stage: quotedStage, marker: quotedMarker, tag: normTag,
+                shaDaemon: shaDaemon, shaAppBinary: shaAppBin,
+                shaUpgradeScript: shaUpgrade, shaUninstallScript: shaUninstall)
+            for arg in args where !applescriptSafe(arg) {
+                throw Failure("升级参数含 AppleScript 元字符，已拒绝提权")
+            }
             let appleScript =
-                "do shell script \"\(scriptPath) "
-                + "'\(quotedStage)' '\(quotedMarker)' '\(normTag)' '\(shaDaemon)' '\(shaAppBin)'\""
-                + " with administrator privileges with prompt \"\(SelfUpgrade.authorizationPrompt(tag: tag))\""
+                "do shell script \"\(scriptPath) " + args.map { "'\($0)'" }.joined(separator: " ")
+                + "\" with administrator privileges "
+                + "with prompt \"\(SelfUpgrade.authorizationPrompt(tag: tag))\""
             let (osaStatus, osaErr) = try await Task.detached(priority: .userInitiated) {
                 let osa = Process()
                 osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")

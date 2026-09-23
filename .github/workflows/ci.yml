@@ -36,8 +36,8 @@ jobs:
           swift run -c release --disable-sandbox fanctltests 2>&1 | tee test-output.txt
           N=$(grep -oE '全部通过：[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1)
           echo "断言数: $N"
-          if [ -z "$N" ] || [ "$N" -lt 4700 ]; then
-            echo "::error::断言数 $N 低于契约下限 4700（测试被删/跳过？）"
+          if [ -z "$N" ] || [ "$N" -lt 4720 ]; then
+            echo "::error::断言数 $N 低于契约下限 4720（测试被删/跳过？）"
             exit 1
           fi
           echo "ASSERTIONS=$N" >> "$GITHUB_ENV"
@@ -60,10 +60,10 @@ jobs:
         # 编译覆盖，此前只编非 UI 目标会让 App 侧语法/类型回归漏到 tag 触发的 release job
         # 才暴露）。macos runner 始终带完整 Xcode，SwiftUIMacros 插件在场，App 可编。
         run: |
-          swift build -c release --disable-sandbox --target fanctld
-          swift build -c release --disable-sandbox --target fanprobe
+          swift build -c release --disable-sandbox --product fanctld
+          swift build -c release --disable-sandbox --product fanprobe
       - name: App 目标编译校验（不跑，仅编）
-        run: swift build -c release --disable-sandbox --target FanCtlApp
+        run: swift build -c release --disable-sandbox --product FanCtlApp
 
   # v3.4.5（4A）：tag 推送时打包 dist/ 附到 GitHub Release——访客不必自备
   # Swift 工具链源码编译（第一公里）。产物含 daemon 二进制 + 完整 App bundle +
@@ -118,4 +118,4 @@ jobs:
           NOTES=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME" | head -40)
           gh release create "$GITHUB_REF_NAME" "$ASSET" \
             --title "清风 $GITHUB_REF_NAME" \
-            --notes "\${NOTES:-解压后：sudo ./install.sh 安装（详见 README 快速安装）。macOS 26+ Apple Silicon。}"
+            --notes "${NOTES:-解压后：sudo ./install.sh 安装（详见 README 快速安装）。macOS 26+ Apple Silicon。}"

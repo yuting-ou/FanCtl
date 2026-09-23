@@ -7,16 +7,49 @@
 #   批次 A（4.2.0）：规范落点 /usr/local/libexec/fanctl-upgrade.sh，root:wheel 755，
 #        由 install.sh 首装、每次升级自我刷新；App 侧 exec 前先 lstat 校验
 #        （常规文件 + root 拥有 + 组/其他无写位），不合规即拒绝提权，绝不回退包内副本。
-# 调起签名：bash -s -- <暂存目录> [标记文件] [授权版本tag] [daemon哈希] [App二进制哈希]
-# 暂存目录由 App 侧（用户态）准备好并已通过 SelfUpgrade.validateStaged 校验门；
-# 后三个参数缺省时退化为旧行为（手动兼容），提供时 root 侧在动手前复核——
-# 关闭"授权弹窗确认之后偷换暂存包"的 TOCTOU（校验与安装同在 root 时间线）。
+# 调起签名（7 个必填参数，App 侧由 SelfUpgrade.upgradeArguments 生成同一顺序）：
+#   bash 落点 <暂存目录> <标记文件> <授权版本tag> <fanctld哈希> <App二进制哈希> <upgrade.sh哈希> <uninstall.sh哈希>
+# 暂存目录由 App（用户态）准备并已过 SelfUpgrade.validateStaged 与特权脚本存在性门；
+# 四个哈希在 root 动手前复核——关闭"授权确认之后偷换暂存包"的 TOCTOU。
+# 批次 A 后暂存包里两份**脚本正文**也会被装成 root 执行代码，故与两份二进制同等待遇：
+# 不复核就是"把注入口从二进制挪到一个无摘要、路径公开、root 主动 install 的目录"。
 set -euo pipefail
 
-# FANCTL_TEST_GATES_ONLY=1：无 root 回归钩子——跳过 EUID 检查，只执行下方授权前
-# 门禁（暂存完整性 / tag 比对 / sha256 复核 / marker 符号链接）后退出 0，绝不触碰
-# launchctl/文件系统安装路径。scripts/test-root-scripts.sh 靠它锁 P1-A/P1-B/P2/marker。
-if [[ $EUID -ne 0 && "${FANCTL_TEST_GATES_ONLY:-}" != "1" ]]; then
+# ---------------------------------------------------------------------------
+# 目录信任谓词（批次 A）：root 要往某目录写"将被 root 执行的代码"之前，该目录必须
+# root 拥有且组/其他无写位——否则同 uid 进程可预置同名文件或符号链接，下次授权即
+# 执行攻击者代码（R23/R28 修文件面，这里修目录面）。
+# **定义必须先于任何调用**：bash 解析到函数定义那一行才注册它，调用早于定义会得到
+# 127 "command not found"，而 `if ! fn` 把 127 反成判真 → 健康机器也走拒支。
+# R36 审查 P1 就是这个：4.2.0 的目录信任门写在调用之后，App 内一键升级 100% 失败，
+# 而回归门禁全绿（测试钩子恰好跳过那块）。顺序由 test-root-scripts.sh 静态门锁住。
+# ---------------------------------------------------------------------------
+fanctl_dir_trusted() {
+    local d="$1" st owner mode
+    [[ -d "$d" && ! -L "$d" ]] || return 1
+    st=$(/usr/bin/stat -f "%u %p" "$d" 2>/dev/null) || return 1
+    owner="${st%% *}"; mode="${st##* }"
+    [[ "$owner" == "0" ]] || return 1
+    [[ $(( 0$mode & 0022 )) -eq 0 ]]
+}
+
+# 全局测试后门一律要求**非 root**：osascript 的 do shell script 会透传调用方环境
+# （实测 `osascript -e 'do shell script "env"'` 里能看到注入变量），root 运行中任何
+# "跳过实装只跑门禁"的后门都必须失效——否则会留下"报成功而什么都没装"的状态。
+GATES_ONLY=0
+if [[ $EUID -ne 0 && "${FANCTL_TEST_GATES_ONLY:-}" == "1" ]]; then GATES_ONLY=1; fi
+
+# 无 root 谓词回归钩子（0=可信，1=不可信）。root 属主的正例无法在无 root 下构造，
+# 诚实记档为"仅真机验证"。
+if [[ $EUID -ne 0 && "${FANCTL_TEST_DIR_TRUST:-}" == "1" ]]; then
+    fanctl_dir_trusted "${1:-}"
+    exit $?
+fi
+
+# 无 root 回归钩子（仅非 root 生效）：跳过 EUID 检查，只跑下方授权前门禁
+# （暂存完整性 / tag 比对 / 四哈希复核 / marker 符号链接）后退出 0，绝不触碰
+# launchctl 与文件系统安装路径。scripts/test-root-scripts.sh 靠它锁 P1-A/P1-B/P2/marker。
+if [[ $EUID -ne 0 && $GATES_ONLY -eq 0 ]]; then
     echo "此脚本须以管理员身份运行（由 App 的升级流程调起）" >&2
     exit 1
 fi
@@ -37,12 +70,15 @@ MARKER="${2:-$STAGING/.upgrade-done}"
 TAG="${3:-}"
 SHA_DAEMON="${4:-}"
 SHA_APPBIN="${5:-}"
+SHA_UPGRADE="${6:-}"
+SHA_UNINSTALL="${7:-}"
 
 # root 侧复核（在 bootout 之前——不匹配则原状退出，运行中的 daemon/App 不受扰动）
 # R29：门禁 fail-closed——TAG/双哈希为必填。App 自动升级恒传齐；手动/社交工程路径
 # 若缺参数则拒绝安装，禁止「跳过校验仍 root 动手」。
-if [[ -z "$TAG" || -z "$SHA_DAEMON" || -z "$SHA_APPBIN" ]]; then
-    echo "缺少授权 tag 或二进制哈希参数，拒绝升级（fail-closed）" >&2
+if [[ -z "$TAG" || -z "$SHA_DAEMON" || -z "$SHA_APPBIN"
+      || -z "$SHA_UPGRADE" || -z "$SHA_UNINSTALL" ]]; then
+    echo "缺少授权 tag 或四个哈希参数，拒绝升级（fail-closed）" >&2
     exit 3
 fi
 STAGED_VER=$(plutil -extract CFBundleShortVersionString raw \
@@ -61,6 +97,17 @@ if [[ "$actual" != "$SHA_APPBIN" ]]; then
     echo "暂存 App 二进制哈希不符（授权后被篡改？）" >&2
     exit 3
 fi
+# 两份特权脚本正文：它们会被装成 root 执行代码，与二进制同等复核
+actual=$(/usr/bin/shasum -a 256 "$STAGING/upgrade.sh" | awk '{print $1}')
+if [[ "$actual" != "$SHA_UPGRADE" ]]; then
+    echo "暂存 upgrade.sh 哈希不符（授权后被篡改？）" >&2
+    exit 3
+fi
+actual=$(/usr/bin/shasum -a 256 "$STAGING/uninstall.sh" | awk '{print $1}')
+if [[ "$actual" != "$SHA_UNINSTALL" ]]; then
+    echo "暂存 uninstall.sh 哈希不符（授权后被篡改？）" >&2
+    exit 3
+fi
 
 # R23 审查（P3-1）：marker 已是符号链接时在 bootout 之前快速失败——否则装完 daemon、
 # 杀完旧 App、替换完 bundle 才在末尾守卫 exit 4，语义是"系统已升级却回报失败、新 App
@@ -70,10 +117,11 @@ if [[ -L "$MARKER" ]]; then
     exit 4
 fi
 
-# 目录信任门（批次 A）：root 执行代码的落点必须 root 拥有且组/其他不可写。
-# 放在 bootout 之前——不合规就原状退出，绝不"先停服务再报错"。
-LIBEXEC="${FANCTL_LIBEXEC_DIR:-/usr/local/libexec}"
-if [[ "${FANCTL_TEST_GATES_ONLY:-}" != "1" ]]; then
+# 目录信任门（批次 A）：落点必须 root 拥有且组/其他不可写；放在 bootout 之前——
+# 不合规就原状退出，绝不"先停服务再报错"。落点在生产路径写死（不给 env 留漂移：
+# plist 里的 ProgramArguments 也硬编码同一绝对路径，两者必须一致）。
+LIBEXEC=/usr/local/libexec
+if [[ $GATES_ONLY -eq 0 ]]; then
     mkdir -p "$LIBEXEC"
     if ! fanctl_dir_trusted "$LIBEXEC" || ! fanctl_dir_trusted "$(dirname "$LIBEXEC")"; then
         echo "拒绝升级：${LIBEXEC} 或其父目录不是 root 拥有且组/其他不可写" >&2
@@ -81,31 +129,11 @@ if [[ "${FANCTL_TEST_GATES_ONLY:-}" != "1" ]]; then
     fi
 fi
 
-if [[ "${FANCTL_TEST_GATES_ONLY:-}" == "1" ]]; then
+if [[ $GATES_ONLY -eq 1 ]]; then
     echo "gates-ok"
     exit 0
 fi
 
-# R36（批次 A）目录信任谓词：root 要往某个目录里写"将被 root 执行的代码"之前，
-# 必须确认这个目录不是用户可写的——否则同 uid 进程把它换成符号链接或预置同名文件，
-# 下次授权即等于执行攻击者代码（R23/R28 修的是文件面，这里是目录面）。
-# 判据：真实目录（非符号链接）+ 属主 uid 0 + 组/其他写位为 0。
-fanctl_dir_trusted() {
-    local d="$1" st owner mode
-    [[ -d "$d" && ! -L "$d" ]] || return 1
-    st=$(/usr/bin/stat -f "%u %p" "$d" 2>/dev/null) || return 1
-    owner="${st%% *}"; mode="${st##* }"
-    [[ "$owner" == "0" ]] || return 1
-    [[ $(( 0$mode & 0022 )) -eq 0 ]]
-}
-
-# FANCTL_TEST_DIR_TRUST=1：无 root 回归钩子，对 $1 求谓词后退出（0=可信，1=不可信）。
-# 安全向的两支可在无 root 下测（普通用户属主、775/777 写位）；"root 属主正例"只能
-# 真机验证——诚实记档，不在门禁里假称已测。
-if [[ "${FANCTL_TEST_DIR_TRUST:-}" == "1" ]]; then
-    fanctl_dir_trusted "${1:-}"
-    exit $?
-fi
 PLIST=/Library/LaunchDaemons/com.fanctl.daemon.plist
 SUPPORT="/Library/Application Support/FanCtl"
 

@@ -210,6 +210,9 @@ swift run -c release --disable-sandbox fanprobe
 
 ## 8. 4.2 变更摘要（2026-09，特权信任根 + 可靠性硬化 + 发版链自证）
 
+> **4.2.0 请勿用 App 内一键升级**：那一版的目录信任门有个"函数定义晚于调用"的缺陷，
+> 升级会稳定失败（不影响已装功能）。直接 `sudo ./install.sh` 装 4.2.1 即可。
+
 > **升级须知（一次性迁移）**：本版把"被授权执行的脚本"从 App bundle 移到
 > `/usr/local/libexec/fanctl-upgrade.sh`（root:wheel 755）。bundle 被 `chown` 给登录用户，
 > 里面的代码不是信任根；从 4.1.x 升上来的机器需要**先手动装一次**
