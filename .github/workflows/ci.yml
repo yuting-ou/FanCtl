@@ -85,7 +85,22 @@ jobs:
           test ! -e /usr/local/libexec/fanctld
           test ! -e /Library/LaunchDaemons/com.fanctl.daemon.plist
           test ! -e "/Applications/清风.app"
-          echo "首装→运行→卸载 全链在干净机器上通过"
+          # 第二公里：访客拿到的不是仓库而是 zip —— R33 为 zip 布局改过产物根查找，
+          # 但从没有真按"解压 → sudo ./install.sh"走过一遍。这里现造一个与 release job
+          # 同形状的 zip，解到仓库外再装再卸。
+          STG="$RUNNER_TEMP/StageLayout/FanCtl-${APP_VERSION}"
+          mkdir -p "$STG"
+          cp -R dist/FanCtl.app dist/fanctld dist/fanprobe scripts/install.sh scripts/uninstall.sh scripts/upgrade.sh "$STG/"
+          (cd "$RUNNER_TEMP/StageLayout" && zip -qr ../visitor.zip "FanCtl-${APP_VERSION}")
+          mkdir -p "$RUNNER_TEMP/visitor" && unzip -q "$RUNNER_TEMP/visitor.zip" -d "$RUNNER_TEMP/visitor"
+          (cd "$RUNNER_TEMP/visitor/FanCtl-${APP_VERSION}" && sudo ./install.sh)
+          /usr/local/libexec/fanctld -v | grep -qF "$APP_VERSION ($BUILD_NUMBER)"
+          test -d "/Applications/清风.app/Contents/MacOS"
+          [ "$(sudo /usr/local/bin/fanprobe --report | wc -l | tr -d ' ')" = "19" ]
+          (cd "$RUNNER_TEMP/visitor/FanCtl-${APP_VERSION}" && sudo ./uninstall.sh)
+          test ! -e /usr/local/libexec/fanctld
+          test ! -e "/Applications/清风.app"
+          echo "首装→运行→卸载 全链在干净机器上通过（仓库布局 + 访客 zip 布局各一遍）"
 
       - name: Release 构建
         # R23（P2）：daemon/工具用非 UI 目标直编。App 目标（FanCtlApp）单独一步编译校验
