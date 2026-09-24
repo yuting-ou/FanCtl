@@ -799,6 +799,7 @@ testSelfUpgradeFuzz()
 testRootScriptGates()
 testPassiveMachine()
 testPartialFanLoss()
+testStatusSummaryCoverage()
 testCalibrationColdStart()
 testMetamorphicProperties()
 testGarbageCodable()
@@ -815,13 +816,13 @@ print("——")
 // R33：CI 曾为 4400、源码 4550 双源漂移——已统一；改数值必须两处同时改
 // R35/R36：4.2.1 实测 4736 断言 / 82 组；R37：4.2.2 实测 4836 / 84（诊断包结构与口径、
 // 只读零副作用两组）；R38：4.2.3 实测 4860 / 85（daemon 版本自报的 JSON 契约组，含
-// "init 参数漏赋值"与"接线计数"两条 F9 同族守卫）；R43：4.2.8 实测 4915 / 86；R44：实测 4926 / 87（双风扇不对称量程形状扫描）
+// "init 参数漏赋值"与"接线计数"两条 F9 同族守卫）；R43：4.2.8 实测 4915 / 86；R44：实测 4926 / 87（双风扇不对称量程形状扫描）；R46：实测 4937 / 88（变化感知字段覆盖门）
 // （R43 组：交还、边沿不重复写、恢复后再失联、去抖、交还写失败、唤醒补交还）
-let minAssertions = 4920
+let minAssertions = 4930
 // R23 测试基建：第二道门槛——distinct group 数。断言总数可被循环刷量虚高
 // （如 expectPersonalityOrdered 单次产 ~816 条），删掉整段测试但保留循环类断言时
 // 总数不降、覆盖却净损；group 数是粗粒度结构量，删函数即少一个 group，刷不出来。
-let minGroups = 86
+let minGroups = 87
 if failures == 0 {
     if checks < minAssertions {
         print("❌ 断言数 \(checks) 低于契约下限 \(minAssertions)（测试被删/跳过？）")

@@ -163,6 +163,15 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R46（4.2.10(101)）：把"新字段必须进变化感知"从口头纪律变成通用门——一上手抓到 9 个
+- **选题（杠杆第一档：指标会不会说谎）**：`statusChangeSummary` 决定"这一拍要不要落盘"，漏一个字段就是那个字段最长陈旧 10s（心跳上限）。这条纪律被违反过三次——`learnEnvelopeGap`(v3.6)、`calibrating`(4.0 审查)、`daemonVersion`(R38)——每次都是**事后手写一条断言**补洞。改成通用门：造 A（字段填满）/B（取值全不同）两份合法 status，逐 JSON 键把 A 换成 B、重新解码，**摘要必须变**。
+- **门第一次跑就报 9 个键**，逐条人工判定（不默认自己是错的也不默认门是对的）：**2 个真漏** → 修：`baseTargetPercent` / `safetyFloorPercent` 加进摘要（`Config.swift` statusChangeSummary 的 `baseStr/floorStr` 两段，走同一个 `r()` 钳位）——它们驱动 App 的「安全托底」胶囊，翻转时不落盘就是让用户看旧状态。**7 个刻意豁免** → 写理由进名单：`appliedPercent`（被 `appliedPercents` 遮蔽的别名；单风扇旧路径走 else 分支仍被看见）、`learnedSamples`（每个稳态样本 +1，纳入=学习期每拍强写）、`decisionTrace`（含 temp/error 每拍量）、`hardwareProfile`（唯一会变的 fanCount 翻正那一拍 reason/输出必变，摘要已被带动）、`thermalModelUsable/B/Samples`（模型每拍漂移，诊断字段容许 ≤10s 陈旧）。
+- **结构量断言**：`keys.count=34`（新增字段必须在本门或豁免名单里表态）、`tested=23`（=34−11 条豁免，对不上即有人动名单）——期望值全是死数字（R44 刚踩过"期望值引用被测集合"的坑）。
+- **变异**：H1 从摘要数组里删掉 `baseStr`（模拟"加了字段忘了接线"）→ 门红；H2 把 `decisionTrace` 从豁免名单删掉 → 门报该键未被看见（证明**豁免条目是承重的**，不是装饰注释）。两式跑完逐文件比内容与 mode 复原、复绿。
+- **交付**：VERSION `4.2.9(100)` → **`4.2.10(101)`**；断言 4934 → **4937 / 88 组**；契约门槛双源同步；`r()` 钳位沿用（NaN/1e308 不 trap，v3.6.3 模糊测试那条教训的同一函数）。
+- **残余风险**：① 门只覆盖 status.json **顶层标量/对象键**，`sensors` 内部子字段（如 `otherHotspots` 变化）不逐键差分——它们整体参与 fanStr/温度段，属于半覆盖；② 豁免名单的 7 条理由里"每拍都变所以不能纳入"是**成本判断**，不是"陈旧无害"：诊断字段最长 10s 陈旧仍在；③ `tested=23` 是死数字，新增字段若同时新增豁免，需两值一起改——审查者应盯住豁免名单的增长。
+- **下一轮最高杠杆**：同法给 `DailyStats`/`AIControlMetrics` 的**累计字段读者清点**上一道门（哪几个 surface 读同一个数、口径标签是否同源——R45 的 fanprobe 谎就是这类），以及把 R43 的"失联风扇缺口"做成 status 显式字段。
+
 ### R45（4.2.9(100)）：同一个数字的两个口径标签——磨损速率的"次/受控分"是句谎话
 - **选题（杠杆第一档：指标会不会说谎）**：R43 交付后跑真机 `fanprobe` 读数时撞见一句可疑文案——「磨损速率 16.39 **次/受控分**」。核分母：`speedChangesPerMinute = speedChanges / (tempSeconds/60)`，而 `tempSeconds` 在 `StatsSampler.swift:64` 是**每个有效温度样本累加**（与是否在受控无关，auto/交还/静音拍照算）。同一个属性在 `DiagnosticReport.swift:296` 印「次/采样分」，`TestsReport.swift:314` 还专门断言过"必须是采样分、不是 AI 受控分"——**只有 fanprobe 这两行是错的**，而 fanprobe 恰是人读趋势、下"批次 B 控制律动不动"判断的那张表。R40 审查当年记过一条"分子/分母域不一致"，处置是保留归一化+把诊断包标签改对，但**漏了这个 surface**：口径修正做了一半，另一半年就在说谎。
 - **修法（最小面 + 结构上防复发）**：单位串收成单一真值 `Config.swift:894` `DailyStats.wearRateUnit = "次/采样分"`；`DiagnosticReport.swift:296` 与 `fanprobe/main.swift:134,150` 全部改从它取；`Config.swift` 的属性注释写清"分母是采样秒、分子是受控动作，归一化只为跨拍频可比，不声称同域"。**数值、判据、控制路径零改动**——只停止贴错标签。

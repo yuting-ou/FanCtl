@@ -2000,6 +2000,104 @@ func testAliveDebouncer() {
 // 锁六条：① 失联满 6s 即交还、每轮只写一次；② 恢复后再失联要重新交还；
 // ③ FNum 虚报（键整体不存在）只试一次不刷日志；④ 健康机器（含单风扇）零误伤；
 // ⑤ 抖动键不处置（去抖）；⑥ 交还写失败出声一次；⑦ 唤醒后仍失联能补交还。
+// R46：变化感知的**字段覆盖门**。这个 bug 反复出现：`learnEnvelopeGap`（v3.6）、
+// `calibrating`（4.0 审查）、`daemonVersion`（R38）都曾被"写进 status 却没进
+// statusChangeSummary"——字段变了而摘要没变 → 那一拍不落盘，App/fanprobe 最多陈旧 10s，
+// 本地与 CI 全绿。逐字段手写断言只能治当时那一个，故改成通用门：
+// 造一份"字段尽量填满"的 A 与一份"取值全都不同"的 B，对每个 JSON 键单独把 A 换成 B 的值，
+// 重新解码后**摘要必须变**；不该变的键必须写进 summaryFree 并给理由。
+// 新增字段若忘了进摘要 → 这里直接红；B 与 A 某键取值相同 → 判"未真正差分"（防空跑）。
+func testStatusSummaryCoverage() {
+    group("变化感知字段覆盖(R46)")
+    var a = DaemonStatus(cpuTemp: 70, gpuTemp: 55, mode: .ai, appliedPercent: 40,
+                         fans: [FanStatusEntry(id: 0, actualRPM: 2600, targetRPM: 2800,
+                                               minRPM: 1400, maxRPM: 5600)],
+                         onBattery: true, batteryOverride: true, reason: .ai, aiIntent: .rising)
+    a.appliedPercents = [40, 55]
+    a.loopInterval = 3
+    a.controlFault = true
+    a.baseTargetPercent = 55
+    a.safetyFloorPercent = 78
+    a.curveTargetPercent = 41
+    a.learningRecently = true
+    a.learnedPoints = 7
+    a.learnedSamples = 210
+    a.targetUnreachable = true
+    a.powerWatts = 33
+    a.nightOverride = true
+    a.envTemp = 27.5
+    a.aiTargetEffective = 74
+    a.palmComp = 1.5
+    a.learnEnvelopeGap = 0.4
+    a.calibrating = true
+    a.thermalModelUsable = true
+    a.thermalModelB = 1.2
+    a.thermalModelSamples = 312
+    a.daemonVersion = "4.2.9 (100)"
+    a.decisionTrace = DecisionTrace(target: 74, temp: 70, error: -4, learned: 40,
+                                    idle: false, hysteresisHold: true, guardSeconds: 3)
+    a.hardwareProfile = HardwareProfile(
+        modelID: "Mac14,10", chipName: "Apple M2 Pro", osVersion: "26.1", fanCount: 2,
+        sensorCounts: .init(cpu: 3, gpu: 1, nand: 2, batt: 3, palm: 1, heatsink: 4, other: 9),
+        hasPowerKey: true, collectedAt: Date(timeIntervalSince1970: 1_690_000_000))
+    var b = DaemonStatus(cpuTemp: 45, gpuTemp: 33, mode: .curve, appliedPercent: 12,
+                         fans: [FanStatusEntry(id: 1, actualRPM: 3000, targetRPM: 3100,
+                                               minRPM: 1500, maxRPM: 5800)],
+                         onBattery: false, batteryOverride: false, reason: .curve, aiIntent: nil)
+    b.appliedPercents = [12]
+    // 不参与摘要的键，每条都要有理由（新增理由必须显式写在这里）
+    // 每条都必须是"为什么它不该触发写盘"的机制理由，不是"还没来得及加"
+    let summaryFree: Set<String> = [
+        "timestamp",          // 心跳本身：陈旧判定靠它，纳入等于每拍强写
+        "cpuTemp", "gpuTemp", // sensors 的派生别名，不是旋钮（解码后仍以 sensors 为准）
+        "loopInterval",       // 自适应间隔每拍都可能变，纳入会把写盘节流打穿
+        "appliedPercent",     // 被 appliedPercents 遮蔽的标量别名：pctStr 只取一份，
+                              // 单风扇旧路径（appliedPercents=nil）时走 else 分支，仍被看见
+        "learnedSamples",     // 每个稳态样本都 +1，纳入等于学习期每拍强写；
+                              // 展示用的 learnedPoints/learningRecently 已在摘要里
+        "decisionTrace",      // 含 temp/error 等每拍量，纳入等于每拍强写（纯展示透镜）
+        "hardwareProfile",    // 启动即定；唯一会变的 fanCount 翻正那一拍 reason/输出必变，
+                              // 摘要已被别的字段带动
+        "thermalModelUsable", "thermalModelB", "thermalModelSamples",
+                              // 模型参数每拍漂移，纳入等于每拍强写；诊断字段容许 ≤10s 陈旧
+    ]
+    let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+    let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+    func dict(_ s: DaemonStatus) -> [String: Any]? {
+        guard let d = try? enc.encode(s) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+    }
+    guard let ad = dict(a), let bd = dict(b) else {
+        expect(false, "前提：A/B 都能编码成 JSON 字典（门自身失效必须判红）")
+        return
+    }
+    let baseSummary = statusChangeSummary(a)
+    let keys = Array(Set(ad.keys).union(Set(bd.keys))).sorted()
+    var tested = 0
+    var missed: [String] = []
+    for key in keys {
+        if summaryFree.contains(key) { continue }
+        let av = ad[key] as? NSObject
+        let bv = bd[key] as? NSObject
+        if av == bv {
+            missed.append("\(key)（A/B 取值相同，未真正差分）")
+            continue
+        }
+        var mutated = ad
+        if let bv { mutated[key] = bv } else { mutated.removeValue(forKey: key) }
+        guard let data = try? JSONSerialization.data(withJSONObject: mutated),
+              let decoded = try? dec.decode(DaemonStatus.self, from: data) else {
+            missed.append("\(key)（改后解码失败，差分没跑成）")
+            continue
+        }
+        tested += 1
+        if statusChangeSummary(decoded) == baseSummary { missed.append(key) }
+    }
+    expectEqual(keys.count, 34, "status.json 顶层键数=34（新增字段必须在本门或 summaryFree 里表态）")
+    expectEqual(tested, 23, "实际被差分的键数=23（= 34 键 − 11 条有理由的豁免；对不上即有人改名单）")
+    expect(missed.isEmpty, "字段变了摘要就得变（否则那一拍不落盘）；漏网：" + missed.joined(separator: ", "))
+}
+
 func testPartialFanLoss() {
     group("多风扇部分读失败(R43)")
 

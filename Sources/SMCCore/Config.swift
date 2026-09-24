@@ -1289,6 +1289,10 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
     let faultStr = s.controlFault == true ? "FAULT" : "ok"
     let faultReasonStr = s.faultReason?.rawValue ?? "-"
     let curveStr = s.curveTargetPercent.map { String(r($0)) } ?? "-"
+    // R46：安全托底与"覆盖前的基础目标"必须进变化感知——App 的「安全托底」胶囊靠它们，
+    // 此前它们翻转时若恰好没有别的字段同拍变化，那一拍不落盘，胶囊最长陈旧 10s（心跳）。
+    let baseStr = s.baseTargetPercent.map { String(r($0)) } ?? "-"
+    let floorStr = s.safetyFloorPercent.map { String(r($0)) } ?? "-"
     let unreachStr = s.targetUnreachable == true ? "UNREACH" : "ok"
     let learnStr = (s.learningRecently == true ? "L" : "-") + ":\(s.learnedPoints ?? 0)"
     let powerStr = s.powerWatts.map { String(r($0)) } ?? "-"
@@ -1322,6 +1326,8 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
         faultStr,
         faultReasonStr,
         curveStr,
+        baseStr,
+        floorStr,
         unreachStr,
         learnStr,
         powerStr,
