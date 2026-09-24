@@ -479,7 +479,7 @@ private func twoFanController(_ a: FanEnvelope, _ b: FanEnvelope) -> FanControll
 
 // 每拍喂给 FanFeedbackHealth：坏扇恒 0 且不爬升（真停转），其余扇瞬时跟到命令值
 private func drivePair(_ fc: FanController, states: [FanState], pct: Double, beats: Int,
-                       badID: Int?) -> (everFaulted: Bool, faultedAtBeat: Int, everHighTarget: Bool) {
+                       badID: Int?, lagFrac: Double = 0) -> (everFaulted: Bool, faultedAtBeat: Int, everHighTarget: Bool) {
     var fb = FanFeedbackHealth()
     var commanded: [Int: Double] = [:]
     var ever = false
@@ -491,7 +491,9 @@ private func drivePair(_ fc: FanController, states: [FanState], pct: Double, bea
         for st in states {
             let target = commanded[st.id] ?? 0
             if target > st.minRPM + 150 { sawHigh = true }
-            let actual = (badID == st.id) ? 0.0 : target
+            // 坏扇恒 0（真停转）；其余扇带 lagFrac 的滞后跟随——喂"恰好等于 target"会让
+            // "零误报"那条断言恒真（差值永远 0，判据碰不到），故按滞后容差的边界给独立值
+            let actual = (badID == st.id) ? 0.0 : target * (1 - lagFrac)
             fed.append(FanState(id: st.id, actualRPM: actual, minRPM: st.minRPM,
                                 maxRPM: st.maxRPM, targetRPM: target))
         }
@@ -525,10 +527,15 @@ func testTwoFanShapes() {
         expectEqual(states.count, 2, "\(name) 前提：两把风扇都可读")
         shapeChecks += 1
         // ① 映射契约：0%→min、100%→max、阶梯单调不减、且不越出量程
-        let lo = fc.rpm(forPercent: 0, state: states[0])
-        let hi = fc.rpm(forPercent: 100, state: states[0])
-        if abs(lo - a.minRPM) > 1e-9 || abs(hi - a.maxRPM) > 1e-9 {
-            mappingBad.append("\(name) fan0 0%/100% → \(lo)/\(hi)，应为 \(a.minRPM)/\(a.maxRPM)")
+        let envs = [a, b]
+        for st in states {
+            let e = envs[st.id]
+            let lo = fc.rpm(forPercent: 0, state: st)
+            let hi = fc.rpm(forPercent: 100, state: st)
+            if abs(lo - e.minRPM) > 1e-9 || abs(hi - e.maxRPM) > 1e-9 {
+                mappingBad.append("\(name) fan\(st.id) 0%/100% → \(lo)/\(hi)，应为 \(e.minRPM)/\(e.maxRPM)")
+            }
+            shapeChecks += 1
         }
         var prev = [-1.0, -1.0]
         for pct in ladder {
@@ -545,12 +552,14 @@ func testTwoFanShapes() {
             shapeChecks += 1
         }
         // ② 两把都跟随 → 一拍都不许判故障（假 controlFault 会交还、停学习）
-        let healthy = drivePair(fc, states: states, pct: 100, beats: 30, badID: nil)
+        // 30% 滞后在容差 max(300, target×0.35) 之内 → 今天不判故障；
+        // 谁把容差收紧到 30% 以下，这条就红（恒真断言的替代：可失效的断言）
+        let healthy = drivePair(fc, states: states, pct: 100, beats: 30, badID: nil, lagFrac: 0.3)
         if !healthy.everHighTarget {
             mappingBad.append("\(name) 满目标下没有一把过判据门槛（本组的判据没被触发到）")
         }
         if healthy.everFaulted {
-            falseFaults.append("\(name) 两把都跟随时第 \(healthy.faultedAtBeat) 拍误报闭环故障")
+            falseFaults.append("\(name) 两把都在容差内跟随时第 \(healthy.faultedAtBeat) 拍误报闭环故障")
         }
         shapeChecks += 1
         // ③ 其中一把真停转 → 必须判故障，且另一把健康不得把它顶掉（两个下标都试）
@@ -568,9 +577,9 @@ func testTwoFanShapes() {
     // 就是自摆的假绿门（删一档形状时两边同时变小，门永远是绿的）
     expectEqual(pairs.count, 4, "形状对恒为 4（真机实测/窄量程/高底噪/等量程）")
     expectEqual(ladder.count, 6, "百分比阶梯恒为 6 档")
-    expectEqual(shapeChecks, 40, "遍历数=4×(前提1+阶梯6+健康1+两序停转2)，缺跑即红")
+    expectEqual(shapeChecks, 48, "遍历数=4×(前提1+端点2+阶梯6+健康1+两序停转2)，缺跑即红")
     expect(mappingBad.isEmpty, "percent→RPM 映射契约全形状成立：\(mappingBad.prefix(3).joined(separator: " | "))")
     expect(falseFaults.isEmpty, "双风扇都跟随时零误报：\(falseFaults.joined(separator: " | "))")
-    expect(missedFaults.isEmpty, "一把真停转必被判故障（健康那把不顶掉）：\(missedFaults.joined(separator: " | "))")
+    expect(missedFaults.isEmpty, "一把真停转必被判故障（每把都要被评到，不得只评第一把）：\(missedFaults.joined(separator: " | "))")
     expect(slowFaults.isEmpty, "停转捕获 ≤8 拍：\(slowFaults.joined(separator: " | "))")
 }
