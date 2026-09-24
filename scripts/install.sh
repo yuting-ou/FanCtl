@@ -39,6 +39,28 @@ if [[ $EUID -ne 0 && "${FANCTL_TEST_DIR_TRUST:-}" == "1" ]]; then
     exit $?
 fi
 
+# R40 App 落点谓词。动因是实测，不是推测：`/Applications` 是 `root:admin drwxrwxr-x`
+# 且**无 sticky**（任何 admin 组成员随时可删改其中的条目），而 BSD 工具对
+# "目标是符号链接"的处理并不一致——实测（macOS 27 / cmd 行工具）：
+#   cp -R src dst   dst 是指向目录的符号链接 ⇒ **跟随**，src 被拷进链接指向的目录
+#   install src dst ⇒ 不跟随（先 unlink 再新建 inode，见 upgrade.sh 里同一注释）
+#   chown -R（默认）/ xattr -dr ⇒ 不跟随命令行的符号链接
+#   rm -rf path ⇒ 不跟随；但 `rm -rf path/`（**带尾斜杠**）跟随并把目标树删光
+# 所以 root 只要照着路径 `cp -R` 一个可被换成链接的位置，就会把一棵 root 属主的目录树
+# 写进攻击者选的路径；而随后的 `chown -R` 又不会把它交还给用户（不跟随 = 静默什么也没做）。
+# 判据：目标不存在（要新建）放行；存在则必须是**真实目录且不是符号链接**。
+fanctl_app_target_ok() {
+    local p="$1"
+    [[ -L "$p" ]] && return 1                       # 含断链：一律拒绝
+    [[ -e "$p" ]] || return 0                       # 不存在：允许新建
+    [[ -d "$p" ]]                                   # 只允许覆盖真实目录
+}
+# FANCTL_TEST_APP_TARGET=1（仅非 root 生效）：对 $1 求谓词后退出（0=可用落点，1=拒绝）。
+if [[ $EUID -ne 0 && "${FANCTL_TEST_APP_TARGET:-}" == "1" ]]; then
+    fanctl_app_target_ok "${1:-}"
+    exit $?
+fi
+
 if [[ $EUID -ne 0 ]]; then
     echo "请用 sudo 运行: sudo ./scripts/install.sh"
     exit 1
@@ -60,6 +82,16 @@ SUPPORT="/Library/Application Support/FanCtl"
 
 if [[ ! -f "$DIST/fanctld" || ! -d "$DIST/FanCtl.app" ]]; then
     echo "未找到构建产物，请先运行 ./scripts/build.sh"
+    exit 1
+fi
+
+# R40 预检放在**动手之前**：此刻还没 bootout 旧服务，拒绝安装 = 系统原样不动（风扇仍由
+# 旧 daemon 或系统调度接管），不会把人留在"daemon 已停、App 未装"的中间态。
+if ! fanctl_app_target_ok "/Applications/清风.app"; then
+    echo "❌ 拒绝安装：/Applications/清风.app 不是真实目录（符号链接或异类文件）。" >&2
+    echo "   root 的 \`cp -R\` 会跟随这种落点把 bundle 写进链接指向的目录（实测），" >&2
+    echo "   随后的 \`chown -R\` 又不跟随，等于把 root 属主的树留在他处。" >&2
+    echo "   先看一眼是什么：ls -lOd /Applications/清风.app ；确认后可安全删除该条目再重装。" >&2
     exit 1
 fi
 
@@ -161,6 +193,15 @@ pkill -x FanCtl 2>/dev/null || true
 sleep 1
 rm -rf "/Applications/清风.app" /Applications/FanCtl.app
 cp -R "$DIST/FanCtl.app" "/Applications/清风.app"
+# R40 复验：预检与 cp 之间存在可被并发替换的窗口（/Applications 无 sticky，admin 组随时
+# 能删改其中的条目）——这一步只能"把撞上的那次变成看得见的失败"，不声称把窗口关死。
+# 撞上时的状态是"daemon 已装好且已 bootstrap、App 未就位"：风扇仍受控，不碰任何红线。
+if [[ -L "/Applications/清风.app" || ! -d "/Applications/清风.app/Contents/MacOS" ]]; then
+    echo "❌ 拷贝后 App 落点不对（被并发换成符号链接，或 bundle 结构不完整）——已中止。" >&2
+    echo "   daemon 此刻已装好并在跑（风扇受控），只有 App 未就位：" >&2
+    echo "   删掉 /Applications/清风.app 这个条目后重跑 sudo ./scripts/install.sh" >&2
+    exit 1
+fi
 # R33：与 upgrade.sh 对齐——未公证 bundle + quarantine = Gatekeeper 拦首次打开
 xattr -dr com.apple.quarantine "/Applications/清风.app" 2>/dev/null || true
 # 把 App bundle 属主改回实际登录用户（非 root）：此后仅改 UI 时可用 ./scripts/deploy.sh 免密替换，

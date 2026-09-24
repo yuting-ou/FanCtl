@@ -46,6 +46,22 @@ if [[ $EUID -ne 0 && "${FANCTL_TEST_DIR_TRUST:-}" == "1" ]]; then
     exit $?
 fi
 
+# R40 App 落点谓词（与 install.sh 同源同语义，实测依据见 install.sh 的注释块）：
+# BSD `cp -R src dst` 会**跟随**指向目录的 dst 符号链接（实测），而 `/Applications` 是
+# root:admin 组可写、无 sticky——落点被换成链接时，root 会把 bundle 写进链接指向的目录，
+# 而随后的 `chown -R`（默认不跟随，实测）不会把树交还给用户。判据：不存在放行；
+# 存在则必须"真实目录且非符号链接"。
+fanctl_app_target_ok() {
+    local p="$1"
+    [[ -L "$p" ]] && return 1                       # 含断链：一律拒绝
+    [[ -e "$p" ]] || return 0                       # 不存在：允许新建
+    [[ -d "$p" ]]                                   # 只允许覆盖真实目录
+}
+if [[ $EUID -ne 0 && "${FANCTL_TEST_APP_TARGET:-}" == "1" ]]; then
+    fanctl_app_target_ok "${1:-}"
+    exit $?
+fi
+
 # 无 root 回归钩子（仅非 root 生效）：跳过 EUID 检查，只跑下方授权前门禁
 # （暂存完整性 / tag 比对 / 四哈希复核 / marker 符号链接）后退出 0，绝不触碰
 # launchctl 与文件系统安装路径。scripts/test-root-scripts.sh 靠它锁 P1-A/P1-B/P2/marker。
@@ -127,6 +143,16 @@ if [[ $GATES_ONLY -eq 0 ]]; then
         echo "拒绝升级：${LIBEXEC} 或其父目录不是 root 拥有且组/其他不可写" >&2
         exit 5
     fi
+    # R40：App 落点预检也放在 bootout 之前——不合规就原状退出，绝不停掉服务再报错。
+    # 与目录信任门同理：这一支只在真实升级里跑（gates-only 模式跳过），所以无 root 侧的
+    # 覆盖由两半拼成——谓词本身用 FANCTL_TEST_APP_TARGET 钩子行为测，"它排在 bootout 之前"
+    # 由 test-root-scripts.sh 的顺序门锁住。缺任何一半都会假绿。
+    if ! fanctl_app_target_ok "/Applications/清风.app"; then
+        echo "拒绝升级：/Applications/清风.app 不是真实目录（符号链接或异类文件）——" >&2
+        echo "   root 的 cp -R 会跟随它把 bundle 写进链接指向的目录。请删掉该条目后重试" >&2
+        echo "   （daemon 与风扇调度此刻完全没动：ls -lOd /Applications/清风.app）" >&2
+        exit 5
+    fi
 fi
 
 if [[ $GATES_ONLY -eq 1 ]]; then
@@ -194,6 +220,16 @@ pkill -x FanCtl 2>/dev/null || true
 sleep 1
 rm -rf "/Applications/清风.app" /Applications/FanCtl.app
 cp -R "$STAGING/FanCtl.app" "/Applications/清风.app"
+# R40 复验（实测依据见 install.sh 的注释块）：预检与 cp 之间的窗口只能缩短、不能关死
+#（/Applications 无 sticky，admin 组随时可换条目）。撞上时如实中止，且**不写重启标记**——
+# 那一刻的状态是"daemon 已升级并 bootstrap（风扇受控、红线照旧）、App 未就位"，
+# 把一个可能落在别处的 root 属主 bundle 交给 watcher 去 open 是不可接受的。
+if [[ -L "/Applications/清风.app" || ! -d "/Applications/清风.app/Contents/MacOS" ]]; then
+    echo "❌ 拷贝后 App 落点不对（被并发换成符号链接，或 bundle 结构不完整）——中止，未写重启标记。" >&2
+    echo "   守护进程已升级并在跑（风扇调速正常），只有菜单栏 App 未就位：" >&2
+    echo "   删掉 /Applications/清风.app 这个条目后重跑安装（或 sudo ./scripts/install.sh）" >&2
+    exit 6
+fi
 # 清掉下载链路的 quarantine 属性（App 经 URL 下载解压自带 com.apple.quarantine，
 # 不清则 Gatekeeper 对未公证 bundle 拦截；本 bundle 由用户主动授权安装，与右键打开等价）
 xattr -dr com.apple.quarantine "/Applications/清风.app" 2>/dev/null || true

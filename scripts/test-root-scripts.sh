@@ -319,6 +319,141 @@ else
     bad "App 落点常量（${SW_APP:-读空}）与 install/upgrade 字面量不一致"
 fi
 
+echo "== 装机/卸载落点的跟随面（R40，依据是实测不是文档）=="
+# BSD 命令行工具对"路径本身是符号链接"的处理互不一致，而 root 装机/卸载正好全用它们。
+# 这里把语义钉成回归断言：哪天 macOS 改了语义，这些门会红——那时该重估的是守卫本身，
+# 而不是留着三道永远用不上的检查（R37 的 mtime 乌龙就是"没测就采信"的代价）。
+S="$TMP/r40"; mkdir -p "$S/srcA" "$S/v1/inner" "$S/v2/inner" "$S/v4/inner"
+printf 'A\n' > "$S/srcA/leaf"; : > "$S/v1/inner/keep"; : > "$S/v2/inner/keep"
+: > "$S/v4/inner/keep"
+ln -s "$S/v1" "$S/l1"; ln -s "$S/v2" "$S/l2"; ln -s "$S/v4" "$S/l4"
+cp -R "$S/srcA" "$S/l1"
+if [[ -e "$S/v1/srcA/leaf" ]]; then
+    ok "实测：cp -R 跟随指向目录的符号链接落点 ⇒ root 会写进链接指向处（守卫动因）"
+else
+    bad "cp -R 语义与实测记录不符（不再跟随）——R40 守卫的前提要重估，别把门留着当装饰"
+fi
+printf 'B\n' > "$S/payload"
+: > "$S/plain2"; ln -s "$S/plain2" "$S/l2b"
+install -m 644 "$S/payload" "$S/l2b"
+if [[ ! -L "$S/l2b" && "$(cat "$S/plain2")" == "B" ]]; then
+    bad "install 跟随了符号链接（victim 被改写）——二进制落点必须补目录信任门"
+elif [[ -L "$S/l2b" ]]; then
+    bad "install 未替换符号链接（语义又变了）"
+else
+    ok "实测：install 不跟随，先 unlink 再新建 inode（故 /usr/local/bin 不构成 root 写入面）"
+fi
+# 观察量选择：把 victim 的组改成"我属于、但它现在不是"的那个组，跟随与否才可辨。
+# 本机（主组 staff + 属于 admin）与 CI runner 同形；只有一个组的机器上退化成"只验链接本体"，
+# 这里显式说明而不是悄悄放宽断言（R38 的 F9 教训：假绿比红更贵）。
+PRIM=$(id -gn); GRP_ALT=""
+for g in admin staff; do
+    if id -nG | grep -qw "$g" && [[ "$g" != "$PRIM" ]]; then GRP_ALT="$g"; break; fi
+done
+mkdir -p "$S/v3a/inner" "$S/v3b/inner"; : > "$S/v3a/inner/keep"; : > "$S/v3b/inner/keep"
+ln -s "$S/v3a" "$S/l3"; ln -s "$S/v3b" "$S/l3h"
+if [[ -n "$GRP_ALT" ]]; then
+    chown -R "$(id -un):$GRP_ALT" "$S/l3" 2>/dev/null || true
+    LC_=$(stat -f "%Sg" "$S/l3"); VC=$(stat -f "%Sg" "$S/v3a/inner/keep")
+    chown -R -H "$(id -un):$GRP_ALT" "$S/l3h" 2>/dev/null || true
+    VL=$(stat -f "%Sg" "$S/v3b/inner/keep")
+    if [[ "$LC_" == "$GRP_ALT" && "$VC" != "$GRP_ALT" && "$VL" == "$GRP_ALT" ]]; then
+        ok "实测：chown -R 默认不跟随（链接本体被改、目标树未动；-H 对照组跟随生效）"
+    else
+        bad "chown 跟随语义与实测记录不符（链接=${LC_} 默认后目标=${VC} -H 后目标=${VL}，期望 ${GRP_ALT} 只出现在链接与 -H 之后）"
+    fi
+else
+    chown -R "$(id -un):$PRIM" "$S/l3" 2>/dev/null || true
+    ok "chown 跟随面降级验证：本机只有主组 ${PRIM}，无法构造可辨组，退化为「不报错」检查"
+fi
+xattr -w com.apple.quarantine "0081;0000;T;0" "$S/v4/inner/keep" 2>/dev/null || true
+xattr -dr com.apple.quarantine "$S/l4" 2>/dev/null || true
+if xattr -p com.apple.quarantine "$S/v4/inner/keep" >/dev/null 2>&1; then
+    xattr -dr com.apple.quarantine "$S/v4" 2>/dev/null || true
+    if ! xattr -p com.apple.quarantine "$S/v4/inner/keep" >/dev/null 2>&1; then
+        ok "实测：xattr -dr 不跟随命令行符号链接（直路删除正对照生效）"
+    else
+        bad "xattr 两条路径都删不掉标记——测试夹具失效，别把它当语义结论"
+    fi
+else
+    bad "xattr -dr 跟随了符号链接（root 可被诱导清掉他处 quarantine = Gatekeeper 绕过面）"
+fi
+rm -rf "$S/l1"
+[[ -d "$S/v1" ]] && ok "实测：rm -rf 符号链接（无尾斜杠）只删链接，目标树完好" \
+                 || bad "rm -rf 无尾斜杠竟跟着删了目标树"
+mkdir -p "$S/v5/inner"; : > "$S/v5/inner/keep"; ln -s "$S/v5" "$S/l5"
+rm -rf "$S/l5/"
+if [[ ! -d "$S/v5" ]]; then
+    ok "实测：rm -rf 链接**带尾斜杠**会跟随并毁掉目标树 ⇒ root 脚本禁止对用户可写路径加尾斜杠"
+else
+    bad "rm -rf 尾斜杠未跟随（语义已变）——下方那条反模式扫描门可以放宽，但要先确认"
+fi
+
+# --- 谓词行为（走脚本自己的测试钩子，不在此手抄一份判断）---
+probe_app() {   # $1=脚本 $2=路径 ⇒ 0 放行 / 非 0 拒绝
+    FANCTL_TEST_APP_TARGET=1 bash "$1" "$2" >/dev/null 2>&1
+}
+app_cases() {   # 五个情形的期望：absent/真目录放行；符号链接/断链/普通文件拒绝
+    local f="$1" d="$2" rc=0
+    probe_app "$f" "$d/absent"            || rc=1
+    probe_app "$f" "$d/realdir"           || rc=1
+    probe_app "$f" "$d/linkdir"           && rc=1
+    probe_app "$f" "$d/linkdangling"      && rc=1
+    probe_app "$f" "$d/plainfile"         && rc=1
+    return $rc
+}
+mkdir -p "$S/p/realdir"; ln -s "$S/p/realdir" "$S/p/linkdir"
+ln -s "$S/p/nowhere" "$S/p/linkdangling"; : > "$S/p/plainfile"
+for f in "$INSTALL" "$UPGRADE"; do
+    if app_cases "$f" "$S/p"; then
+        ok "$(basename "$f")：App 落点谓词五情形全对（放行 absent/真目录，拒绝 链接/断链/文件）"
+    else
+        bad "$(basename "$f")：App 落点谓词判错（见 fanctl_app_target_ok）"
+    fi
+done
+
+# --- 卸载删除前缀：问不到家目录时绝不 rm -rf ---
+UN_OK=$(FANCTL_TEST_CACHE_TARGET=1 bash "$ROOT/scripts/uninstall.sh" "$S/p/realdir" 2>/dev/null || true)
+REJ=0
+for bad_home in "" "/" "relative/path" "$S/p/notexist"; do
+    FANCTL_TEST_CACHE_TARGET=1 bash "$ROOT/scripts/uninstall.sh" "$bad_home" >/dev/null 2>&1 || REJ=$((REJ+1))
+done
+if [[ "$UN_OK" == "$S/p/realdir/Library/Caches/com.fanctl.app" && "$REJ" -eq 4 ]]; then
+    ok "卸载删除前缀：真实家目录拼出正确路径，空/根/相对/不存在四种一律拒绝"
+else
+    bad "卸载删除前缀失守（放行值=[$UN_OK]，拒绝数=$REJ/4）——root 可能拿空前缀去 rm -rf"
+fi
+
+# 卸载侧接线：谓词有牙 ≠ 调用点真的用它（钩子在调用点之前就 exit，只测谓词会留假绿）
+UNSCR="$ROOT/scripts/uninstall.sh"
+if grep -q 'rm -rf "\$CACHE_TARGET"' "$UNSCR" \
+   && ! grep -qF 'rm -rf "$CONSOLE_HOME/Library' "$UNSCR"; then
+    ok "uninstall.sh：缓存删除走守卫值，旧的「直接拼 \${CONSOLE_HOME}」形态已不存在"
+else
+    bad "uninstall.sh：缓存删除又回到未守卫的拼接（空前缀会让 root 在文件系统根下 rm -rf）"
+fi
+
+# --- 接线与顺序（谓词有牙 ≠ 装机路径真的用上它）---
+for f in "$INSTALL" "$UPGRADE"; do
+    def_line=$(grep -n '^fanctl_app_target_ok() {' "$f" | head -1 | cut -d: -f1 || true)
+    pre_line=$(grep -n 'fanctl_app_target_ok "/Applications' "$f" | head -1 | cut -d: -f1 || true)
+    boot_line=$(grep -n 'launchctl bootout' "$f" | head -1 | cut -d: -f1 || true)
+    cp_line=$(grep -n '^cp -R .*"/Applications/清风.app"$' "$f" | head -1 | cut -d: -f1 || true)
+    post_line=$(grep -n '拷贝后 App 落点不对' "$f" | head -1 | cut -d: -f1 || true)
+    if [[ -n "$def_line" && -n "$pre_line" && "$def_line" -lt "$pre_line" \
+          && -n "$boot_line" && "$pre_line" -lt "$boot_line" \
+          && -n "$cp_line" && -n "$post_line" && "$cp_line" -lt "$post_line" ]]; then
+        ok "$(basename "$f")：预检在 bootout 之前、复验在 cp -R 之后（拒绝时不会把人留在半装状态）"
+    else
+        bad "$(basename "$f")：App 落点守卫接线错序（定义:${def_line} 预检:${pre_line} bootout:${boot_line} cp:${cp_line} 复验:${post_line}）"
+    fi
+done
+if grep -qE 'rm -rf "[^"]*/" *(2>|$)' "$INSTALL" "$UPGRADE" "$ROOT/scripts/uninstall.sh"; then
+    bad "root 脚本里出现「rm -rf 带尾斜杠」形态（会跟随符号链接并毁掉目标树）"
+else
+    ok "三个 root 脚本无「rm -rf 带尾斜杠」形态"
+fi
+
 echo "== CI workflow 内联 shell 语法预检（R39 发版链自炸）=="
 # v4.2.4 第一次 tag 触发就被自己新加的门炸红。真机现象：`command substitution: line 10:
 # syntax error near unexpected token '|'`——**`bash -n` 对这段写法返回 0**（命令替换的内容

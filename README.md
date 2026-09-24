@@ -251,6 +251,12 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
   自报版本）限长 64 且只收可打印 ASCII，可疑值整体替换成固定标记；其余（上次退出原因、SMC 错误串）
   压平换行、控制字符转空格、超 200 字符截断并如实报原长。动因：App bundle 被 chown 给登录用户，
   它的 plist 字符串不可信，而 `ESC[2J` 在"把报告粘进终端"时会被真解释。
+- **装机落点跟随面（4.2.5）**：`/Applications` 是 `root:admin` 组可写且无 sticky，任何本地
+  管理员用户都能随时把 `清风.app` 条目换成指向别处的符号链接；实测 BSD `cp -R src dst` 会
+  **跟随**这种 dst（root 于是把 bundle 写进链接指向的目录），而 `chown -R` 默认不跟随（不会
+  把树交还用户）。`install.sh`/`upgrade.sh` 现在在停服务之前预检落点、`cp -R` 之后复验，
+  不合规就拒绝且系统原样不动；`uninstall.sh` 补了删除前缀守卫（问不到家目录就跳过，绝不拿
+  可能为空的前缀 `rm -rf`）。五个命令行工具对符号链接的实际语义被钉成回归门（62 条）。
 - **daemon 自报版本（4.2.3）**：`status.json` 增 `daemonVersion`（编译期常量注入，进变化
   感知摘要，升级后第一拍即刷新），诊断包"装机"小节改为三件套：App plist 版本 + daemon
   自报版本 + 二进制落盘时间；解码侧限长 64、只收可打印 ASCII（该文件在同组可写目录）。

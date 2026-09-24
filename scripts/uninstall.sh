@@ -2,6 +2,21 @@
 # 卸载 FanCtl（需要 sudo）：停止服务、恢复系统风扇调度、删除所有安装文件
 set -euo pipefail
 
+# R40 删除前缀守卫。本脚本以 root 跑，而"登录用户的家目录"是**问出来的**
+# （`sudo -u $USER sh -c 'echo $HOME'`）：问失败时它是空串，拼出来的删除目标就退化成
+# `/Library/Caches/com.fanctl.app`——即 root 在文件系统根下删东西。宁可留一个缓存目录
+# 让卸载报告看得见，也不拿可能为空/为 / 的前缀去 `rm -rf`。
+fanctl_cache_target() {
+    local h="$1"
+    [[ -n "$h" && "$h" == /* && "$h" != "/" && -d "$h" ]] || return 1
+    printf '%s/Library/Caches/com.fanctl.app\n' "$h"
+}
+# FANCTL_TEST_CACHE_TARGET=1（仅非 root 生效）：对 $1 求"将删路径"，可信则打印并退 0，
+# 否则退 1。放在 EUID 检查之前，好让 scripts/test-root-scripts.sh 无 root 真跑这段。
+if [[ $EUID -ne 0 && "${FANCTL_TEST_CACHE_TARGET:-}" == "1" ]]; then
+    if fanctl_cache_target "${1:-}"; then exit 0; else exit 1; fi
+fi
+
 if [[ $EUID -ne 0 ]]; then
     echo "请用 sudo 运行: sudo ./scripts/uninstall.sh"
     exit 1
@@ -56,8 +71,15 @@ CONSOLE_USER=$(stat -f%Su /dev/console)
 sudo -u "$CONSOLE_USER" defaults delete com.fanctl.app 2>/dev/null || true
 
 echo "==> 清理用户缓存（趋势历史）..."
-CONSOLE_HOME=$(sudo -u "$CONSOLE_USER" sh -c 'echo $HOME')
-rm -rf "$CONSOLE_HOME/Library/Caches/com.fanctl.app"
+CONSOLE_HOME=$(sudo -u "$CONSOLE_USER" sh -c 'echo $HOME' 2>/dev/null || true)
+# R40：删除目标必须过 fanctl_cache_target（绝对路径、非空、非 /、目录真实存在）才允许 rm。
+# 问不到就跳过并在收尾提示里留下手动路径——留一个没人要的缓存目录，比拿空前缀去 rm -rf 好。
+if CACHE_TARGET=$(fanctl_cache_target "$CONSOLE_HOME"); then
+    rm -rf "$CACHE_TARGET"
+else
+    echo "⚠️ 拿不到可信的登录用户家目录（CONSOLE_USER=${CONSOLE_USER:-<空>}，HOME=${CONSOLE_HOME:-<空>}）" >&2
+    echo "   已跳过用户缓存清理；要手动清的话是 ~/Library/Caches/com.fanctl.app" >&2
+fi
 
 echo ""
 echo "✅ 已完全卸载，风扇已交还 macOS 系统调度。"
