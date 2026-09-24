@@ -42,6 +42,9 @@ func testUIAnimationGuards() {
     } else {
         expect(false, "找不到 FanSpinner 调用点（门空转即红）")
     }
+    let mon = source("Sources/FanCtlApp/MonitorViews.swift") ?? ""
+    expect(!mon.contains("contentTransition(.numericText()).animation(.snappy, value: p.cpu)"),
+           "逐项功耗百分比不挂数字转场（每拍抖动的量，与 RPM 同族）")
     expectEqual(gauge.components(separatedBy: "frame(width: fanSpinnerSide").count - 1, 1,
                 "图标边长只在 FanSpinner 内部出现一次")
     expect(model.contains("self.fans = fanStates"), "fans 仍被赋值（门不是靠删功能变绿）")

@@ -214,10 +214,13 @@ struct ProcessHogView: View {
                             .font(.system(size: 10, weight: .medium, design: .rounded))
                             .lineLimit(1).truncationMode(.tail)
                         Spacer(minLength: 4)
+                        // R49：CPU 分项功耗占比是每拍抖动的量（与 RPM 同族），
+                        // 不做 numericText 转场、不做补间——只在整数位变化时演一次
+                        // 缩放的观感就是"数字自己在跳/缩"。等宽数字保证布局不抖。
                         Text("\(Int(p.cpu))%")
                             .font(MonitorStyle.numeral(10))
                             .foregroundStyle(Self.cpuColor(p.cpu))
-                            .contentTransition(.numericText()).animation(.snappy, value: p.cpu)
+                            // R49：见上，逐项功耗百分比不再挂数字转场
                         GlowBar(fraction: min(p.cpu / 100, 1), color: Self.cpuColor(p.cpu))
                             .frame(width: 44, height: 5)
                     }
