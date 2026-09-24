@@ -107,6 +107,13 @@ jobs:
           # /usr/local/libexec（root:wheel 755），App 只 exec、不携带副本
           cp scripts/upgrade.sh "$STAGE/"
           zip -qr "FanCtl-v${VERSION}.zip" "$STAGE"
+          # R40：发行物自证 mode。仓库里掉一次可执行位时，4876 断言 + 62 条门禁 + 构建 + CI
+          # 全绿，只有真用户敲 `sudo ./install.sh` 才会 permission denied——所以这道门只看
+          # 即将上传的那份 zip（unzip -Z 第一列就是打包进去的权限），不看工作树。
+          for _e in install uninstall upgrade; do
+            unzip -Z "FanCtl-v${VERSION}.zip" "${STAGE}/${_e}.sh" | grep -q '^.rwxr-xr-x' || { echo "::error::zip 里的 ${_e}.sh 不可执行，首装会 permission denied"; exit 1; }
+          done
+          echo "zip 内三个 root 脚本均可执行 ✓"
           echo "ASSET=FanCtl-v${VERSION}.zip" >> "$GITHUB_ENV"
 
       - name: 发布 GitHub Release（gh CLI，第一方工具）
