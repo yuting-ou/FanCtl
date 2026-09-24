@@ -764,11 +764,12 @@ final class FanModel: ObservableObject {
         let rpmOld = fans.map { Int($0.actualRPM / 10) }
         let rpmNew = fanStates.map { Int($0.actualRPM / 10) }
         if rpmNew != rpmOld {
-            if panelVisible {
-                withAnimation(.snappy(duration: 0.25)) { self.fans = fanStates }
-            } else {
-                self.fans = fanStates
-            }
+            // R47：不再把 fans 的赋值包在 withAnimation 里。daemon 每 1–3s 推一次转速，
+            // 而 transaction 级动画会把该子树里**所有**在同一个事务里变化的可动画量补间
+            // （数字转场 numericText 带缩放、行内几何），于是每一拍都能看见"数字/图标
+            // 自己滚一下、缩一下"；numericText 在高频刷新下还有字形位图内存膨胀的前科
+            // （本项目历史记录）。数值平滑交给各视图自己的 .animation(value:) 定点做。
+            self.fans = fanStates
         }
 
         // v3.4.1：lastRefresh 仅面板可见时更新（唯一消费者 FanRow.now 已随 DoD-5c

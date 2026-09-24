@@ -169,8 +169,10 @@ struct FanRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
+            // R47：尺寸只有一个来源（FanSpinner 自己定）。原先这里还套了一层
+            // .frame(width: 22)，与内部写死的 24×24 相互矛盾——两条尺寸主张并存时
+            // 渲染边长取决于父级提案，就是"图标看着看着自己变小"的来源之一。
             FanSpinner(rpm: fan.actualRPM, tint: .blue)
-                .frame(width: 22)
 
             VStack(spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -181,8 +183,9 @@ struct FanRow: View {
                         .font(.system(size: 17, weight: .semibold, design: .rounded))
                         .monospacedDigit()
                         .foregroundStyle(.primary)
-                        .contentTransition(.numericText())
-                        .animation(.snappy, value: fan.actualRPM)
+                        // R47：去掉 numericText 数字转场（每 1–3s 就换一次值，转场的
+                        // 缩放/滚动被看成"自己缩小"，且高频下字形位图会长）。等宽数字
+                        // 已保证布局不抖，直接换值即可。
                         .shadow(color: .blue.opacity(0.25), radius: 3, y: 0.5)
                     Text("RPM")
                         .font(.caption2)
@@ -191,8 +194,7 @@ struct FanRow: View {
                         .font(.caption2.monospacedDigit().weight(.medium))
                         .foregroundStyle(.blue.opacity(0.85))
                         .frame(width: 30, alignment: .trailing)
-                        .contentTransition(.numericText())
-                        .animation(.snappy, value: loadFraction)
+                        // R47：同上，百分比也逐拍变——不做数字转场、不做补间
                 }
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
@@ -248,6 +250,9 @@ struct FanRow: View {
 // v2.6.2 视觉回归：自绘螺旋桨叶片方案被用户评为"抽象"，恢复经典风扇符号原地旋转。
 // 转速变化时从 presentation layer 取当前相位作动画起点（无缝变速）；
 // RPM < 50 时移除动画并半透明，表达"风扇停转"。
+/// 风扇图标边长的唯一真值（调用方不得再另给 frame；TestsCore 有静态门守着）
+let fanSpinnerSide: CGFloat = 24
+
 struct FanSpinner: View {
     let rpm: Double
     let tint: Color
@@ -261,7 +266,7 @@ struct FanSpinner: View {
                 .opacity(rpm < 50 ? 0.3 : 1.0)
         } else {
             SpinnerNSView(rpm: rpm, tint: tint)
-                .frame(width: 24, height: 24)
+                .frame(width: fanSpinnerSide, height: fanSpinnerSide)
         }
     }
 }

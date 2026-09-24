@@ -163,6 +163,15 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+### R47（4.2.12(103)）：UI 授权后的第一轮——"风扇会自己缩小"从源码定位到两处根因
+- **作者放行 UI/动画**（此前宪法把"观感"列为不自主改动区），点名"风扇会自己缩小的动画，你自己检查一遍"。GUI 在本会话不可呈现（R21 已定性为 OS 27 对合成点击的呈现限制），所以**全部证据来自源码**，不靠猜。
+- **根因①（事务级动画）**：`FanModel.swift:765-772` 把每拍的 `self.fans = fanStates` 包在 `withAnimation(.snappy(duration: 0.25))` 里（面板可见时）。SwiftUI 的 transaction 动画会补间**该子树里同一事务内变化的所有可动画量**——不是只有我想动的那一个。修法：赋值不再包动画。
+- **根因②（每拍数字转场）**：`GaugeViews.swift:184-185/194-195` 给转速与百分比挂了 `.contentTransition(.numericText())` + `.animation(value:)`。RPM 是真实传感器抖动量（每拍都可能跨 10 RPM 分档），numericText 转场带缩放/滚动 → 每 1–3s 演一次"数字自己缩一下"，正对作者描述；且本项目已记录过 numericText 高频刷新导致字形位图内存膨胀。修法：这两个每拍数字改等宽直读（保留 `monospacedDigit`，布局不抖），**能量条的 `.animation(value: loadFraction)` 保留**（那是真正需要平滑的连续信号）。温度卡与其余数字转场一律不动（作者钉过的观感）。
+- **根因③（尺寸两处各写一套）**：`FanSpinner` 内部 `.frame(width: 24, height: 24)`，`FanRow` 又套 `.frame(width: 22)` 且不给高——两条主张不一致时渲染边长取决于父级提案，是"图标变小"的另一类来源。收成单一常量 `fanSpinnerSide`，调用方不再自选尺寸。
+- **有牙**：新增 group「UI 动画静态门(R47)」（源码级，读不到文件判红，不做空气门）：FanRow 之后 numericText 出现次数必须为 0、`fanSpinnerSide` 只在内部出现一次、`Fans` 赋值不再被 `withAnimation` 包住但仍在赋值（防"靠删功能变绿"）。**本轮不再自跑变异**（门的三条判据都是"计数=0/1"型，删功能会同时把 `self.fans = fanStates` 那条存在性断言打红，门自身可失效）——记为待验：下一轮补一次"把 numericText 加回去/把 withAnimation 包回来"的变异。
+- **交付**：VERSION `4.2.11(102)` → **`4.2.12(103)`**；`./scripts/build.sh` 全链路含 App 编译通过；root 脚本门禁 65 条（其中 `- 4.2.12：` 要点门在本轮先红过一次——它就是在防"说明与 tag 不同源"）；断言/组数见 README 与 main.swift。
+- **残余**：① 观感最终裁定仍要作者真机看一眼（我这边面板开不出来）；② 门是源码级，不能证明"补间真的没了"，只能证明那三种写法没回来；③ 其余 numericText 用途（温度/功耗/百分比卡）未逐条审计。
+
 ### R46（4.2.10(101)）：把"新字段必须进变化感知"从口头纪律变成通用门——一上手抓到 9 个
 - **选题（杠杆第一档：指标会不会说谎）**：`statusChangeSummary` 决定"这一拍要不要落盘"，漏一个字段就是那个字段最长陈旧 10s（心跳上限）。这条纪律被违反过三次——`learnEnvelopeGap`(v3.6)、`calibrating`(4.0 审查)、`daemonVersion`(R38)——每次都是**事后手写一条断言**补洞。改成通用门：造 A（字段填满）/B（取值全不同）两份合法 status，逐 JSON 键把 A 换成 B、重新解码，**摘要必须变**。
 - **门第一次跑就报 9 个键**，逐条人工判定（不默认自己是错的也不默认门是对的）：**2 个真漏** → 修：`baseTargetPercent` / `safetyFloorPercent` 加进摘要（`Config.swift` statusChangeSummary 的 `baseStr/floorStr` 两段，走同一个 `r()` 钳位）——它们驱动 App 的「安全托底」胶囊，翻转时不落盘就是让用户看旧状态。**7 个刻意豁免** → 写理由进名单：`appliedPercent`（被 `appliedPercents` 遮蔽的别名；单风扇旧路径走 else 分支仍被看见）、`learnedSamples`（每个稳态样本 +1，纳入=学习期每拍强写）、`decisionTrace`（含 temp/error 每拍量）、`hardwareProfile`（唯一会变的 fanCount 翻正那一拍 reason/输出必变，摘要已被带动）、`thermalModelUsable/B/Samples`（模型每拍漂移，诊断字段容许 ≤10s 陈旧）。

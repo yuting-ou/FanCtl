@@ -7,6 +7,48 @@ import SMCCore
 // MARK: - 曲线插值
 
 
+// R47：UI 动画静态门（源码级）。观感类断言跑不了 CI 里的 GUI，但"谁在每拍被补间"
+// 是可以在源码里钉死的事实。三条都在防"复现一次就再也说不清"的回归：
+//   1) FanRow 的每拍数字不得再用 numericText（高频数字转场=看着缩小 + 字形位图膨胀）；
+//   2) fans 赋值不得再被 withAnimation 包住（事务级动画把整棵子树拖进补间）；
+//   3) 风扇图标尺寸只有一个来源（fanSpinnerSide），调用方不得再套 frame。
+func testUIAnimationGuards() {
+    group("UI 动画静态门(R47)")
+    // TestsCore.swift 在 <root>/Sources/fanctltests/ → 上溯三层才是仓库根
+    let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    func source(_ rel: String) -> String? {
+        guard let s = try? String(contentsOfFile: root.appendingPathComponent(rel).path,
+                                  encoding: .utf8) else {
+            expect(false, "静态门读不到 \(rel)（源码缺席必须判红，不得空转）")
+            return nil
+        }
+        return s
+    }
+    guard let gauge = source("Sources/FanCtlApp/GaugeViews.swift"),
+          let model = source("Sources/FanCtlApp/FanModel.swift") else { return }
+    let row = String(gauge[gauge.range(of: "struct FanRow: View")!.lowerBound...])
+    // 次数用 components 数，不用 filter（filter 在 String 上逐 Character 迭代，$0.contains 不存在）
+    expectEqual(row.components(separatedBy: ".contentTransition(.numericText())").count - 1, 0,
+                "FanRow 之后 numericText 出现次数=0（每拍数字不做转场）")
+    expect(row.contains("FanSpinner(rpm: fan.actualRPM, tint: .blue)"),
+           "FanRow 用带默认 tint 的构造器（调用方不再自选尺寸）")
+    // 精确判"调用点下一行"，不判整段文件（.frame(width: 22) 在别的视图里是合法尺寸）
+    let glines = row.split(separator: "\n").map(String.init)
+    if let i = glines.firstIndex(where: { $0.contains("FanSpinner(rpm:") }) {
+        let nxt = i + 1 < glines.count
+            ? glines[i + 1].trimmingCharacters(in: .whitespaces) : ""
+        expect(!nxt.hasPrefix(".frame("), "FanSpinner 调用点下一行不得再套 frame（尺寸单一来源）")
+    } else {
+        expect(false, "找不到 FanSpinner 调用点（门空转即红）")
+    }
+    expectEqual(gauge.components(separatedBy: "frame(width: fanSpinnerSide").count - 1, 1,
+                "图标边长只在 FanSpinner 内部出现一次")
+    expect(model.contains("self.fans = fanStates"), "fans 仍被赋值（门不是靠删功能变绿）")
+    expect(!model.contains("withAnimation(.snappy(duration: 0.25)) { self.fans ="),
+           "fans 赋值不包 withAnimation")
+}
+
 func testInterpolation() {
     group("插值")
     let bal = CurvePreset.balanced.points
