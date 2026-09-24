@@ -54,6 +54,39 @@ jobs:
           git diff --cached --quiet || git commit -m "CI: 更新断言数徽章 ($N)"
           git push
 
+      # R42：首装/卸载冒烟——"任何人机器上装得起来吗"此前只靠读代码推断。runner 是一台
+      # 干净的异机（无风扇 VM ⇒ 走 4.0 B1 的 passive 语义），装它一次就有实证。
+      # 只在 main 推送上跑，**绝不在 tag 触发的发版跑里执行**：这道步自己若不可靠，
+      # 代价是一次红的 main 推送，而不是一个发不出去的 Release（R39 的教训）。
+      - name: 首装与卸载冒烟（干净机器真装真卸，仅 main 推送）
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -o pipefail
+          read -r APP_VERSION BUILD_NUMBER < VERSION
+          # 目录信任门是生产语义，不是 CI 的环境抱怨：Homebrew 机器 /usr/local 常归登录用户，
+          # 冒烟前按 install.sh 自己要求的样子摆正，再验"合规机器上装得起来"
+          sudo mkdir -p /usr/local/libexec
+          sudo chown root:wheel /usr/local /usr/local/libexec
+          sudo chmod 755 /usr/local /usr/local/libexec
+          # 本作业的 "Release 构建" 只直编两个非 UI 目标、不组装 dist/（dist/ 与 App bundle
+          # 在 tag 才跑的 release 作业里生成）→ 冒烟必须自己走一遍 build.sh。顺带这也是
+          # "干净机器上从零构建出发能不能装起来"的第一公里实证。
+          ./scripts/build.sh
+          sudo ./scripts/install.sh
+          test -x /usr/local/libexec/fanctld || { echo "::error::fanctld 未就位"; exit 1; }
+          /usr/local/libexec/fanctld -v | grep -qF "$APP_VERSION ($BUILD_NUMBER)"
+          test -d "/Applications/清风.app/Contents/MacOS"
+          test -x /usr/local/bin/fanprobe
+          sleep 5
+          launchctl print system/com.fanctl.daemon >/dev/null
+          # 诊断包小节数是固定的 19 行（缺数据也必须出声），干净机器首装后必须能整段产出
+          [ "$(sudo /usr/local/bin/fanprobe --report | wc -l | tr -d ' ')" = "19" ]
+          sudo /usr/local/libexec/fanctl-uninstall.sh || sudo ./scripts/uninstall.sh
+          test ! -e /usr/local/libexec/fanctld
+          test ! -e /Library/LaunchDaemons/com.fanctl.daemon.plist
+          test ! -e "/Applications/清风.app"
+          echo "首装→运行→卸载 全链在干净机器上通过"
+
       - name: Release 构建
         # R23（P2）：daemon/工具用非 UI 目标直编。App 目标（FanCtlApp）单独一步编译校验
         # （R23 续轮 P3-3：不跑、只编——恢复 PR 阶段对 SelfUpgradeService/FanModel/视图的
