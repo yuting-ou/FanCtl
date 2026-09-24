@@ -119,9 +119,10 @@ jobs:
           # 发版号必须严格大于已发布的最大 tag（R39 审查轮）：其余几道门比的都是
           # "tag == VERSION == notes 里的号"，三处一起留旧号（改了代码没提号）时全绿——
           # 只有"新代码贴旧版本号"这条路径没人挡。gh 也拦不住删掉 Release 后重打同号。
+          # 整条管道必须写在**一行**里：`$( )` 内的换行是命令终止符，下一行以 `|` 开头
+          # 就是 syntax error near unexpected token `|`（v4.2.4 首次发版实测被自己炸红）。
           CUR_TAG="$GITHUB_REF_NAME"
-          PREV_TAG=$(git ls-remote --tags origin 2>/dev/null | sed 's@.*refs/tags/@@; s@\^{}$@@'
-            | grep -E '^v[0-9]' | awk -v t="$CUR_TAG" '$0 != t' | sort -V | tail -1)
+          PREV_TAG=$(git ls-remote --tags origin 2>/dev/null | sed 's@.*refs/tags/@@; s@\^{}$@@' | grep -E '^v[0-9]' | awk -v t="$CUR_TAG" '$0 != t' | sort -V | tail -1)
           if [[ -n "$PREV_TAG" ]] && [[ "$(printf '%s\n%s\n' "$PREV_TAG" "$CUR_TAG" | sort -V | head -1)" == "$CUR_TAG" ]]; then
             echo "::error::tag ${CUR_TAG} 不高于已发布的 ${PREV_TAG}（新代码贴旧版本号 = 同号不同码）"
             exit 1

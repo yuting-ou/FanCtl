@@ -319,6 +319,49 @@ else
     bad "App 落点常量（${SW_APP:-读空}）与 install/upgrade 字面量不一致"
 fi
 
+echo "== CI workflow 内联 shell 语法预检（R39 发版链自炸）=="
+# v4.2.4 第一次 tag 触发就被自己新加的门炸红。真机现象：`command substitution: line 10:
+# syntax error near unexpected token '|'`——**`bash -n` 对这段写法返回 0**（命令替换的内容
+# 要到执行时才解析），只有 CI 的 `bash -e` 才把它变成退出码。所以两道门都要：
+#   ① 静态禁"行首续行操作符"（`| && ||` 打头的一行）——本次事故的确切形状；
+#   ② 抽出 run 块跑 bash -n——兜 if/fi 失衡这类块级错（它兜不住 ①，故 ① 不可省）。
+WF="$ROOT/.github/workflows/ci.yml"
+BLOCKS="$TMP/ci-run-blocks.sh"
+# 抽取器按"块内容 = run: 缩进 +2"切行；heredoc 会让这个约定失效，先钉住前提
+if grep -qE '<<-?[[:space:]]*["(a-zA-Z]' "$WF"; then
+    bad "ci.yml 出现 heredoc：run 块抽取器会截断，先改抽取器再放行"
+else
+    ok "ci.yml 无 heredoc：run 块抽取前提成立"
+fi
+awk '
+    {
+        if (inblk) {
+            if ($0 ~ /^ *$/) { print ""; next }
+            if (match($0, /[^ ]/) - 1 > ind) { print substr($0, ind + 3); next }
+            inblk = 0
+        }
+        if ($0 ~ /^ *run: *\| *$/) { inblk = 1; ind = match($0, /[^ ]/) - 1 }
+    }
+' "$WF" > "$BLOCKS"
+NBLK=$(grep -cE '^[[:space:]]*run:[[:space:]]*\|[[:space:]]*$' "$WF" || true)
+if [[ "$NBLK" -ge 3 ]] && grep -q 'set -o pipefail' "$BLOCKS" && grep -q 'gh release create' "$BLOCKS"; then
+    ok "抽出 $NBLK 个 run 块（首块与发行块都在场，抽取器没掏空）"
+else
+    bad "run 块抽取异常：声明 $NBLK 个，抽取内容缺关键标记（抽取器失效 = 门会假绿）"
+fi
+# ① 行首续行操作符：$( ) 内换行 = 命令终止符，下一行以操作符开头即运行时语法错误
+if grep -nE '^[[:space:]]*(\|\||\||&&)[[:space:]]' "$BLOCKS" >"$TMP/leadops.txt" 2>/dev/null; then
+    bad "run 块里有行首续行操作符（bash -n 查不出，CI 上必炸）：$(tr '\n' ' ' < "$TMP/leadops.txt" | cut -c1-160)"
+else
+    ok "无行首续行操作符（管道续行一律写在行尾）"
+fi
+# ② 块级语法
+if bash -n "$BLOCKS" 2>"$BLOCKS.err"; then
+    ok "全部 run 块 bash -n 通过（块级语法）"
+else
+    bad "run 块语法错误：$(head -2 "$BLOCKS.err" | tr '\n' ' ')"
+fi
+
 echo "root 脚本门禁：$pass 通过 / $fail 失败"
 if [[ "$fail" -gt 0 ]]; then exit 1; fi
 exit 0
