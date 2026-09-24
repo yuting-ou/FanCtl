@@ -319,6 +319,36 @@ else
     bad "App 落点常量（${SW_APP:-读空}）与 install/upgrade 字面量不一致"
 fi
 
+echo "== 发行脚本可执行位（R40 事故：变异工具自己剥掉了它）=="
+# 本轮写在 /tmp 的 python 变异脚本用 shutil.copyfile 备份、shutil.move 还原——copyfile **不保留
+# mode**，于是 install/uninstall/upgrade 三个脚本在提交里从 100755 静默掉到 100644。后果不在本地
+# （本地还能 bash 起来），而在发行链：build.sh 用 cp 原样带进 zip、CI 从 git 记录复原 mode，
+# 于是首装用户按 README 敲 `sudo ./install.sh` 直接 permission denied。全部测试当时照样绿。
+SH_EXE_FAIL=""
+for f in install uninstall upgrade build deploy test-root-scripts; do
+    [[ -x "$ROOT/scripts/$f.sh" ]] || SH_EXE_FAIL="$SH_EXE_FAIL $f.sh(工作树)"
+done
+if [[ -z "$SH_EXE_FAIL" ]]; then
+    ok "六个 shell 入口在工作树里都可执行（cp 进 zip 才带得走 mode）"
+else
+    bad "缺可执行位：$SH_EXE_FAIL"
+fi
+if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
+    GITMODE_FAIL=""
+    for f in install uninstall upgrade build deploy test-root-scripts; do
+        m=$(git -C "$ROOT" ls-tree HEAD -- "scripts/$f.sh" | awk '{print $1}')
+        # 允许"还没提交"（ls-tree 空）时只查已入库的那些，避免把新加文件算成漏网
+        [[ -n "$m" && "$m" != "100755" ]] && GITMODE_FAIL="$GITMODE_FAIL $f.sh($m)"
+    done
+    if [[ -z "$GITMODE_FAIL" ]]; then
+        ok "git 记录里这些脚本的 mode 均为 100755（CI checkout 复原的就是它）"
+    else
+        bad "git 记录的 mode 不对：$GITMODE_FAIL —— chmod 之后要 commit，否则 runner 上仍是 644"
+    fi
+else
+    ok "非 git 环境（或无 HEAD），跳过 mode 入库检查"
+fi
+
 echo "== 装机/卸载落点的跟随面（R40，依据是实测不是文档）=="
 # BSD 命令行工具对"路径本身是符号链接"的处理互不一致，而 root 装机/卸载正好全用它们。
 # 这里把语义钉成回归断言：哪天 macOS 改了语义，这些门会红——那时该重估的是守卫本身，
