@@ -52,7 +52,20 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .github/badges/tests.json
           git diff --cached --quiet || git commit -m "CI: 更新断言数徽章 ($N)"
-          git push
+          # R48：徽章提交常与紧邻的人工推送相撞（non-fast-forward），旧写法一次相撞就把
+          # 整个作业判红——那红是 CI 自己撞车，不是代码回归。改为 fetch+rebase 重试 3 次，
+          # 仍失败才判红并留话。**绝不 --force**（徽章提交是纯追加，rebase 后必可快进）。
+          _pushed=0
+          for _try in 1 2 3; do
+            if git push; then _pushed=1; break; fi
+            git fetch -q origin
+            git rebase origin/main || git rebase --abort || true
+            sleep $((_try * 4))
+          done
+          if [ "$_pushed" != "1" ]; then
+            echo "::error::徽章提交重试 3 次仍推不上去（多半是 main 上有真冲突）——需要人工看"
+            exit 1
+          fi
 
       # R42：首装/卸载冒烟——"任何人机器上装得起来吗"此前只靠读代码推断。runner 是一台
       # 干净的异机（无风扇 VM ⇒ 走 4.0 B1 的 passive 语义），装它一次就有实证。
