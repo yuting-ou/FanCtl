@@ -7,9 +7,15 @@ set -euo pipefail
 # `/Library/Caches/com.fanctl.app`——即 root 在文件系统根下删东西。宁可留一个缓存目录
 # 让卸载报告看得见，也不拿可能为空/为 / 的前缀去 `rm -rf`。
 fanctl_cache_target() {
-    local h="$1"
-    [[ -n "$h" && "$h" == /* && "$h" != "/" && -d "$h" ]] || return 1
-    printf '%s/Library/Caches/com.fanctl.app\n' "$h"
+    local h="$1" real
+    [[ -n "$h" && "$h" == /* && "$h" != "/" ]] || return 1
+    # 归一化后再判：`/.` 与 `//` 都"不等于 /"却会解析到文件系统根，而 `-d` 还会跟随
+    # 符号链接——先 cd -P 拿真实路径，再要求它不是 /，否则 root 就在 / 下面删东西了
+    real=$(cd -P -- "$h" 2>/dev/null && pwd -P) || return 1
+    # bash 的 pwd -P 会保留 "//"（POSIX 允许两连斜杠有实现定义含义），所以还要
+    # 排掉"全是斜杠"和"只有一层"这两种前缀：前者等于在 / 下删，后者如 /Users
+    [[ -n "$real" && "$real" == /*/* && -n "${real//[\/]/}" ]] || return 1
+    printf '%s/Library/Caches/com.fanctl.app\n' "$real"
 }
 # FANCTL_TEST_CACHE_TARGET=1（仅非 root 生效）：对 $1 求"将删路径"，可信则打印并退 0，
 # 否则退 1。放在 EUID 检查之前，好让 scripts/test-root-scripts.sh 无 root 真跑这段。

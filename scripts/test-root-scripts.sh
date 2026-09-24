@@ -337,8 +337,8 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --verify HEAD >/de
     GITMODE_FAIL=""
     for f in install uninstall upgrade build deploy test-root-scripts; do
         m=$(git -C "$ROOT" ls-tree HEAD -- "scripts/$f.sh" | awk '{print $1}')
-        # 允许"还没提交"（ls-tree 空）时只查已入库的那些，避免把新加文件算成漏网
-        [[ -n "$m" && "$m" != "100755" ]] && GITMODE_FAIL="$GITMODE_FAIL $f.sh($m)"
+        # 查不到 = 还没入库（发行物里不会有它）；不是 100755 = CI checkout 出来不可执行
+        [[ "$m" != "100755" ]] && GITMODE_FAIL="$GITMODE_FAIL $f.sh(${m:-未入库})"
     done
     if [[ -z "$GITMODE_FAIL" ]]; then
         ok "git 记录里这些脚本的 mode 均为 100755（CI checkout 复原的就是它）"
@@ -423,35 +423,33 @@ fi
 probe_app() {   # $1=脚本 $2=路径 ⇒ 0 放行 / 非 0 拒绝
     FANCTL_TEST_APP_TARGET=1 bash "$1" "$2" >/dev/null 2>&1
 }
-app_cases() {   # 五个情形的期望：absent/真目录放行；符号链接/断链/普通文件拒绝
-    local f="$1" d="$2" rc=0
-    probe_app "$f" "$d/absent"            || rc=1
-    probe_app "$f" "$d/realdir"           || rc=1
-    probe_app "$f" "$d/linkdir"           && rc=1
-    probe_app "$f" "$d/linkdangling"      && rc=1
-    probe_app "$f" "$d/plainfile"         && rc=1
-    return $rc
-}
 mkdir -p "$S/p/realdir"; ln -s "$S/p/realdir" "$S/p/linkdir"
 ln -s "$S/p/nowhere" "$S/p/linkdangling"; : > "$S/p/plainfile"
 for f in "$INSTALL" "$UPGRADE"; do
-    if app_cases "$f" "$S/p"; then
-        ok "$(basename "$f")：App 落点谓词五情形全对（放行 absent/真目录，拒绝 链接/断链/文件）"
+    # linkdir/ 与 linkdir// 是 R40 审查轮抓到的形状：`test -L path/` 会跟随，
+    # 不剥尾斜杠就说"可用落点"——正是守卫要拦的那种
+    if probe_app "$f" "$S/p/absent" && probe_app "$f" "$S/p/realdir" \
+       && ! probe_app "$f" "$S/p/linkdir" && ! probe_app "$f" "$S/p/linkdir/" \
+       && ! probe_app "$f" "$S/p/linkdir//" && ! probe_app "$f" "$S/p/linkdangling" \
+       && ! probe_app "$f" "$S/p/plainfile" && ! probe_app "$f" "/"; then
+        ok "$(basename "$f")：App 落点谓词七情形全对（放行 absent/真目录；拒 链接/链接带尾斜杠/双尾斜杠/断链/文件/根）"
     else
         bad "$(basename "$f")：App 落点谓词判错（见 fanctl_app_target_ok）"
     fi
 done
 
 # --- 卸载删除前缀：问不到家目录时绝不 rm -rf ---
+# 守卫会 cd -P 归一化，所以期望值也按归一化后的真实路径比（/tmp → /private/tmp 这类）
+REAL_HOME=$(cd "$S/p/realdir" && pwd -P)
 UN_OK=$(FANCTL_TEST_CACHE_TARGET=1 bash "$ROOT/scripts/uninstall.sh" "$S/p/realdir" 2>/dev/null || true)
 REJ=0
-for bad_home in "" "/" "relative/path" "$S/p/notexist"; do
+for bad_home in "" "/" "relative/path" "$S/p/notexist" "/." "//" "/Users"; do
     FANCTL_TEST_CACHE_TARGET=1 bash "$ROOT/scripts/uninstall.sh" "$bad_home" >/dev/null 2>&1 || REJ=$((REJ+1))
 done
-if [[ "$UN_OK" == "$S/p/realdir/Library/Caches/com.fanctl.app" && "$REJ" -eq 4 ]]; then
-    ok "卸载删除前缀：真实家目录拼出正确路径，空/根/相对/不存在四种一律拒绝"
+if [[ "$UN_OK" == "$REAL_HOME/Library/Caches/com.fanctl.app" && "$REJ" -eq 7 ]]; then
+    ok "卸载删除前缀：真实家目录拼出归一化路径，7 种坏前缀（空/根/相对/不存在/. 写法/双斜杠/单层）一律拒绝"
 else
-    bad "卸载删除前缀失守（放行值=[$UN_OK]，拒绝数=$REJ/4）——root 可能拿空前缀去 rm -rf"
+    bad "卸载删除前缀失守（放行值=[$UN_OK] 期望 [$REAL_HOME/Library/Caches/com.fanctl.app]，拒绝数=$REJ/7）"
 fi
 
 # 卸载侧接线：谓词有牙 ≠ 调用点真的用它（钩子在调用点之前就 exit，只测谓词会留假绿）
@@ -466,19 +464,22 @@ fi
 # --- 接线与顺序（谓词有牙 ≠ 装机路径真的用上它）---
 for f in "$INSTALL" "$UPGRADE"; do
     def_line=$(grep -n '^fanctl_app_target_ok() {' "$f" | head -1 | cut -d: -f1 || true)
-    pre_line=$(grep -n 'fanctl_app_target_ok "/Applications' "$f" | head -1 | cut -d: -f1 || true)
+    pre_line=$(grep -nE '^[[:space:]]*if ! fanctl_app_target_ok "/Applications' "$f" | head -1 | cut -d: -f1 || true)
     boot_line=$(grep -n 'launchctl bootout' "$f" | head -1 | cut -d: -f1 || true)
     cp_line=$(grep -n '^cp -R .*"/Applications/清风.app"$' "$f" | head -1 | cut -d: -f1 || true)
+    # ERE 里裸 [[ 会被当字符集起点，必须转义（不转义=永不匹配=这道门假红，比假绿好但仍是废门）
+    guard_line=$(grep -nE '^[[:space:]]*if[[:space:]]+\[\[[[:space:]]+-L[[:space:]]+"/Applications/清风\.app"' "$f" | head -1 | cut -d: -f1 || true)
     post_line=$(grep -n '拷贝后 App 落点不对' "$f" | head -1 | cut -d: -f1 || true)
     if [[ -n "$def_line" && -n "$pre_line" && "$def_line" -lt "$pre_line" \
           && -n "$boot_line" && "$pre_line" -lt "$boot_line" \
-          && -n "$cp_line" && -n "$post_line" && "$cp_line" -lt "$post_line" ]]; then
+          && -n "$cp_line" && -n "$post_line" && "$cp_line" -lt "$post_line" \
+          && -n "$guard_line" && "$cp_line" -lt "$guard_line" && "$guard_line" -lt "$post_line" ]]; then
         ok "$(basename "$f")：预检在 bootout 之前、复验在 cp -R 之后（拒绝时不会把人留在半装状态）"
     else
-        bad "$(basename "$f")：App 落点守卫接线错序（定义:${def_line} 预检:${pre_line} bootout:${boot_line} cp:${cp_line} 复验:${post_line}）"
+        bad "$(basename "$f")：App 落点守卫接线错序/失效（定义:${def_line} 预检:${pre_line} bootout:${boot_line} cp:${cp_line} 复验判定:${guard_line} 复验文案:${post_line}）"
     fi
 done
-if grep -qE 'rm -rf "[^"]*/" *(2>|$)' "$INSTALL" "$UPGRADE" "$ROOT/scripts/uninstall.sh"; then
+if grep -qE 'rm -rf "[^"]*/"' "$INSTALL" "$UPGRADE" "$ROOT/scripts/uninstall.sh"; then
     bad "root 脚本里出现「rm -rf 带尾斜杠」形态（会跟随符号链接并毁掉目标树）"
 else
     ok "三个 root 脚本无「rm -rf 带尾斜杠」形态"
