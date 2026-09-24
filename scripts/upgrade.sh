@@ -227,7 +227,7 @@ cp -R "$STAGING/FanCtl.app" "/Applications/清风.app"
 if [[ -L "/Applications/清风.app" || ! -d "/Applications/清风.app/Contents/MacOS" ]]; then
     echo "❌ 拷贝后 App 落点不对（被并发换成符号链接，或 bundle 结构不完整）——中止，未写重启标记。" >&2
     echo "   守护进程已升级并在跑（风扇调速正常），只有菜单栏 App 未就位：" >&2
-    echo "   删掉 /Applications/清风.app 这个条目后重跑安装（或 sudo ./scripts/install.sh）" >&2
+    echo "   删掉 /Applications/清风.app 这个条目后再走一次升级，或用发行包里的 install.sh" >&2
     exit 6
 fi
 # 清掉下载链路的 quarantine 属性（App 经 URL 下载解压自带 com.apple.quarantine，

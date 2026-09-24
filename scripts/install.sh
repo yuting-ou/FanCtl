@@ -62,7 +62,9 @@ if [[ $EUID -ne 0 && "${FANCTL_TEST_APP_TARGET:-}" == "1" ]]; then
 fi
 
 if [[ $EUID -ne 0 ]]; then
-    echo "请用 sudo 运行: sudo ./scripts/install.sh"
+    # R40：提示里不能写死仓库布局——发行 zip 里 install.sh 与脚本同级，
+    # 按 README 敲 `sudo ./scripts/install.sh` 会指向一个不存在的目录。$0 在两种布局下都对。
+    echo "请用 sudo 运行: sudo $0"
     exit 1
 fi
 
@@ -182,7 +184,7 @@ chmod 644 "$PLIST"
 # App 未装，处于"调速无人管"中间态且无提示。显式报错并给恢复路径。
 if ! launchctl bootstrap system "$PLIST"; then
     echo "❌ LaunchDaemon 注册失败（plist=${PLIST}）。风扇调速当前无人接管——" >&2
-    echo "   排查后重跑 sudo ./scripts/install.sh；或先手动恢复系统调度：launchctl kickstart -k system/com.fanctl.daemon" >&2
+    echo "   排查后重跑 sudo $0；或先手动恢复系统调度：launchctl kickstart -k system/com.fanctl.daemon" >&2
     exit 1
 fi
 
@@ -199,7 +201,7 @@ cp -R "$DIST/FanCtl.app" "/Applications/清风.app"
 if [[ -L "/Applications/清风.app" || ! -d "/Applications/清风.app/Contents/MacOS" ]]; then
     echo "❌ 拷贝后 App 落点不对（被并发换成符号链接，或 bundle 结构不完整）——已中止。" >&2
     echo "   daemon 此刻已装好并在跑（风扇受控），只有 App 未就位：" >&2
-    echo "   删掉 /Applications/清风.app 这个条目后重跑 sudo ./scripts/install.sh" >&2
+    echo "   删掉 /Applications/清风.app 这个条目后重跑 sudo $0" >&2
     exit 1
 fi
 # R33：与 upgrade.sh 对齐——未公证 bundle + quarantine = Gatekeeper 拦首次打开

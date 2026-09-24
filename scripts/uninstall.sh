@@ -18,7 +18,7 @@ if [[ $EUID -ne 0 && "${FANCTL_TEST_CACHE_TARGET:-}" == "1" ]]; then
 fi
 
 if [[ $EUID -ne 0 ]]; then
-    echo "请用 sudo 运行: sudo ./scripts/uninstall.sh"
+    echo "请用 sudo 运行: sudo $0"
     exit 1
 fi
 

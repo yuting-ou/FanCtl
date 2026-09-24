@@ -484,6 +484,14 @@ else
     ok "三个 root 脚本无「rm -rf 带尾斜杠」形态"
 fi
 
+# 用户可见提示不能写死仓库布局：Release zip 里脚本与 App 同级，指 "./scripts/install.sh"
+# 等于给了一个不存在的命令（本轮实测发行包时撞见）
+if grep -nE 'echo .*scripts/(install|uninstall|upgrade)\.sh' "$INSTALL" "$UPGRADE" "$ROOT/scripts/uninstall.sh" >"$TMP/layout_hints.txt" 2>/dev/null; then
+    bad "提示里写死了仓库布局路径（zip 布局下不存在 scripts/）：$(head -1 "$TMP/layout_hints.txt" | cut -c1-120)"
+else
+    ok "用户可见提示一律按调用路径回显（两种布局都成立）"
+fi
+
 echo "== CI workflow 内联 shell 语法预检（R39 发版链自炸）=="
 # v4.2.4 第一次 tag 触发就被自己新加的门炸红。真机现象：`command substitution: line 10:
 # syntax error near unexpected token '|'`——**`bash -n` 对这段写法返回 0**（命令替换的内容
