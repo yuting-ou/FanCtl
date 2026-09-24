@@ -455,3 +455,122 @@ func testFamilySeeded() {
     expect(worseOvershoot.isEmpty,
            "播种后过冲无 >1.5° 劣化成员（\(worseOvershoot.prefix(3))）")
 }
+
+// MARK: - R44：双风扇 + 不对称量程的形状扫描（真机形状，不是假想敌）
+// 动因：v4.2.8 发行件在本机跑 `fanprobe --report` 印出「数量 2 · fan0 量程 1350–5349 ·
+// fan1 量程 1458–5777」——作者的日常机器就是双风扇且两把量程不对称，而族扫描此前恒用
+// 单风扇 `FanState(minRPM: 1200, maxRPM: 5349)`（本文件 runFamilyMember），既不是真机
+// 任一把，也没扫过"两把一起受控、其中一把不跟"的形状。percent→RPM 映射与反馈健康度
+// 的每台风扇判据（高目标门 `target > min+150`、滞后门、R24c 的"全部高目标扇都跟上"）
+// 都跟量程有关，所以按形状对扫描。锁四条：映射契约、健康对不误报、坏扇不被健康扇顶掉、
+// 网格完整性（删档即红）。
+struct FanEnvelope { let minRPM: Double; let maxRPM: Double }
+
+private func twoFanController(_ a: FanEnvelope, _ b: FanEnvelope) -> FanController? {
+    let smc = MockSMC()
+    smc.set("FNum", 2, type: "ui8 ")
+    smc.set("F0Md", 1, type: "ui8 ")
+    smc.set("F1Md", 1, type: "ui8 ")
+    smc.set("F0Ac", a.minRPM); smc.set("F0Mn", a.minRPM); smc.set("F0Mx", a.maxRPM); smc.set("F0Tg", a.minRPM)
+    smc.set("F1Ac", b.minRPM); smc.set("F1Mn", b.minRPM); smc.set("F1Mx", b.maxRPM); smc.set("F1Tg", b.minRPM)
+    guard let fc = try? FanController(smc: smc) else { return nil }
+    return fc
+}
+
+// 每拍喂给 FanFeedbackHealth：坏扇恒 0 且不爬升（真停转），其余扇瞬时跟到命令值
+private func drivePair(_ fc: FanController, states: [FanState], pct: Double, beats: Int,
+                       badID: Int?) -> (everFaulted: Bool, faultedAtBeat: Int, everHighTarget: Bool) {
+    var fb = FanFeedbackHealth()
+    var commanded: [Int: Double] = [:]
+    var ever = false
+    var at = -1
+    var sawHigh = false
+    for beat in 1...beats {
+        for st in states { commanded[st.id] = fc.rpm(forPercent: pct, state: st) }
+        var fed: [FanState] = []
+        for st in states {
+            let target = commanded[st.id] ?? 0
+            if target > st.minRPM + 150 { sawHigh = true }
+            let actual = (badID == st.id) ? 0.0 : target
+            fed.append(FanState(id: st.id, actualRPM: actual, minRPM: st.minRPM,
+                                maxRPM: st.maxRPM, targetRPM: target))
+        }
+        fb.record(states: fed, commandedRPM: commanded, risingGrace: true)
+        if fb.faulted && !ever { ever = true; at = beat }
+    }
+    return (ever, at, sawHigh)
+}
+
+func testTwoFanShapes() {
+    group("双风扇不对称量程扫描(R44)")
+    let pairs: [(String, FanEnvelope, FanEnvelope)] = [
+        ("本机实测", FanEnvelope(minRPM: 1350, maxRPM: 5349), FanEnvelope(minRPM: 1458, maxRPM: 5777)),
+        ("窄量程+宽量程", FanEnvelope(minRPM: 2500, maxRPM: 2800), FanEnvelope(minRPM: 1200, maxRPM: 6000)),
+        ("高底噪+可停转", FanEnvelope(minRPM: 4000, maxRPM: 6000), FanEnvelope(minRPM: 0, maxRPM: 5000)),
+        ("等量程", FanEnvelope(minRPM: 1200, maxRPM: 5349), FanEnvelope(minRPM: 1200, maxRPM: 5349)),
+    ]
+    let ladder = [0.0, 10.0, 25.0, 50.0, 80.0, 100.0]
+    var mappingBad: [String] = []
+    var falseFaults: [String] = []
+    var missedFaults: [String] = []
+    var slowFaults: [String] = []
+    var shapeChecks = 0
+
+    for (name, a, b) in pairs {
+        guard let fc = twoFanController(a, b) else {
+            expect(false, "\(name) FanController 构造失败（前提塌了，后面全是空断言）")
+            continue
+        }
+        let states = fc.allStates()
+        expectEqual(states.count, 2, "\(name) 前提：两把风扇都可读")
+        shapeChecks += 1
+        // ① 映射契约：0%→min、100%→max、阶梯单调不减、且不越出量程
+        let lo = fc.rpm(forPercent: 0, state: states[0])
+        let hi = fc.rpm(forPercent: 100, state: states[0])
+        if abs(lo - a.minRPM) > 1e-9 || abs(hi - a.maxRPM) > 1e-9 {
+            mappingBad.append("\(name) fan0 0%/100% → \(lo)/\(hi)，应为 \(a.minRPM)/\(a.maxRPM)")
+        }
+        var prev = [-1.0, -1.0]
+        for pct in ladder {
+            for st in states {
+                let v = fc.rpm(forPercent: pct, state: st)
+                if v < st.minRPM - 1e-9 || v > st.maxRPM + 1e-9 {
+                    mappingBad.append("\(name) fan\(st.id) \(pct)% → \(v) 越出量程 \(st.minRPM)–\(st.maxRPM)")
+                }
+                if v < prev[st.id] - 1e-9 {
+                    mappingBad.append("\(name) fan\(st.id) 阶梯非单调：\(prev[st.id]) → \(v)")
+                }
+                prev[st.id] = v
+            }
+            shapeChecks += 1
+        }
+        // ② 两把都跟随 → 一拍都不许判故障（假 controlFault 会交还、停学习）
+        let healthy = drivePair(fc, states: states, pct: 100, beats: 30, badID: nil)
+        if !healthy.everHighTarget {
+            mappingBad.append("\(name) 满目标下没有一把过判据门槛（本组的判据没被触发到）")
+        }
+        if healthy.everFaulted {
+            falseFaults.append("\(name) 两把都跟随时第 \(healthy.faultedAtBeat) 拍误报闭环故障")
+        }
+        shapeChecks += 1
+        // ③ 其中一把真停转 → 必须判故障，且另一把健康不得把它顶掉（两个下标都试）
+        for bad in [0, 1] {
+            let r = drivePair(fc, states: states, pct: 100, beats: 12, badID: bad)
+            if !r.everFaulted {
+                missedFaults.append("\(name) fan\(bad) 恒停转而另一把健康 → 未判故障（保护漏了）")
+            } else if r.faultedAtBeat > 8 {
+                slowFaults.append("\(name) fan\(bad) 停转到判故障用了 \(r.faultedAtBeat) 拍（>8 拍）")
+            }
+            shapeChecks += 1
+        }
+    }
+    // 三条结构量都用字面量，不引用 pairs.count/ladder.count——期望值跟着被测集合一起缩
+    // 就是自摆的假绿门（删一档形状时两边同时变小，门永远是绿的）
+    expectEqual(pairs.count, 4, "形状对恒为 4（真机实测/窄量程/高底噪/等量程）")
+    expectEqual(ladder.count, 6, "百分比阶梯恒为 6 档")
+    expectEqual(shapeChecks, 40, "遍历数=4×(前提1+阶梯6+健康1+两序停转2)，缺跑即红")
+    expect(mappingBad.isEmpty, "percent→RPM 映射契约全形状成立：\(mappingBad.prefix(3).joined(separator: " | "))")
+    expect(falseFaults.isEmpty, "双风扇都跟随时零误报：\(falseFaults.joined(separator: " | "))")
+    expect(missedFaults.isEmpty, "一把真停转必被判故障（健康那把不顶掉）：\(missedFaults.joined(separator: " | "))")
+    expect(slowFaults.isEmpty, "停转捕获 ≤8 拍：\(slowFaults.joined(separator: " | "))")
+}
