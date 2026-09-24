@@ -293,7 +293,7 @@ public enum DiagnosticReport {
             statsWhen = "无战报"
         }
         let wearLine: String = "磨损(\(statsWhen)): 调速 " + n(st?.speedChanges, "%.0f") + " 次"
-            + " · 速率 " + n(st?.speedChangesPerMinute, "%.2f") + " 次/采样分"
+            + " · 速率 " + n(st?.speedChangesPerMinute, "%.2f") + " " + DailyStats.wearRateUnit
             + " · 启停抑制 " + n(st?.aiCyclingGuards, "%.0f") + " 次"
         out.append(wearLine)
 

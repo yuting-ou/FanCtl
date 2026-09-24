@@ -885,8 +885,13 @@ public struct DailyStats: Codable {
         return s
     }
 
-    /// R29：调速次数折算到「次/分钟」（按受控秒）。绝对 speedChanges 随 loop 拍频
-    /// 放大（AI 期 1s 拍 vs 空闲 20s 拍不可直接比），磨损趋势应看本速率。
+    /// R29：调速次数折算到「次/分钟」。绝对 speedChanges 随 loop 拍频放大
+    /// （AI 期 1s 拍 vs 空闲 20s 拍不可直接比），磨损趋势应看本速率。
+    /// **分母是采样秒 `tempSeconds`（`StatsSampler` 每个有效温度样本累加），不是"受控秒"**：
+    /// 分子（受控动作数）与分母（采样时间）本就不同域，R40 审查记过一次"域不一致"，
+    /// 当时的处置是保留这个归一化但把单位说清——归一化的目的只是让不同拍频时段可比，
+    /// 不是声称"每分钟受控动作"。单位串只有一个来源：`DailyStats.wearRateUnit`。
+    public static let wearRateUnit = "次/采样分"
     public var speedChangesPerMinute: Double {
         let mins = tempSeconds / 60.0
         guard mins > 0.5, speedChanges.isFinite, tempSeconds.isFinite else { return 0 }

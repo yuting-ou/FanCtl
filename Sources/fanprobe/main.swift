@@ -131,8 +131,12 @@ do {
     // 今日战报摘要（调速次数 = |输出Δ|≥3% 的拍数，风扇寿命代理指标）
     if let s = ConfigStore.loadStats(readOnly: true), s.date == DailyStats.today(), s.tempCount > 0 {
         print("今日: 最高 \(String(format: "%.1f", s.maxTemp))°C · 调速 \(Int(s.speedChanges)) 次 · 启停抑制 \(Int(s.aiCyclingGuards)) 次\(s.overshootPeak >= 3 ? " · 过冲峰值 +\(Int(s.overshootPeak.rounded()))°" : "") · 静音/安静 \(Int(s.quietSeconds / 60)) 分钟")
-        print(String(format: "  磨损速率: %.2f 次/受控分（R29 口径；批次B门看趋势）",
-                     s.speedChangesPerMinute))
+        // R45：单位串必须与 SMCCore 同源（DailyStats.wearRateUnit）。此前这里写死了
+        // 一个错的口径名，而分母其实是采样秒（StatsSampler 对每个有效温度样本累加）——
+        // 同一个数两个 surface 各说一套，而它是批次 B 控制律延后裁决的读数。
+        // 注意：本文件不得再出现口径字面量，TestsCore 的静态接线门会判红。
+        print("  磨损速率: " + String(format: "%.2f", s.speedChangesPerMinute)
+              + " " + DailyStats.wearRateUnit + "（分母=采样秒 tempSeconds；批次B门看趋势）")
     }
     // R32：近 14 归档日磨损速率 + 今日实时（history 未必含今天；裁决看趋势不看单日）
     // 防御性按日期排序：archiveDay 维护有序，但损坏/手改 JSON 不保证；suffix(14) 才是「最近」
@@ -147,7 +151,7 @@ do {
             rows.append((s.date, s.speedChanges, s.speedChangesPerMinute))
         }
         if !rows.isEmpty {
-            print("磨损速率趋势（次/受控分，R29 口径；近 14 归档日 + 今日实时）:")
+            print("磨损速率趋势（" + DailyStats.wearRateUnit + "；近 14 归档日 + 今日实时）:")
             for (date, ch, rate) in rows {
                 print(String(format: "  %@: %.2f（调速 %.0f 次）", date, rate, ch))
             }

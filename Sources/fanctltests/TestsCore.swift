@@ -110,9 +110,9 @@ func testHistogram() {
     // R29/R32：speedChangesPerMinute 磨损速率口径（批次 B 控制律延后的裁决探针）
     do {
         var d = DailyStats(date: "2026-09-21")
-        expectEqual(d.speedChangesPerMinute, 0, "无受控秒 → 0")
+        expectEqual(d.speedChangesPerMinute, 0, "无采样秒 → 0")
         d.tempSeconds = 30; d.speedChanges = 10
-        expectEqual(d.speedChangesPerMinute, 0, "受控秒≤0.5 分 → 0（防抖）")
+        expectEqual(d.speedChangesPerMinute, 0, "采样秒≤0.5 分 → 0（防抖）")
         d.tempSeconds = 120; d.speedChanges = 30
         expectClose(d.speedChangesPerMinute, 15, 1e-9, "30次/2分 = 15/min")
         d.tempSeconds = 600; d.speedChanges = 30
@@ -121,6 +121,28 @@ func testHistogram() {
         expectEqual(bad.speedChangesPerMinute, 0, "非有限 speedChanges → 0")
         var bad2 = DailyStats(date: "y"); bad2.tempSeconds = .infinity; bad2.speedChanges = 10
         expectEqual(bad2.speedChangesPerMinute, 0, "非有限 tempSeconds → 0")
+        // R45：单位串单一真值 + 两个 surface 的静态接线门。
+        // 动因：同一个 speedChangesPerMinute 在诊断包里印"次/采样分"、在 fanprobe 的
+        // 今日战报里印"次/受控分"，而分母其实是采样秒（StatsSampler 对每个有效温度样本
+        // 累加）——它是批次 B 控制律延后裁决的读数，口径标签不能两处各说一套。
+        // 读不到源码一律判红（R41 教训：查不到就静默跳过 = 门自己变空气）。
+        expectEqual(DailyStats.wearRateUnit, "次/采样分", "单位串唯一真值=采样分（分母 tempSeconds）")
+        // #filePath = <root>/Sources/fanctltests/TestsCore.swift → 上溯三层到仓库根，
+        // 并把"根必须有 Package.swift"当前提断言（层数写错必须判红，不许静默读不到）
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        expect(FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent("Package.swift").path),
+               "接线门的仓库根定位必须命中 Package.swift（层数错=空气门）")
+        for rel in ["Sources/fanprobe/main.swift", "Sources/SMCCore/DiagnosticReport.swift"] {
+            let path = repoRoot.appendingPathComponent(rel).path
+            guard let src = try? String(contentsOfFile: path, encoding: .utf8) else {
+                expect(false, "接线门读不到 \(rel)（源码缺席必须判红，不得空转）")
+                continue
+            }
+            expect(src.contains("DailyStats.wearRateUnit"), "\(rel) 接的是同源单位串")
+            expect(!src.contains("次/受控"), "\(rel) 不再硬编码错口径")
+            expect(!src.contains("\"次/采样分\""), "\(rel) 不重复硬编码单位串（保持单一来源）")
+        }
     }
 }
 
