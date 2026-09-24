@@ -823,7 +823,7 @@ let minAssertions = 4930
 // R23 测试基建：第二道门槛——distinct group 数。断言总数可被循环刷量虚高
 // （如 expectPersonalityOrdered 单次产 ~816 条），删掉整段测试但保留循环类断言时
 // 总数不降、覆盖却净损；group 数是粗粒度结构量，删函数即少一个 group，刷不出来。
-let minGroups = 87
+let minGroups = 88
 if failures == 0 {
     if checks < minAssertions {
         print("❌ 断言数 \(checks) 低于契约下限 \(minAssertions)（测试被删/跳过？）")
