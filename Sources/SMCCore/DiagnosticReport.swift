@@ -225,7 +225,17 @@ public enum DiagnosticReport {
             fanText = "未知（无 status 或风扇数为 0=passive 机型）"
         }
         let fanNumber: String = s.flatMap { $0.hardwareProfile }.map { String($0.fanCount) } ?? "—"
-        out.append("风扇: 数量 " + fanNumber + " · " + fanText + stale)
+        // R43：可读风扇数 < 画像风扇数 = 有本拍读不到的风扇，这一行必须把缺口出声——
+        // 否则"数量 2 · fan0 …"在报告里读起来就是台单风扇机器。
+        // 只报现象、不下处置结论：交还是引擎那一拍用 live fanCount 做的判据，这里拿的是
+        // status 快照（且旧 daemon 根本不交还、交还写也可能失败），说"已交还"就是越界镀金。
+        // 声明值来自组可写的 status.json，只做有界减法、不枚举区间。
+        let gapText: String = {
+            guard let st = s, !st.fans.isEmpty, let declared = st.hardwareProfile?.fanCount else { return "" }
+            let gap = declared - st.fans.count
+            return (gap > 0 && gap <= 16) ? " · 另有 " + String(gap) + " 把本拍无读数" : ""
+        }()
+        out.append("风扇: 数量 " + fanNumber + " · " + fanText + gapText + stale)
 
         let confLine: String = "配置: config.json " + (i.configPresent ? "在" : "缺")
             + " · last-good " + (i.lastGoodPresent ? "在（损坏时可回退）" : "缺（损坏将回出厂默认）")

@@ -17,6 +17,8 @@ import Dispatch
 // 自适应循环间隔边界（秒）与写入节流（原 fanctld 顶层常量，随引擎迁入）
 public let RPM_DEADBAND = 40.0           // 目标变化小于此值不重写，减少 SMC 写入
 public let REASSERT_LOOPS = 20           // 每 N 循环强制重写一次（防睡眠唤醒后 SMC 复位强制模式）
+// R43：一把风扇连续失联满这么久才交还系统调度（去抖，见 beat 内注释；默认 3s 拍约 2 拍）
+public let FANLOSS_HANDBACK_SECONDS: TimeInterval = 6.0
 
 public let LOOP_INTERVAL_MIN: TimeInterval = 1.0
 public let LOOP_INTERVAL_DEFAULT: TimeInterval = 3.0
@@ -141,6 +143,10 @@ public final class ControlEngine {
     var horizonWarned: Set<String> = []   // v3.6.2（F5）：异常久远截止时间只告警一次
     var lastProbeTime = Date.distantPast
     var probeVerifyLoops = 0
+    // R43：失联风扇的处置状态。invisibleFanSince = "从何时起一直读不到"（去抖计时），
+    // handedBackInvisibleFans = 已交还的边沿记忆（恢复可见即清除）——见 beat 内注释
+    var invisibleFanSince: [Int: Date] = [:]
+    var handedBackInvisibleFans: Set<Int> = []
     var stuckDetector = StuckSensorDetector()       // v2.8 传感器卡死一致性门
     var belowAmbientSeconds = 0.0                    // v3.0 读数偏低门（秒制，累计钳顶 90）
     var belowAmbientFaulted = false                  // 偏低门锁存：≥90s 触发、衰减到 0 才解除
@@ -276,6 +282,10 @@ public final class ControlEngine {
         tempFailCount = 0
         probeVerifyLoops = 0
         lastProbeTime = .distantPast
+        // R43：失联计时与边沿记忆属于"上一次清醒会话"——wake 上方已 restoreAutoAll 把
+        // 全部风扇（含不可见的）交还过一遍，留着旧记忆会让醒后仍失联的那把不再补交还
+        invisibleFanSince.removeAll()
+        handedBackInvisibleFans.removeAll()
         targetUnreachable = false
         targetUnreachableSince = nil
         targetUnreachableLogged = false
@@ -767,6 +777,42 @@ public final class ControlEngine {
 
         // 一次性读取所有风扇状态
         let fanStates = fans.allStates()
+        // R43（多风扇部分读失败的钉住面）：allStates 会跳过读失败的风扇（Ac/Tg 非有限或
+        // Mn/Mx 键抛错），而下方写循环只遍历 fanStates——被跳过的那把就此停在最后一次强制
+        // 目标上（F{n}Md=1 + 过期 Tg），系统调度对它失效，且没有任何机制把它要回来：
+        // writeHealth 只看写出去的那几把（全成功）、feedbackHealth 只看可读名单（它不在里面）、
+        // status.fans 只列可读风扇 → 双风扇机器在 UI/诊断包里长得跟单风扇机器一样。
+        // 处置：失联持续满 FANLOSS_HANDBACK_SECONDS 才按边沿交还（每轮失联一次 Md=0 + 一条日志）；
+        // 恢复可见即作废计时与边沿记忆 → 当拍重新接管，再失联再交还。
+        // 为何去抖：间歇 NaN 的键不需要处置——它在可见拍上照常受控；单拍即交还会让 Md 逐拍
+        // 1↔0 翻转（正是下方 :1013 注释里 v2.6.2 修过的"交还↔夺回"振荡）并每轮刷日志。
+        // 判据取墙钟连续时长，故 fastConfigApply 拍无需排除：30ms 连发拍伪造不出 6s。
+        // 热安全向：交还=交给 EC 调度，与 92°C 兜底的最终形态（restoreAutoAll）同向；
+        // 多等 6s + 一拍远小于热时间常数 25–70s，期间 CPU 侧兜底照常在场。
+        let presentFanIDs = Set(fanStates.map { $0.id })
+        let lossNow = hooks.now()
+        for id in 0..<fans.fanCount where !presentFanIDs.contains(id) {
+            let since = invisibleFanSince[id] ?? lossNow
+            invisibleFanSince[id] = since
+            let lostFor = lossNow.timeIntervalSince(since)
+            guard lostFor >= FANLOSS_HANDBACK_SECONDS else { continue }
+            guard !handedBackInvisibleFans.contains(id) else { continue }
+            handedBackInvisibleFans.insert(id)
+            // 过期命令基线一并作废：恢复可见后不能拿旧目标做跟随比较（会挂假故障）
+            lastWrittenRPM.removeValue(forKey: id)
+            // 交还写失败也算"本轮失联已处理"：键整体缺失的风扇从没被本进程强制过（同键
+            // setForcedRPM 必失败），无钉住风险，逐拍重试只会刷日志。失败本身出声，不静默。
+            do {
+                try fans.restoreAuto(fan: id)
+                hooks.log("风扇 \(id) 连续 \(Int(lostFor))s 读不到状态，已交还系统调度")
+            } catch {
+                hooks.log("风扇 \(id) 读不到状态，交还写入亦失败（该键可能整体不存在）: \(error)")
+            }
+        }
+        for id in presentFanIDs {
+            invisibleFanSince.removeValue(forKey: id)
+        }
+        handedBackInvisibleFans = handedBackInvisibleFans.subtracting(presentFanIDs)
         // 验证期（probeVerifyLoops > 0）用严格检查（无升速宽限），探测真实故障。
         // fastConfigApply 拍只更新命令基线不计数：快速下拖时限速行程在数百 ms 内走完
         // 而 RPM 物理回落需 1-3s，逐拍计 mismatch 会稳定误判闭环失效（v2.8 审查 P1）

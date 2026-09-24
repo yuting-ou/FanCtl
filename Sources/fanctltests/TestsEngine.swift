@@ -11,6 +11,7 @@ final class MockSMC: SMCIO {
     var values: [String: (type: String, value: Double)] = [:]
     var writes: [(key: String, value: Double)] = []
     var reads: [String] = []   // v3.4.1：读记录（缓存效果观测）
+    var failWriteKeys: Set<String> = []   // R43：点名让某些键写失败
 
     func set(_ key: String, _ value: Double, type: String = "flt ") {
         lock.lock(); defer { lock.unlock() }
@@ -65,6 +66,9 @@ final class MockSMC: SMCIO {
         // R23 全量审查（TSan 实锤）：v3.4.5 锁纪律的漏网方法——主线程写 values 与
         // 后台重扫持锁读并发 = 同一起段错误根因的 Dictionary COW 损坏，补齐锁。
         lock.lock(); defer { lock.unlock() }
+        // R43：让指定键的写入抛错（真实 SMC 对不存在的键就是失败），
+        // 否则"交还写失败"这类 catch 分支在 mock 下结构性不可达（假覆盖）
+        if failWriteKeys.contains(key) { throw SMCError.keyNotFound(key) }
         writes.append((key, value))
         values[key]?.value = value
     }
@@ -1987,6 +1991,201 @@ func testAliveDebouncer() {
 
 
 // MARK: - 4.0 B1 冷却能力门控：无风扇（passive）机器
+
+// R43：多风扇机器的"部分读失败"钉住面。allStates 跳过读失败的风扇（Ac/Tg 非有限、
+// Mn/Mx 读抛错），而写循环只遍历 fanStates——被跳过的那把就此停在最后一次强制目标上
+//（F{n}Md=1 + 过期 Tg），系统调度对它失效，且没有任何机制把它要回来：writeHealth 只看
+// 写出去的那几把（全成功）、feedbackHealth 只看 fanStates（它不在名单里），92°C 兜底之前
+// 一路静默；status.fans 只列可读风扇，双风扇机器在 UI/诊断包里长得跟单风扇机器一样。
+// 锁六条：① 失联满 6s 即交还、每轮只写一次；② 恢复后再失联要重新交还；
+// ③ FNum 虚报（键整体不存在）只试一次不刷日志；④ 健康机器（含单风扇）零误伤；
+// ⑤ 抖动键不处置（去抖）；⑥ 交还写失败出声一次；⑦ 唤醒后仍失联能补交还。
+func testPartialFanLoss() {
+    group("多风扇部分读失败(R43)")
+
+    func twoFanSMC() -> MockSMC {
+        let smc = MockSMC()
+        smc.set("FNum", 2, type: "ui8 ")
+        for i in 0...1 {
+            smc.set("F\(i)Md", 0, type: "ui8 ")
+            smc.set("F\(i)Ac", 2000)
+            smc.set("F\(i)Mn", 1200)
+            smc.set("F\(i)Mx", 5000)
+            smc.set("F\(i)Tg", 2000)
+        }
+        smc.set("Tp01", 70)
+        smc.set("PSTR", 30)
+        return smc
+    }
+    // 让"还在管"的风扇跟上命令：actual 取上一拍写出去的目标。mock 不自己升速，
+    // 否则反馈健康度会因转速不动挂假故障，把要验的东西淹掉。
+    func beatFollow(_ engine: ControlEngine, _ clock: FakeClock, _ smc: MockSMC,
+                    ids: [Int], broken: Set<Int> = []) {
+        for id in ids {
+            smc.set("F\(id)Ac", broken.contains(id) ? .nan : (smc.lastWrite("F\(id)Tg") ?? 2000))
+        }
+        clock.advance(3)
+        engine.beat()
+    }
+    func handBackWrites(_ smc: MockSMC, _ id: Int) -> Int {
+        smc.writes.filter { $0.key == "F\(id)Md" && $0.value == 0 }.count
+    }
+
+    // ① 主场景：两把都在管 → 风扇 1 失联 → 交还，健康那把不受牵连
+    do {
+        let dir = engineTestEnv()
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 80, envCompensation: false))
+        let smc = twoFanSMC()
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        beatFollow(engine, clock, smc, ids: [0, 1])
+        beatFollow(engine, clock, smc, ids: [0, 1])
+        expectEqual(smc.lastWrite("F0Md"), 1, "① 前提：风扇 0 已在强制模式")
+        expectEqual(smc.lastWrite("F1Md"), 1, "① 前提：风扇 1 已在强制模式（否则交还断言空转）")
+        expectEqual(handBackWrites(smc, 1), 0, "① 前提：健康期没有交还写入")
+        for _ in 0..<4 { beatFollow(engine, clock, smc, ids: [0, 1], broken: [1]) }
+        expectEqual(smc.lastWrite("F1Md"), 0, "① 失联风扇被交还系统（原缺陷：钉在过期强制目标上）")
+        expectEqual(handBackWrites(smc, 1), 1, "① 按边沿只写一次（逐拍重写=模式位抖动+日志刷屏）")
+        expectEqual(smc.lastWrite("F0Md"), 1, "① 健康风扇仍在自己控制下（不牵连整环交还）")
+        expectEqual(col.logs.filter { $0.contains("读不到状态") }.count, 1,
+                    "① 失联出声一次")
+        let st = ConfigStore.loadStatus()
+        expectEqual(st?.fans.count, 1, "① status 只列可读风扇（缺口在诊断包侧出声）")
+        expectEqual(st?.hardwareProfile?.fanCount, 2, "① 画像仍 2 把：数量与可读列表之差=缺口")
+        expect(st?.controlFault != true, "① 一把失联不判整环故障")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    // ② 恢复 → 再失联：边沿记忆必须在可见那一拍清除
+    do {
+        let dir = engineTestEnv()
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 80, envCompensation: false))
+        let smc = twoFanSMC()
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        beatFollow(engine, clock, smc, ids: [0, 1])
+        for _ in 0..<3 { beatFollow(engine, clock, smc, ids: [0, 1], broken: [1]) }
+        expectEqual(handBackWrites(smc, 1), 1, "② 第一轮失联交还一次")
+        beatFollow(engine, clock, smc, ids: [0, 1])
+        expectEqual(smc.lastWrite("F1Md"), 1, "② 恢复可见当拍重新接管（过期命令基线已作废）")
+        for _ in 0..<3 { beatFollow(engine, clock, smc, ids: [0, 1], broken: [1]) }
+        expectEqual(smc.lastWrite("F1Md"), 0, "② 第二轮失联仍交还（边沿记忆在可见拍清除）")
+        expectEqual(handBackWrites(smc, 1), 2, "② 两轮失联各交还一次")
+        expectEqual(col.logs.filter { $0.contains("读不到状态") }.count, 2,
+                    "② 每轮失联各出声一次")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    // ③ FNum 虚报：探测到 2 把但第二把键整体不存在（从没被强制过 = 无钉住风险）
+    do {
+        let dir = engineTestEnv()
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 80, envCompensation: false))
+        let smc = MockSMC()
+        smc.set("FNum", 2, type: "ui8 ")
+        smc.set("F0Md", 0, type: "ui8 ")
+        smc.set("F0Ac", 2000)
+        smc.set("F0Mn", 1200)
+        smc.set("F0Mx", 5000)
+        smc.set("F0Tg", 2000)
+        smc.set("Tp01", 70)
+        smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        for _ in 0..<6 { beatFollow(engine, clock, smc, ids: [0]) }
+        expectEqual(smc.lastWrite("F0Md"), 1, "③ 健康风扇照常接管")
+        expectEqual(handBackWrites(smc, 1), 1, "③ 键缺失的风扇只交还一次，不逐拍重试刷日志")
+        expectEqual(ConfigStore.loadStatus()?.fans.count, 1, "③ 只上报读得到的一把")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    // ④ 零误伤：单风扇健康机器不该出现任何交还写入或失联日志
+    do {
+        let dir = engineTestEnv()
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 80, envCompensation: false))
+        let smc = makeFanSMC()
+        smc.set("Tp01", 70)
+        smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        for _ in 0..<6 { beatFollow(engine, clock, smc, ids: [0]) }
+        expectEqual(smc.lastWrite("F0Md"), 1, "④ 单风扇机器保持强制接管")
+        expect(smc.writes.first { $0.key == "F0Md" && $0.value == 0 } == nil,
+               "④ 健康机器零交还写入（改动面不越界）")
+        expect(col.logs.filter { $0.contains("读不到状态") }.isEmpty, "④ 无失联不出声")
+        expect(smc.writes.filter { $0.key.hasPrefix("F1") }.isEmpty, "④ 不碰不存在的第二把")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    // ⑤ 去抖：间歇 NaN 的键不需要处置（可见拍上它照常受控），逐拍交还会把 Md 抖成
+    //    v2.6.2 修过的"交还↔夺回"振荡；满 6s 连续失联才动手
+    do {
+        let dir = engineTestEnv()
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 80, envCompensation: false))
+        let smc = twoFanSMC()
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        beatFollow(engine, clock, smc, ids: [0, 1])
+        for i in 0..<8 {
+            beatFollow(engine, clock, smc, ids: [0, 1], broken: i % 2 == 1 ? [1] : [])
+        }
+        expectEqual(handBackWrites(smc, 1), 0, "⑤ 交替失联（每拍复活）一次都不交还")
+        expectEqual(smc.lastWrite("F1Md"), 1, "⑤ 抖动风扇在可见拍上仍受控")
+        expect(col.logs.filter { $0.contains("读不到状态") }.isEmpty, "⑤ 抖动不刷交还日志")
+        // 交替循环停在"失联"那一拍（记作 t0），从这里开始算连续时长
+        beatFollow(engine, clock, smc, ids: [0, 1], broken: [1])      // t0+3s
+        expectEqual(handBackWrites(smc, 1), 0, "⑤ 连续失联未满 6s 仍不交还（阈值不是拍数玩笑）")
+        beatFollow(engine, clock, smc, ids: [0, 1], broken: [1])      // t0+6s
+        expectEqual(handBackWrites(smc, 1), 1, "⑤ 满 6s 即交还（也不得更早）")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    // ⑥ 交还写入失败（键整体不存在 / SMC 拒绝）：出声一次、不逐拍重试、不牵连健康风扇
+    do {
+        let dir = engineTestEnv()
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 80, envCompensation: false))
+        let smc = twoFanSMC()
+        smc.failWriteKeys = ["F1Md"]
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        for _ in 0..<6 { beatFollow(engine, clock, smc, ids: [0, 1], broken: [1]) }
+        expectEqual(col.logs.filter { $0.contains("交还写入亦失败") }.count, 1,
+                    "⑥ 失败出声一次（不静默、不逐拍重试刷日志）")
+        expect(smc.writes.first { $0.key == "F1Md" } == nil, "⑥ 抛错的写没落进写记录（catch 分支真被执行）")
+        expectEqual(smc.lastWrite("F0Md"), 1, "⑥ 健康风扇照常受控")
+        expect(ConfigStore.loadStatus()?.controlFault != true, "⑥ 交还失败不冒充整环故障")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    // ⑦ 唤醒后仍失联要能补交还：wake 里两份状态（计时 + 边沿记忆）必须随上下文一起作废
+    do {
+        let dir = engineTestEnv()
+        ConfigStore.saveConfig(FanConfig(mode: .manual, manualPercent: 80, envCompensation: false))
+        let smc = twoFanSMC()
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        for _ in 0..<4 { beatFollow(engine, clock, smc, ids: [0, 1], broken: [1]) }
+        expectEqual(handBackWrites(smc, 1), 1, "⑦ 睡前交还一次")
+        engine.wake()
+        expectEqual(handBackWrites(smc, 1), 2, "⑦ 前提：wake 自身把全部风扇交还（含失联那把）")
+        for _ in 0..<3 { beatFollow(engine, clock, smc, ids: [0, 1], broken: [1]) }
+        expectEqual(handBackWrites(smc, 1), 3, "⑦ 醒后仍连续失联会再补一次（计时/边沿记忆已作废）")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+}
 
 func testPassiveMachine() {
     group("冷却能力门控(4.0 B1)")

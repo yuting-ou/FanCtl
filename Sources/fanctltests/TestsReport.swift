@@ -123,6 +123,32 @@ func testDiagnosticReport() {
     expect(fullText.contains("累计受控"), "dt 账本用「累计」字样与本轮受控区分")
     expect(fullText.contains("电池") && fullText.contains("电池降档 是"), "电源态进报告")
 
+    // ④b R43：可读风扇数 < 画像风扇数 = 有本拍读不到、已交还系统的风扇。
+    //     这一行必须把缺口出声——否则"数量 2 · fan0 …"读起来就是台单风扇机器。
+    var gapInput = fullReportInput()
+    if var st = gapInput.status, var prof = st.hardwareProfile {
+        prof.fanCount = 2          // 画像 2 把，fans 仍只有一把（风扇 1 本拍无读数）
+        st.hardwareProfile = prof
+        gapInput.status = st
+    }
+    let gapLines = DiagnosticReport.lines(gapInput)
+    let gapText = gapLines.joined(separator: "\n")
+    expect(gapText.contains("另有 1 把本拍无读数"), "缺口进报告（不再靠读者自己数）")
+    expect(!gapText.contains("已交还"),
+           "渲染层只报现象：交还是引擎那一拍的判据，快照+旧 daemon 上下不了处置结论")
+    expectEqual(gapLines.count, DiagnosticReport.sectionCount, "补这句不长模板（行数恒定契约）")
+    expect(!fullText.contains("另有"), "1/1 机器不误报缺口（negative control）")
+    // 声明值来自组可写的 status.json：虚高值只能做有界减法，不许拿它枚举区间
+    var hostileGapInput = fullReportInput()
+    if var st = hostileGapInput.status, var prof = st.hardwareProfile {
+        prof.fanCount = 1_000_000
+        st.hardwareProfile = prof
+        hostileGapInput.status = st
+    }
+    let hostileGapText = DiagnosticReport.lines(hostileGapInput).joined(separator: "\n")
+    expect(!hostileGapText.contains("另有"),
+           "画像风扇数虚高 1e6 时不打印缺口（有界判据，渲染层不被 JSON 牵着走）")
+
     // ⑤ 口径标签必须与 getter 的回退条件同一条：加权秒被钳成 0（sanitized 的产物）时
     //    走的是样本口径除法，标签若仍写"秒加权"就是在给数字镀金
     var legacyInput = fullReportInput()
