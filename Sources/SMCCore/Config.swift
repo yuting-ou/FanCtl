@@ -1291,8 +1291,11 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
     let curveStr = s.curveTargetPercent.map { String(r($0)) } ?? "-"
     // R46：安全托底与"覆盖前的基础目标"必须进变化感知——App 的「安全托底」胶囊靠它们，
     // 此前它们翻转时若恰好没有别的字段同拍变化，那一拍不落盘，胶囊最长陈旧 10s（心跳）。
-    let baseStr = s.baseTargetPercent.map { String(r($0)) } ?? "-"
-    let floorStr = s.safetyFloorPercent.map { String(r($0)) } ?? "-"
+    // R46 审查修正：**按 5% 粗量化**。baseTargetPercent 是覆盖前的连续插值、每拍都写，
+    // 逐整数纳入会让"安全托底把输出钉住"的那些拍每拍跨整数 → 落盘涨到每拍一次，
+    // 与我豁免 loopInterval/thermalModelB 的理由自相矛盾。5% 粒度：守卫接入/解除一定翻段。
+    let baseStr = s.baseTargetPercent.map { String(r($0 / 5)) } ?? "-"
+    let floorStr = s.safetyFloorPercent.map { String(r($0 / 5)) } ?? "-"
     let unreachStr = s.targetUnreachable == true ? "UNREACH" : "ok"
     let learnStr = (s.learningRecently == true ? "L" : "-") + ":\(s.learnedPoints ?? 0)"
     let powerStr = s.powerWatts.map { String(r($0)) } ?? "-"

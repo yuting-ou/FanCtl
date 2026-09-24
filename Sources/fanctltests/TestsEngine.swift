@@ -2051,13 +2051,14 @@ func testStatusSummaryCoverage() {
         "timestamp",          // 心跳本身：陈旧判定靠它，纳入等于每拍强写
         "cpuTemp", "gpuTemp", // sensors 的派生别名，不是旋钮（解码后仍以 sensors 为准）
         "loopInterval",       // 自适应间隔每拍都可能变，纳入会把写盘节流打穿
-        "appliedPercent",     // 被 appliedPercents 遮蔽的标量别名：pctStr 只取一份，
-                              // 单风扇旧路径（appliedPercents=nil）时走 else 分支，仍被看见
+        "appliedPercent",     // 被 appliedPercents 遮蔽的标量别名：pctStr 只取一份。
+                              // 诚实标注：本门夹具的 appliedPercents 恒非 nil，
+                              // else 分支（旧单风扇路径）未被本门差分
         "learnedSamples",     // 每个稳态样本都 +1，纳入等于学习期每拍强写；
                               // 展示用的 learnedPoints/learningRecently 已在摘要里
         "decisionTrace",      // 含 temp/error 等每拍量，纳入等于每拍强写（纯展示透镜）
-        "hardwareProfile",    // 启动即定；唯一会变的 fanCount 翻正那一拍 reason/输出必变，
-                              // 摘要已被别的字段带动
+        "hardwareProfile",    // 启动即定；fanCount 翻正那一拍带动的是 appliedPercents/fans
+                              // 两段（不是 reason——R46 审查修正过这句）
         "thermalModelUsable", "thermalModelB", "thermalModelSamples",
                               // 模型参数每拍漂移，纳入等于每拍强写；诊断字段容许 ≤10s 陈旧
     ]
@@ -2095,6 +2096,23 @@ func testStatusSummaryCoverage() {
     }
     expectEqual(keys.count, 34, "status.json 顶层键数=34（新增字段必须在本门或 summaryFree 里表态）")
     expectEqual(tested, 23, "实际被差分的键数=23（= 34 键 − 11 条有理由的豁免；对不上即有人改名单）")
+    // R46 审查修正（门的关键盲区）：JSON 键来自夹具，A/B 都留 nil 的键会被 encodeIfPresent
+    // 省略、根本不进差分——"新增字段必须表态"因此有洞。改成用 Mirror 枚举**存储属性**：
+    // 每个存储属性要么被差分过、要么在豁免名单、要么显式列进下面的"夹具未填"名单。
+    // 以后新增字段忘了三处之一 → 这里直接红（与 keys.count 的死数字互为犄角）。
+    let storedLabels = Set(Mirror(reflecting: a).children.compactMap { $0.label })
+    let unexercised = storedLabels.subtracting(keys).subtracting(summaryFree)
+    expectEqual(unexercised.sorted().joined(separator: ","), "faultReason,learnMap",
+                "未差分也未豁免的存储属性（夹具未填=免检，必须显式承认；新增即红）")
+    // 量化的牙：5% 之内的漂移动不得摘要，跨 5% 必须动（防"为了即时性把写盘节流打穿"）
+    var q1 = a
+    var q2 = a
+    var q3 = a
+    q1.baseTargetPercent = 40
+    q2.baseTargetPercent = 42
+    q3.baseTargetPercent = 46
+    expectEqual(statusChangeSummary(q1), statusChangeSummary(q2), "5% 内漂移不触发落盘（节流不被打穿）")
+    expect(statusChangeSummary(q1) != statusChangeSummary(q3), "跨 5% 必须触发落盘（量化没把信号量化没）")
     expect(missed.isEmpty, "字段变了摘要就得变（否则那一拍不落盘）；漏网：" + missed.joined(separator: ", "))
 }
 
