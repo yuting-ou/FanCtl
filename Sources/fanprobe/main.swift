@@ -131,10 +131,11 @@ do {
     // 今日战报摘要（调速次数 = |输出Δ|≥3% 的拍数，风扇寿命代理指标）
     if let s = ConfigStore.loadStats(readOnly: true), s.date == DailyStats.today(), s.tempCount > 0 {
         print("今日: 最高 \(String(format: "%.1f", s.maxTemp))°C · 调速 \(Int(s.speedChanges)) 次 · 启停抑制 \(Int(s.aiCyclingGuards)) 次\(s.overshootPeak >= 3 ? " · 过冲峰值 +\(Int(s.overshootPeak.rounded()))°" : "") · 静音/安静 \(Int(s.quietSeconds / 60)) 分钟")
-        // R45：单位串必须与 SMCCore 同源（DailyStats.wearRateUnit）。此前这里写死了
+        // R45：单位串必须与 SMCCore 的同源常量一致。此前这里写死了
         // 一个错的口径名，而分母其实是采样秒（StatsSampler 对每个有效温度样本累加）——
         // 同一个数两个 surface 各说一套，而它是批次 B 控制律延后裁决的读数。
-        // 注意：本文件不得再出现口径字面量，TestsCore 的静态接线门会判红。
+        // 注意：本文件不得再出现口径字面量，也不得在注释里写常量的名字——
+        // 接线门按"代码里出现该常量的次数"判，注释凑数不算。
         print("  磨损速率: " + String(format: "%.2f", s.speedChangesPerMinute)
               + " " + DailyStats.wearRateUnit + "（分母=采样秒 tempSeconds；批次B门看趋势）")
     }

@@ -129,6 +129,8 @@ func testHistogram() {
         expectEqual(DailyStats.wearRateUnit, "次/采样分", "单位串唯一真值=采样分（分母 tempSeconds）")
         // #filePath = <root>/Sources/fanctltests/TestsCore.swift → 上溯三层到仓库根，
         // 并把"根必须有 Package.swift"当前提断言（层数写错必须判红，不许静默读不到）
+        let wearRateCallSites = ["Sources/fanprobe/main.swift": 2,
+                                 "Sources/SMCCore/DiagnosticReport.swift": 1]
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         expect(FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent("Package.swift").path),
@@ -139,7 +141,13 @@ func testHistogram() {
                 expect(false, "接线门读不到 \(rel)（源码缺席必须判红，不得空转）")
                 continue
             }
-            expect(src.contains("DailyStats.wearRateUnit"), "\(rel) 接的是同源单位串")
+            // 按**代码行**里出现该常量的次数判（剥掉 // 开头的行再数）：本文件注释里
+            // 曾提到过常量名，把"contains"满足掉而删掉真正的打印行仍会绿——半颗牙。
+            let codeOnly = src.split(separator: "\n").filter {
+                !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//")
+            }.joined(separator: "\n")
+            expectEqual(codeOnly.components(separatedBy: "DailyStats.wearRateUnit").count - 1,
+                        wearRateCallSites[rel] ?? -1, "接线处数不符（注释凑数不算）: " + rel)
             expect(!src.contains("次/受控"), "\(rel) 不再硬编码错口径")
             expect(!src.contains("\"次/采样分\""), "\(rel) 不重复硬编码单位串（保持单一来源）")
         }
