@@ -50,6 +50,91 @@ func testUIAnimationGuards() {
     expect(model.contains("self.fans = fanStates"), "fans 仍被赋值（门不是靠删功能变绿）")
     expect(!model.contains("withAnimation(.snappy(duration: 0.25)) { self.fans ="),
            "fans 赋值不包 withAnimation")
+
+    // R51 补三条可绕路径（R50 记账的原文）：
+    // ① 只切 "struct FanRow" 之后的文本 → 把转速数字搬进前置/独立子视图即绕；
+    //    改为按**数据源**判：任何读 actualRPM / loadFraction 的 Text 之后 3 行内不得出现转场。
+    // ② 精确字面量 → `.numericText(countsDown:)` 或换行写法即绕；
+    //    改为剥注释 + 去空白后按前缀 "contentTransition(.numericText" 匹配。
+    // ③ fans 那条只钉字面 "withAnimation…{ self.fans =" → 把赋值搬进 assign() 即原样复活；
+    //    改为钉 withAnimation 的**总预算**（死数字），新增一处就红。
+    func codeOnly(_ s: String) -> [String] {
+        s.split(separator: "\n").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+    }
+    func flat(_ s: String) -> String {
+        codeOnly(s).joined().replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\t", with: "")
+    }
+    let viewDir = root.appendingPathComponent("Sources/FanCtlApp")
+    let viewFiles = (try? FileManager.default.contentsOfDirectory(atPath: viewDir.path))?.sorted() ?? []
+    expectEqual(viewFiles.filter { $0.hasSuffix(".swift") }.count, 11,
+                "FanCtlApp 视图文件数=11（死数字：新增文件会同时进下面的转场预算）")
+    var transTotal = 0
+    for f in viewFiles where f.hasSuffix(".swift") {
+        guard let src = source("Sources/FanCtlApp/\(f)") else { return }
+        let n = flat(src).components(separatedBy: "contentTransition(.numericText").count - 1
+        transTotal += n
+        // 逐文件死预算：加一处即红，**搬到别的文件/独立子视图也红**（绕路径①的完整版）
+        let expectN: Int
+        switch f {
+        case "GaugeViews.swift": expectN = 1
+        case "MonitorViews.swift": expectN = 2
+        case "PanelView.swift": expectN = 7
+        default: expectN = 0
+        }
+        expectEqual(n, expectN, "\(f) 的 numericText 处数=\(expectN)（每拍数字不做转场）")
+        let lines = codeOnly(src)
+        for (i, ln) in lines.enumerated() where ln.contains("Text(")
+            && (ln.contains("actualRPM") || ln.contains("loadFraction")) {
+            let window = lines[i..<min(lines.count, i + 4)].joined()
+            expect(!window.contains("contentTransition(.numericText"),
+                   "\(f):\(i + 1) 每拍数字（转速/占比）不挂转场——换宿主视图也一样红")
+        }
+    }
+    expectEqual(transTotal, 10, "全面板 numericText 总数=10（死预算：新文件里加一处也红）")
+    expectEqual(flat(model).components(separatedBy: "withAnimation").count - 1, 3,
+                "FanModel 的 withAnimation 总数=3（死预算：新增一处事务级动画即红）")
+    // :722 的 `withAnimation(.snappy(0.25)) { assign() }` **刻意不设反断言**：R51 用
+    // --tickbench 量过（每拍 CPU：留着 804/818/834ms vs 撤掉 848/867ms，差在噪声内；
+    // 玻璃换实心、主温度去渐变/辉光同样不动），撤它换不来成本，只会改掉作者钉过的
+    // 温度数字转场观感。预算门（上一条）仍然守着"别再加第四处"。
+}
+
+/// R51：--tickbench 渲染量具的安全边界。它是**发行二进制里的调试入口**，
+/// 所以"只读真夹具、写盘落临时目录"不能靠注释承诺，必须有机器的牙。
+func testTickBenchSafety() {
+    group("渲染量具安全门(R51)")
+    let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    func codeOnly(_ rel: String) -> String? {
+        guard let s = try? String(contentsOfFile: root.appendingPathComponent(rel).path,
+                                  encoding: .utf8) else {
+            expect(false, "静态门读不到 \(rel)（源码缺席必须判红，不得空转）")
+            return nil
+        }
+        return s.split(separator: "\n").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }.joined(separator: "\n")
+    }
+    guard let bench = codeOnly("Sources/FanCtlApp/TickBench.swift"),
+          let appEntry = codeOnly("Sources/FanCtlApp/FanCtlApp.swift") else { return }
+    // ① 不许出现真实数据目录的字面量：所有写盘必须走覆盖后的临时目录
+    expect(!bench.contains("/Library/Application Support"),
+           "量具里不得硬编码真实 support 目录（写盘只能落临时目录）")
+    // ② 顺序前提：先重定向路径，再构造 FanModel（否则 watch/config 读写打在真目录上）
+    let iOverride = bench.range(of: "setOverridesForTesting")?.lowerBound
+    let iModel = bench.range(of: "FanModel()")?.lowerBound
+    guard let o = iOverride, let m = iModel else {
+        expect(false, "量具缺少 setOverridesForTesting 或 FanModel() 锚点（改名要连门一起改）")
+        return
+    }
+    expect(o < m, "必须先重定向路径再建 FanModel（否则首拍就碰真实 /Library）")
+    // ③ 接线自证：入口真的被调用（存在性反断言不算牙，见 R47 教训）
+    expect(appEntry.contains("--tickbench") && appEntry.contains("TickBench.run()"),
+           "--tickbench 入口已接线到 App 启动路径")
+    // ④ 量具有"不测空气"的守卫：夹具读不到必须 exit 非零，不能静默出 0 成本
+    expect(bench.contains("ABORT=no-fixture") && bench.contains("exit(2)"),
+           "夹具缺席时量具判废退出（不做空气门）")
 }
 
 func testInterpolation() {

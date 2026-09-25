@@ -930,7 +930,10 @@ public enum FanCtlPaths {
     private static var overrideLogDir: URL? = nil
 
     /// 测试专用：重定向数据/日志目录（引擎接线测试用，避免触碰真实 /Library 安装）。
-    /// 传 nil 恢复默认。仅在测试进程内使用，生产代码不得调用。
+    /// 传 nil 恢复默认。除测试进程外唯一例外是 App 的 `--tickbench` 诊断入口（R51）：
+    /// 它先把真实目录的 status.json **只读**一次当夹具，再重定向到临时目录，此后全部写盘
+    /// 落临时——不会污染用户数据，也不会替 daemon 说谎。该边界由静态门
+    /// 「渲染量具安全门(R51)」钉住（禁真实路径字面量 + 重定向必须先于建模型）。
     public static func setOverridesForTesting(supportDir: URL?, logDir: URL?) {
         pathLock.lock()
         overrideSupportDir = supportDir

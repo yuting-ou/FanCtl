@@ -27,6 +27,10 @@ struct FanCtlApp: App {
             }
             exit(0)
         }
+        // R51：面板每拍渲染成本量具（离屏真窗口，只读真夹具、写盘落临时目录）
+        if CommandLine.arguments.contains("--tickbench") {
+            TickBench.run()   // 内部 exit
+        }
         // 调试用：离屏渲染面板到 PNG（验证 UI 无需手动点开菜单栏）
         if CommandLine.arguments.contains("--snapshot") {
             snapshotPlainCards = true
