@@ -892,10 +892,56 @@ public struct DailyStats: Codable {
     /// 当时的处置是保留这个归一化但把单位说清——归一化的目的只是让不同拍频时段可比，
     /// 不是声称"每分钟受控动作"。单位串只有一个来源：`DailyStats.wearRateUnit`。
     public static let wearRateUnit = "次/采样分"
+    /// R53：第二个分母的单位串同样只有一处定义。诊断包曾写 "次/分"、fanprobe 曾写
+    /// "次/墙钟分"——同一个数在两张表面各说一套，正是 R45 立单一来源门要防的形状。
+    public static let wallWearRateUnit = "次/墙钟分"
     public var speedChangesPerMinute: Double {
         let mins = tempSeconds / 60.0
         guard mins > 0.5, speedChanges.isFinite, tempSeconds.isFinite else { return 0 }
         return speedChanges / mins
+    }
+
+    /// R53：**第二个分母**——当日墙钟分钟。`speedChangesPerMinute` 的分子在温度失真拍
+    /// 也计数（`StatsSampler.record` 里 `speedChanges += 1` 在 `tempPlausible` 守卫之外），
+    /// 分母却不计那些拍 ⇒ 速率被系统性抬高（R45 记过，当时只改了标签、没给量尺）。
+    ///
+    /// **两个口径各偏一边，别把比值当"纯 bug 量"**（R53 审查 O3 纠正过一次过度归因）：
+    /// - 采样分母漏掉"没有有效温度样本的时间"（失真拍、daemon 没跑的时段）⇒ **偏高**；
+    /// - 墙钟分母把"整机睡眠/daemon 停着"的墙钟也算进去，而那段根本没有调速动作 ⇒ **偏低**。
+    /// 真值在两者之间：判"风扇每分钟受控磨损"看墙钟，判"控制活动在忙时段的强度"看采样口径。
+    /// 比值因此**随当日进程漂移**（墙钟分母单调变大），不是常数：本机 2026-09-26 01:44
+    /// 实测 17.04 vs 6.79（2.51×），同日 17:20 UTC 为 2.14×——引用时带时间戳，别抄成定值。
+    ///
+    /// 只在"这份战报就是今天"时给数：跨日/归档日的墙钟起点不是这一天的开始，宁可不显示。
+    /// **已知边界**：`date` 字符串由 daemon 的系统时区写入，本函数用**读取方**的
+    /// `Calendar.current` 算起点——带 `TZ=` 覆盖的 shell 会让分母凭空变大/变小（审查 O3
+    /// 实测可差 2.3×）。这是 `DailyStats` 按"本地日"键控的既有性质，不是本轮新增；
+    /// 要跨时区可比得先改存储层，那属作者决策。
+    public func wallClockMinutes(now: Date, calendar: Calendar = .current) -> Double? {
+        guard date == Self.dayString(for: now) else { return nil }
+        let mins = now.timeIntervalSince(calendar.startOfDay(for: now)) / 60.0
+        return mins.isFinite && mins > 0.5 ? mins : nil
+    }
+
+    /// 墙钟口径的磨损速率（次/墙钟分）；拿不到当日墙钟时返回 nil（不返回 0，0 会被读成"没磨损"）
+    public func speedChangesPerWallMinute(now: Date, calendar: Calendar = .current) -> Double? {
+        guard let m = wallClockMinutes(now: now, calendar: calendar), speedChanges.isFinite else { return nil }
+        let v = speedChanges / m
+        return v.isFinite ? v : nil
+    }
+
+    /// 采样口径 ÷ 墙钟 的抬高倍数。**等价于「墙钟分钟 ÷ 采样分钟」**（分子 `speedChanges`
+    /// 在两边同时出现、约掉了）——这样写不是为了好看：直接相除在安静日会踩 `0/0 = nan`
+    /// 与 `x/0 = inf`（R53 审查 O4 实测到的真 bug，fanprobe 曾把 "nan 倍" 印给用户），
+    /// 而两个分母各自有 `> 0.5 分钟` 的门槛 ⇒ 本式的结果恒为有限正数，不需要 nan 兜底。
+    /// 三条守卫各挡一类"倍数没有意义"的情形，且每一条都有断言归属（变异 X4c/X4e 各红一处）：
+    /// 一次都没调速、采样侧不足 30 秒、拿不到当日墙钟。
+    public func wearRateInflation(now: Date, calendar: Calendar = .current) -> Double? {
+        guard speedChanges > 0 else { return nil }
+        guard let wall = wallClockMinutes(now: now, calendar: calendar) else { return nil }
+        let sampledMinutes = tempSeconds / 60.0
+        guard sampledMinutes > 0.5 else { return nil }
+        return wall / sampledMinutes
     }
 }
 

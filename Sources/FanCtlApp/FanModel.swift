@@ -213,11 +213,16 @@ final class FanModel: ObservableObject {
     /// 差额就是这张图。快拍时段少采两拍不丢信息（环形缓冲本来就按 3s 分辨率显示）。
     static let trendSampleSeconds: TimeInterval = 3
 
+    /// R53：趋势落盘节奏（秒）。原本按"每 30 拍"计，R52 把采样改成 3s 节奏后若仍按拍计
+    /// 会恶化到 90s，故改为按时间计。提成命名常量而不是留裸字面量：裸 `>= 30` 改成
+    /// `>= 0` 就是每拍写盘而测试全绿，静态门只能钉住有名字的单一真值。
+    static let historySaveSeconds: TimeInterval = 30
+
     private static let historyFile: URL = {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("com.fanctl.app/trend-history.json")
     }()
-    private var historySaveCounter = 0
+    private var lastHistorySave = Date.distantPast
     private var lastTrendAppend = Date.distantPast
     private var trendDirty = false
 
@@ -796,9 +801,11 @@ final class FanModel: ObservableObject {
             // 打开时的快速恢复；面板长关期间每 30 事件一次 200 样本原子写是纯浪费
             //（内存环仍在累积，App 退出时 willTerminate 兜底落盘）
             if panelVisible {
-                historySaveCounter += 1
-                if historySaveCounter >= 30 {
-                    historySaveCounter = 0
+                // R53 收回 R52 的自伤：落盘原本"每 30 拍"一次，R52 把趋势采样改成 3s 节奏后
+                // 若仍按样本数计，快拍期就从 30s 恶化到 90s（强杀时多丢 60s 趋势）。
+                // 改成按**时间**判：与拍频解耦，最坏窗口恒定 30s。
+                if nowT.timeIntervalSince(lastHistorySave) >= Self.historySaveSeconds {
+                    lastHistorySave = nowT
                     persistHistory()
                 }
             }

@@ -292,8 +292,15 @@ public enum DiagnosticReport {
         } else {
             statsWhen = "无战报"
         }
+        // R53：两个分母并排印。左边分母是采样秒（温度失真拍的调速进分子不进分母 ⇒ 偏高），
+        // 右边是当日墙钟分钟（把整机睡眠/daemon 停着的墙钟也算进去 ⇒ 偏低）；真值在两者之间，
+        // 口径选择的完整论述在 `DailyStats.wallClockMinutes` 的文档里，这里不重复也不改写。
+        // 归档日/凌晨半小时内墙钟口径给 "—"，不硬凑一个数
+        //（宁缺勿错，同 R43 的"渲染层别替引擎下结论"）。
+        let wallRate = st?.speedChangesPerWallMinute(now: i.generatedAt)
         let wearLine: String = "磨损(\(statsWhen)): 调速 " + n(st?.speedChanges, "%.0f") + " 次"
             + " · 速率 " + n(st?.speedChangesPerMinute, "%.2f") + " " + DailyStats.wearRateUnit
+            + " · 墙钟 " + (wallRate.map { String(format: "%.2f", $0) + " " + DailyStats.wallWearRateUnit } ?? "—")
             + " · 启停抑制 " + n(st?.aiCyclingGuards, "%.0f") + " 次"
         out.append(wearLine)
 

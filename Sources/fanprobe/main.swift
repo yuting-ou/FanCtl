@@ -138,6 +138,22 @@ do {
         // 接线门按"代码里出现该常量的次数"判，注释凑数不算。
         print("  磨损速率: " + String(format: "%.2f", s.speedChangesPerMinute)
               + " " + DailyStats.wearRateUnit + "（分母=采样秒 tempSeconds；批次B门看趋势）")
+        // R53：给出同一份数据的第二个分母（墙钟）。只换说法不改数值：读趋势的人
+        // 第一次能看见两个口径差多少，而不是只能信一个数。两个口径各偏一边
+        //（采样侧漏时⇒偏高、墙钟侧含停机⇒偏低），所以这里报"区间"而不是"真值"，
+        // 倍数由 SMCCore 的纯函数给——安静日为 0 时它返回 nil，避免印出 nan/inf。
+        if let wall = s.speedChangesPerWallMinute(now: Date()) {
+            var line = "  同一份战报按当日墙钟算: " + String(format: "%.2f", wall)
+                + " " + DailyStats.wallWearRateUnit
+            if let infl = s.wearRateInflation(now: Date()) {
+                line += String(format: "（采样口径 ÷ 墙钟 = %.2f 倍；真值落在两个数之间）", infl)
+            } else {
+                line += "（倍数不给：今日 0 次调速，或采样侧不足 30 秒）"
+            }
+            print(line)
+        } else {
+            print("  墙钟口径不可用（非今日战报，或当日不足 30 秒）")
+        }
     }
     // R32：近 14 归档日磨损速率 + 今日实时（history 未必含今天；裁决看趋势不看单日）
     // 防御性按日期排序：archiveDay 维护有序，但损坏/手改 JSON 不保证；suffix(14) 才是「最近」

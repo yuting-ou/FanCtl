@@ -125,6 +125,12 @@ func testUIAnimationGuards() {
            "history 只在环真的动了才重发（无条件赋值等于每拍告诉 SwiftUI 图变了）")
     expectEqual(modelCode.components(separatedBy: "history = historyBuffer.elements").count - 1, 2,
                 "history 赋值点=2（面板打开时全量 + 每拍条件式），加第三处即红")
+    // R53 审查 O5：落盘节奏原本是裸字面量 `>= 30`，改成 0 就是"每拍写一次盘"而全绿。
+    // 与 trendSampleSeconds 同法——命名常量 + 钉出现次数。
+    expectEqual(modelCode.components(separatedBy: "historySaveSeconds").count - 1, 2,
+                "historySaveSeconds 出现 2 次（声明 + 落盘条件）——旁路落盘节奏门即红")
+    expectEqual(modelCode.components(separatedBy: "lastHistorySave").count - 1, 3,
+                "lastHistorySave 出现 3 次（声明 + 比较 + 盖时间戳）——绕过计时即红")
     expectEqual(flat(model).components(separatedBy: "withAnimation").count - 1, 3,
                 "FanModel 的 withAnimation 总数=3（死预算：新增一处事务级动画即红）")
     // :722 的 `withAnimation(.snappy(0.25)) { assign() }` **刻意不设反断言**：R51 用
@@ -191,6 +197,117 @@ func testTickBenchSafety() {
         return
     }
     expect(sn < m && rs < ex, "快照先于建模、还原先于唯一出口 exit")
+}
+
+/// R53：磨损速率的第二个分母（当日墙钟）＋抬高倍数。动机是活数据：同一份战报的采样口径
+/// 速率明显高于按墙钟算的，因为分子（受控动作）在温度失真拍也计数、分母（采样秒）不算那些拍。
+func testWallClockWearRate() {
+    group("墙钟口径磨损速率(R53)")
+    // 刻意**不**用 Calendar.current：被测的墙钟分母 = now − startOfDay(now)，在夏令时切换日
+    // 是 660/780 分钟而不是 720（R53 审查 O6 实测 Pacific/Chatham、Europe/London 会红）。
+    // 用一个无 DST 的固定偏移历造时刻并显式传入，期望值才是手算出来的常量。
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(secondsFromGMT: 0)!
+    // 战报的 date 键由**设备时区**的 dayString 生成（存储层既有性质），所以每条夹具都按
+    // 自己那个时刻盖戳：这样 "是不是今天" 的守卫恒成立，测的只剩墙钟算术本身。
+    func at(_ hour: Int, _ minute: Int, _ second: Int = 0) -> Date {
+        var c = cal.dateComponents([.year, .month, .day], from: Date())
+        c.hour = hour; c.minute = minute; c.second = second
+        guard let d = cal.date(from: c) else { expect(false, "构造测试时刻失败"); return Date() }
+        return d
+    }
+    func rec(_ when: Date, changes: Double, sampled: Double) -> DailyStats {
+        var st = DailyStats(date: DailyStats.dayString(for: when))
+        st.speedChanges = changes
+        st.tempSeconds = sampled
+        return st
+    }
+    let noon = at(12, 0)
+    // 120 次 / 6 个采样分钟 ⇒ 采样口径 20.00；同一份按墙钟 = 120/720
+    let s = rec(noon, changes: 120, sampled: 360)
+    expectClose(s.speedChangesPerMinute, 20, 1e-9, "采样口径速率（分母=tempSeconds）")
+    expectClose(s.wallClockMinutes(now: noon, calendar: cal) ?? -1, 720, 1e-6, "墙钟分钟=当日 00:00 起")
+    expectClose(s.speedChangesPerWallMinute(now: noon, calendar: cal) ?? -1, 1.0 / 6.0, 1e-9,
+                "墙钟口径速率=120/720（与采样口径并排，差值即抬高幅度）")
+    expectClose(s.wearRateInflation(now: noon, calendar: cal) ?? -1, 120, 1e-9,
+                "抬高倍数 = 墙钟分钟 ÷ 采样分钟 = 720/6（分子约掉，与 20÷(1/6) 同值）")
+
+    // 归档日必须 nil：跨日硬算墙钟会给出一个看起来合理却完全错误的分母
+    let old = rec(at(12, 0).addingTimeInterval(-172_800), changes: 120, sampled: 360)
+    expect(old.wallClockMinutes(now: noon, calendar: cal) == nil, "非今日战报不给墙钟分钟（不硬凑分母）")
+    expect(old.speedChangesPerWallMinute(now: noon, calendar: cal) == nil, "非今日战报不给墙钟速率")
+
+    // 门槛与 `speedChangesPerMinute` 同构：分母不足 0.5 分钟就不给数（否则凌晨头几秒
+    // 会把速率炸成天文数字）。这里刻意用"秒"级时刻验证边界两侧。
+    let tiny = rec(at(0, 0, 20), changes: 5, sampled: 60)
+    expect(tiny.wallClockMinutes(now: at(0, 0, 20), calendar: cal) == nil, "当日墙钟不足 30 秒不给口径")
+    // 同一份夹具在边界另一侧必须给数（否则"门槛太严、永远没数"也是一种谎）
+    expectClose(tiny.wallClockMinutes(now: at(0, 1, 0), calendar: cal) ?? -1, 1.0, 1e-9,
+                "墙钟 60 秒 = 1 分钟（边界另一侧给数）")
+
+    // 抬高倍数的"无意义"守卫（R53 审查 O4 实测到 fanprobe 会印 nan/inf 后，把倍数改成
+    // 「墙钟分钟 ÷ 采样分钟」：分子约掉 ⇒ 恒为有限正数，不再靠 nan 兜底。三条守卫
+    // 各有断言归属：X4c 删 `sampledMinutes > 0.5` 红在下面 noSamples，
+    // X4e 删 `speedChanges > 0` 红在 quiet，非今日那条由上面的归档日断言管着）
+    let quiet = rec(noon, changes: 0, sampled: 360)
+    expectClose(quiet.speedChangesPerWallMinute(now: noon, calendar: cal) ?? -1, 0, 1e-9,
+                "安静日墙钟速率=0（0 在这里是真话：一次都没调）")
+    expect(quiet.wearRateInflation(now: noon, calendar: cal) == nil,
+           "0 次调速 ⇒ 倍数无意义（两个口径此刻都是 0）")
+    let noSamples = rec(noon, changes: 5, sampled: 10)   // 采样侧不足 0.5 分 ⇒ 采样口径 0
+    expectEqual(noSamples.speedChangesPerMinute, 0, "采样分母太短 ⇒ 采样口径 0")
+    expect(noSamples.wearRateInflation(now: noon, calendar: cal) == nil,
+           "采样侧不足 30 秒 ⇒ 不给倍数（分母门槛与采样口径同构）")
+
+    // NaN/Inf 防御（分子来自可写的 stats.json）
+    let bad = rec(noon, changes: .nan, sampled: 360)
+    expect(bad.speedChangesPerWallMinute(now: noon, calendar: cal) == nil, "NaN 调速数不出墙钟速率")
+    expect(bad.wearRateInflation(now: noon, calendar: cal) == nil, "NaN ⇒ 倍数也不出")
+    let bad2 = rec(noon, changes: .infinity, sampled: 360)
+    expect(bad2.speedChangesPerWallMinute(now: noon, calendar: cal) == nil, "Inf 调速数不出墙钟速率")
+
+    // 诊断包必须真的把两个口径都印出来，且模板行数不变（19）。
+    // 这里只断言**形状**（两个口径都在、墙钟侧不是 —）：报告内部走 Calendar.current，
+    // 精确值在 DST 切换日会变，把 "0.17" 写死会让本测试在 2026-11-01 的 LA runner 上无因红。
+    // 精确算术已由上面显式传入固定偏移历的断言覆盖。
+    let input = DiagnosticReport.Input(generatedAt: noon, status: nil, statusAgeSeconds: nil,
+                                       learn: nil, metrics: nil, ledger: nil, model: nil,
+                                       stats: s, configPresent: false, lastGoodPresent: false,
+                                       exitReason: nil, logReadable: false)
+    let lines = DiagnosticReport.lines(input)
+    expectEqual(lines.count, DiagnosticReport.sectionCount, "加墙钟口径不得改变模板行数")
+    let wear = lines.first { $0.hasPrefix("磨损(") } ?? ""
+    expect(wear.contains("速率 20.00 " + DailyStats.wearRateUnit), "磨损行仍给采样口径")
+    expect(wear.contains("墙钟 ") && wear.contains(DailyStats.wallWearRateUnit)
+           && !wear.contains("墙钟 —"),
+           "磨损行并排给出墙钟口径（有数、带单位、不是 —）")
+    // 陈旧战报：墙钟口径必须显式出声为 —，不能悄悄留空让人以为"没磨损"
+    let stOld = DailyStats(date: "2000-01-01")
+    let inputOld = DiagnosticReport.Input(generatedAt: noon, status: nil, statusAgeSeconds: nil,
+                                          learn: nil, metrics: nil, ledger: nil, model: nil,
+                                          stats: stOld, configPresent: false, lastGoodPresent: false,
+                                          exitReason: nil, logReadable: false)
+    let wearOld = (DiagnosticReport.lines(inputOld).first { $0.hasPrefix("磨损(") }) ?? ""
+    expect(wearOld.contains("墙钟 —"), "拿不到墙钟口径时出声（— ≠ 0）")
+
+    // 接线门：两张人读表面都必须真的算第二个分母（R45 的谎就出在这里）
+    let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    for rel in ["Sources/fanprobe/main.swift", "Sources/SMCCore/DiagnosticReport.swift"] {
+        if let probe = try? String(contentsOfFile: root.appendingPathComponent(rel).path,
+                                   encoding: .utf8) {
+            let code = probe.split(separator: "\n").map(String.init)
+                .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }.joined()
+            expectEqual(code.components(separatedBy: "speedChangesPerWallMinute").count - 1, 1,
+                        "\(rel) 必须调用墙钟口径（出现 1 次；删掉即红，注释凑数不算）")
+            // 倍数只在 fanprobe 印（报告里两列已够），所以另一侧必须是 0
+            expectEqual(code.components(separatedBy: "wearRateInflation").count - 1,
+                        rel.contains("fanprobe") ? 1 : 0,
+                        "\(rel) 的抬高倍数接线处数不符（0/1 之外即红）")
+        } else {
+            expect(false, "静态门读不到 \(rel) 源码（源码缺席必须判红）")
+        }
+    }
 }
 
 func testInterpolation() {
@@ -317,6 +434,10 @@ func testHistogram() {
         // 并把"根必须有 Package.swift"当前提断言（层数写错必须判红，不许静默读不到）
         let wearRateCallSites = ["Sources/fanprobe/main.swift": 2,
                                  "Sources/SMCCore/DiagnosticReport.swift": 1]
+        // R53：墙钟口径是同一条门该管的第二个分母。两个 surface 曾各写一套单位串
+        // （诊断包 "次/分"、fanprobe "次/墙钟分"），同一个数两种说法＝R45 立门的原罪重演。
+        let wallRateCallSites = ["Sources/fanprobe/main.swift": 1,
+                                 "Sources/SMCCore/DiagnosticReport.swift": 1]
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         expect(FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent("Package.swift").path),
@@ -334,8 +455,13 @@ func testHistogram() {
             }.joined(separator: "\n")
             expectEqual(codeOnly.components(separatedBy: "DailyStats.wearRateUnit").count - 1,
                         wearRateCallSites[rel] ?? -1, "接线处数不符（注释凑数不算）: " + rel)
+            expectEqual(codeOnly.components(separatedBy: "DailyStats.wallWearRateUnit").count - 1,
+                        wallRateCallSites[rel] ?? -1, "墙钟口径接线处数不符: " + rel)
             expect(!src.contains("次/受控"), "\(rel) 不再硬编码错口径")
             expect(!src.contains("\"次/采样分\""), "\(rel) 不重复硬编码单位串（保持单一来源）")
+            // 含注释一起数：注释里"顺手写一遍"也算第二套口径落地（R45 的谎就是这样长出来的）
+            expect(!src.contains(DailyStats.wallWearRateUnit),
+                   "\(rel) 的墙钟单位串必须引用常量，不得硬编码")
         }
     }
 }
