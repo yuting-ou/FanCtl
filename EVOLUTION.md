@@ -163,6 +163,12 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
     非空白）→ R21 关闭态门禁的 onAppear→panelVisible 翻转在生产路径成立，门禁生效、无回滚。
     此前"开不出"纯属 OS 27 会话对合成点击的呈现限制（A/B 已证非代码回归）。
 
+## R50（无发版）：补做 R47/R48/R49 欠的对抗审查——两路各一条必修，一条修掉、一条停放
+- **修（CI）**：重试循环里的裸 `git fetch -q origin` 在 Actions 默认 `bash -e` 下抖一次就让整步**无提示中止**（徽章没推、也没有 `::error::` 线索）。加 `|| true`，判红文案改成可执行的下一步（tests.json 与 origin 同行冲突时，正解是采 origin/main 的值重跑）。root 脚本门禁 65/0（含 R39 的 run 块语法预检与禁行首续行操作符）复跑通过。
+- **停放（面板动画，需作者裁定）**：审查指出 `FanModel.swift:722` 的 `withAnimation(.snappy(0.25)) { assign() }` **仍在**，而 `assign()` 覆盖温度/功耗/输出全族——与我撤掉的 `:772` 同类，只是键换成整数位比较；窄版同族还有 `GaugeViews.swift:154` 卡级 `.animation(value: temp)`：value 是原始 Double，每拍给整棵子树（SparkLine 的 Path、gradient、shadow）开补间，与本项目记过的"持续动画驱动视图树→CPU 暴涨"同族。**本轮不动它**：撤掉会改掉作者钉过的"读数更活"观感，且需要面板可见时的 App CPU/内存斜率对照才能定值不值，预算内只能半改。下一轮第一条就是它。
+- **门的三条可绕路径（记档，与门一起改）**：① `testUIAnimationGuards` 只切 `struct FanRow` **之后**的文本，把转速数字挪进前置/独立子视图即绕；② 判据是精确字面量，`.numericText(countsDown:)` 或换行写法即绕；③ `fans` 那条只钉字面 `withAnimation…{ self.fans =`，把赋值搬进 `assign()` 即原样复活（正是上面停放项的入口）。防空气门成立（读不到源码判红、找不到锚点判红、已注册），但两处 `range(of:)!` 在改名时是 crash 而非判红，应换成显式 `expect(false)`。
+- **核对后维持原判**：`numericText` 的触发键是渲染后的字符串而非 `value` 的 Double，"整数位没变就不滚"成立 → 其余站点保留不动不改。观察项：`MonitorViews.swift:160` 用 `rounded()`，x.5 附近仍可能每拍翻位。
+
 ## 交接口（2026-09-24 深夜 · 仓库/发行 = 4.2.13(104)，main=origin/main，工作区干净）
 - **本机跑的不是最新版**：装在系统里的 daemon 早于 4.2.8；4.2.8/4.2.10/4.2.11/4.2.12/4.2.13 都只在仓库与 Release 里。要生效必须作者执行 `sudo ./scripts/install.sh`（我不跑 sudo，属自治边界）。
 - **只有作者能答的四条**：① 装 4.2.13；② 面板开一眼——转速与功耗占比改成"等宽直读、不滚数字"是否接受（若想念滚动感，只在行内加 `.animation(value:)`，不要再回到事务级 `withAnimation`，这是 R47 的结论）；③ App 内一键升级的 root 脚本自我刷新，需要一台装着旧版的机器；④ 空 tag `v4.1.4` 的处置（删不删归作者）。

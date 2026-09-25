@@ -58,7 +58,9 @@ jobs:
           _pushed=0
           for _try in 1 2 3; do
             if git push; then _pushed=1; break; fi
-            git fetch -q origin
+            # 裸 fetch 在 Actions 默认 bash -e 下抖一次就让整步无提示中止
+            # （徽章没推、也没有 ::error:: 线索）——正是"撞车被判成回归"的另一种形态
+            git fetch -q origin || true
             git rebase origin/main || git rebase --abort || true
             sleep $((_try * 4))
           done
