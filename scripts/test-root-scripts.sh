@@ -500,6 +500,16 @@ echo "== CI workflow 内联 shell 语法预检（R39 发版链自炸）=="
 #   ① 静态禁"行首续行操作符"（`| && ||` 打头的一行）——本次事故的确切形状；
 #   ② 抽出 run 块跑 bash -n——兜 if/fi 失衡这类块级错（它兜不住 ①，故 ① 不可省）。
 WF="$ROOT/.github/workflows/ci.yml"
+# R54（独立审查 P4）：断言数契约门槛有**两个源**——`fanctltests` 的 minAssertions 与 ci.yml 的
+# `-lt N`。历史上每次都靠人记着同步，而漏改一个**不会让任何东西变红**（本地全绿、CI 拿旧下限，
+# 门形同虚设）。所以把"两源同值"本身做成一条门。
+MA=$(grep -oE '^let minAssertions = [0-9]+' "$ROOT/Sources/fanctltests/main.swift" | grep -oE '[0-9]+')
+CF=$(grep -oE '"\$N" -lt [0-9]+' "$WF" | grep -oE '[0-9]+')
+if [[ -n "$MA" && -n "$CF" && "$MA" == "$CF" ]]; then
+    ok "断言数契约门槛双源同值：$MA = fanctltests = ci.yml"
+else
+    bad "断言数契约门槛双源不一致：fanctltests=[$MA] ci.yml=[$CF] —— 发版必须同值"
+fi
 BLOCKS="$TMP/ci-run-blocks.sh"
 # 抽取器按"块内容 = run: 缩进 +2"切行；heredoc 会让这个约定失效，先钉住前提
 if grep -qE '<<-?[[:space:]]*["(a-zA-Z]' "$WF"; then

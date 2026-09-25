@@ -137,7 +137,7 @@ do {
         // 注意：本文件不得再出现口径字面量，也不得在注释里写常量的名字——
         // 接线门按"代码里出现该常量的次数"判，注释凑数不算。
         print("  磨损速率: " + String(format: "%.2f", s.speedChangesPerMinute)
-              + " " + DailyStats.wearRateUnit + "（分母=采样秒 tempSeconds；批次B门看趋势）")
+              + " " + DailyStats.wearRateUnit + "（分母=采样秒 tempSeconds；跨日比较看下面的墙钟列）")
         // R53：给出同一份数据的第二个分母（墙钟）。只换说法不改数值：读趋势的人
         // 第一次能看见两个口径差多少，而不是只能信一个数。两个口径各偏一边
         //（采样侧漏时⇒偏高、墙钟侧含停机⇒偏低），所以这里报"区间"而不是"真值"，
@@ -155,23 +155,23 @@ do {
             print("  墙钟口径不可用（非今日战报，或当日不足 30 秒）")
         }
     }
-    // R32：近 14 归档日磨损速率 + 今日实时（history 未必含今天；裁决看趋势不看单日）
+    // R32：近 14 条归档战报的磨损速率 + 今日（history 未必含今天；裁决看趋势不看单日）
     // 防御性按日期排序：archiveDay 维护有序，但损坏/手改 JSON 不保证；suffix(14) 才是「最近」
+    // R54：右列改成**墙钟覆盖率**（当日采样秒 ÷ 86400）= "这天的采样口径能信几成"。行文本由
+    // DailyStats.wearTrendRow 给（纯函数、有断言）。分母不足的日子不再整行被滤掉——那恰好是
+    // "计数还在涨、分母已经塌了"的最需要看见的一天，现在左列印 `—`、右列给出原因。
     do {
-        var rows: [(String, Double, Double)] = []
-        let hist = ConfigStore.loadHistory(readOnly: true).sorted { $0.date < $1.date }
-        for d in hist.suffix(14) where d.tempSeconds > 30 {
-            rows.append((d.date, d.speedChanges, d.speedChangesPerMinute))
+        let now = Date()
+        var list = ConfigStore.loadHistory(readOnly: true).sorted { $0.date < $1.date }
+        if let s = ConfigStore.loadStats(readOnly: true), s.date == DailyStats.today() {
+            if list.last?.date == s.date { list.removeLast() }
+            list.append(s)
         }
-        if let s = ConfigStore.loadStats(readOnly: true), s.date == DailyStats.today(), s.tempSeconds > 30 {
-            if let last = rows.last, last.0 == s.date { rows.removeLast() }
-            rows.append((s.date, s.speedChanges, s.speedChangesPerMinute))
-        }
+        let rows = list.suffix(14)
         if !rows.isEmpty {
-            print("磨损速率趋势（" + DailyStats.wearRateUnit + "；近 14 归档日 + 今日实时）:")
-            for (date, ch, rate) in rows {
-                print(String(format: "  %@: %.2f（调速 %.0f 次）", date, rate, ch))
-            }
+            print("磨损速率趋势（" + DailyStats.wearRateUnit + " · 墙钟覆盖率；近 14 条归档记录 + 今日"
+                  + "。覆盖率低 ⇒ 左列那份速率要按比例打折看）:")
+            for d in rows { print(d.wearTrendRow(now: now)) }
         }
     }
     if let m = ConfigStore.loadAIMetrics(readOnly: true), m.sampleCount > 0 {

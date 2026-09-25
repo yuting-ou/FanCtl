@@ -896,9 +896,10 @@ public struct DailyStats: Codable {
     /// "次/墙钟分"——同一个数在两张表面各说一套，正是 R45 立单一来源门要防的形状。
     public static let wallWearRateUnit = "次/墙钟分"
     public var speedChangesPerMinute: Double {
-        let mins = tempSeconds / 60.0
-        guard mins > 0.5, speedChanges.isFinite, tempSeconds.isFinite else { return 0 }
-        return speedChanges / mins
+        // 门槛走 `Self.minSampledSecondsForRate`（趋势表渲染共用同一个数，不再各写一份 30/0.5）
+        guard tempSeconds > Self.minSampledSecondsForRate,
+              speedChanges.isFinite, tempSeconds.isFinite else { return 0 }
+        return speedChanges / (tempSeconds / 60.0)
     }
 
     /// R53：**第二个分母**——当日墙钟分钟。`speedChangesPerMinute` 的分子在温度失真拍
@@ -912,7 +913,9 @@ public struct DailyStats: Codable {
     /// 比值因此**随当日进程漂移**（墙钟分母单调变大），不是常数：本机 2026-09-26 01:44
     /// 实测 17.04 vs 6.79（2.51×），同日 17:20 UTC 为 2.14×——引用时带时间戳，别抄成定值。
     ///
-    /// 只在"这份战报就是今天"时给数：跨日/归档日的墙钟起点不是这一天的开始，宁可不显示。
+    /// 只在"这份战报就是今天"时给数：跨日/归档日的墙钟起点不是这一天的开始，宁可不显示
+    ///（归档日要做跨日比较请改用 `archivedWallRate`——那是"整日均摊"，与本函数的"真实已过墙钟"
+    /// 是两个问题，别混用）。
     /// **已知边界**：`date` 字符串由 daemon 的系统时区写入，本函数用**读取方**的
     /// `Calendar.current` 算起点——带 `TZ=` 覆盖的 shell 会让分母凭空变大/变小（审查 O3
     /// 实测可差 2.3×）。这是 `DailyStats` 按"本地日"键控的既有性质，不是本轮新增；
@@ -928,6 +931,37 @@ public struct DailyStats: Codable {
         guard let m = wallClockMinutes(now: now, calendar: calendar), speedChanges.isFinite else { return nil }
         let v = speedChanges / m
         return v.isFinite ? v : nil
+    }
+
+    /// **归档日**的墙钟覆盖率：当日计入分母的采样秒 ÷ 86400。它才回答"这天的采样口径能信几成"：
+    /// 0 ⇒ 那天几乎没有可用温度读数；接近 1 ⇒ 采样口径的分母基本没漏。
+    /// `>1` 不夹到 100%：那是时钟阶跃/回拨留下的重叠秒，藏起来就再也看不见了。
+    ///
+    /// 为什么不是"日均速率"（R54 第一版的做法，被独立审查打回）：`speedChanges/1440` 与同一行
+    /// 已经印着的「调速 N 次」是线性关系（Pearson=1.000），**零新增信息**；而把"今日"那行也用
+    /// 同一个单位串印 `N/已过分钟`，同一列就挂了两种分母、相邻两行能差近 10 倍，纯粹由"现在几点"
+    /// 决定。覆盖率是无量纲的，今日/未来日直接给 `—`。
+    /// 今日与"未来日"（时钟回拨、手改 history、TZ 覆盖都会造出这种行）一律 nil。
+    /// DST 切换日真实墙钟是 1380/1460 分钟 ⇒ 本比率偏 ≤4.2%（`yyyy-MM-dd` 与读取时区无关，
+    /// 这是它相对"用读取方日历反推"的优点）；有 DST 的时区别拿它做相邻两日的高低判断。
+    public func archivedWallCoverage(now: Date) -> Double? {
+        guard date < Self.dayString(for: now) else { return nil }
+        guard tempSeconds.isFinite, tempSeconds >= 0 else { return nil }
+        return tempSeconds / 86400.0
+    }
+
+    /// 采样口径速率的最低分母门槛（秒）：不足就不给速率。`speedChangesPerMinute` 的守卫与
+    /// 趋势表的渲染**必须共用这一个数**（R54 审查 P8：此前 fanprobe 里另写死一个 30，谁调谁分叉）。
+    public static let minSampledSecondsForRate: Double = 30
+
+    /// 磨损趋势表的一行（R54 审查 P10：这张表是本轮唯一用户可见产物，而全仓没有任何测试读过
+    /// fanprobe 的 stdout——把行文本搬成纯函数，格式、`—` 分支、覆盖率才有断言可打）。
+    /// 形如 `  2026-09-12: 6.31 · 69%（调速 6243 次）`；左格 = `wearRateUnit`，右格 = 墙钟覆盖率。
+    public func wearTrendRow(now: Date) -> String {
+        let rate = tempSeconds > Self.minSampledSecondsForRate
+            ? String(format: "%.2f", speedChangesPerMinute) : "—"
+        let cov = archivedWallCoverage(now: now).map { String(format: "%.0f%%", $0 * 100) } ?? "—"
+        return String(format: "  %@: %@ · %@（调速 %.0f 次）", date, rate, cov, speedChanges)
     }
 
     /// 采样口径 ÷ 墙钟 的抬高倍数。**等价于「墙钟分钟 ÷ 采样分钟」**（分子 `speedChanges`

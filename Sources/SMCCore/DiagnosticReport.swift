@@ -296,7 +296,8 @@ public enum DiagnosticReport {
         // 右边是当日墙钟分钟（把整机睡眠/daemon 停着的墙钟也算进去 ⇒ 偏低）；真值在两者之间，
         // 口径选择的完整论述在 `DailyStats.wallClockMinutes` 的文档里，这里不重复也不改写。
         // 归档日/凌晨半小时内墙钟口径给 "—"，不硬凑一个数
-        //（宁缺勿错，同 R43 的"渲染层别替引擎下结论"）。
+        //（宁缺勿错，同 R43 的"渲染层别替引擎下结论"）。跨日的"整日均摊"口径只活在 fanprobe 的
+        // 趋势表里（`DailyStats.archivedWallRate`），报告这里刻意不用——两者答的不是一个问题。
         let wallRate = st?.speedChangesPerWallMinute(now: i.generatedAt)
         let wearLine: String = "磨损(\(statsWhen)): 调速 " + n(st?.speedChanges, "%.0f") + " 次"
             + " · 速率 " + n(st?.speedChangesPerMinute, "%.2f") + " " + DailyStats.wearRateUnit

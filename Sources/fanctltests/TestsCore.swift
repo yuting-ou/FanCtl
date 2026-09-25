@@ -266,6 +266,33 @@ func testWallClockWearRate() {
     let bad2 = rec(noon, changes: .infinity, sampled: 360)
     expect(bad2.speedChangesPerWallMinute(now: noon, calendar: cal) == nil, "Inf 调速数不出墙钟速率")
 
+    // R54：趋势表的墙钟列 = **墙钟覆盖率**（当日采样秒 ÷ 86400）。
+    // 为什么不是"日均速率"（第一版做法，被独立审查打回）：`N/1440` 与同一行已经印着的
+    // 「调速 N 次」线性相关 ⇒ 零新增信息；而把今日行也用同一单位串印 `N/已过分钟`，
+    // 一列就挂了两种分母、相邻两行差近 10 倍且只由"现在几点"决定。
+    // 期望值全部手算：2880/720=4.00、43200/86400=50%、20/86400→"0%"。
+    expectEqual(DailyStats.minSampledSecondsForRate, 30, "采样口径的分母门槛（秒）=30，两处读者共用一个数")
+    var past = DailyStats(date: "2026-09-17")
+    past.speedChanges = 2880; past.tempSeconds = 43200
+    expectEqual(past.wearTrendRow(now: noon), "  2026-09-17: 4.00 · 50%（调速 2880 次）",
+                "趋势行形状：采样速率 · 墙钟覆盖率（调速次数）")
+    var starved = DailyStats(date: "2026-09-18")
+    starved.speedChanges = 900; starved.tempSeconds = 20
+    expectEqual(starved.wearTrendRow(now: noon), "  2026-09-18: — · 0%（调速 900 次）",
+                "分母塌了的日子不再整行消失：左格 —，右格给出原因（计数还在涨）")
+    expectEqual(s.wearTrendRow(now: noon), "  " + s.date + ": 20.00 · —（调速 120 次）",
+                "今日行不给覆盖率：那天还没过完，给了就是把 86400 当已知")
+    var future = DailyStats(date: "2099-01-01"); future.speedChanges = 5; future.tempSeconds = 600
+    expect(future.archivedWallCoverage(now: noon) == nil,
+          "未来日不给覆盖率（时钟回拨/TZ 覆盖造出来的行不能当归档日摊分母）")
+    var stepped = DailyStats(date: "2026-09-19"); stepped.tempSeconds = 172800
+    expectClose(stepped.archivedWallCoverage(now: noon) ?? -1, 2.0, 1e-12,
+                "NTP 阶跃留下的 >100% 不夹到 1（藏起来就再也看不见）")
+    var negSec = DailyStats(date: "2026-09-19"); negSec.tempSeconds = -60
+    expect(negSec.archivedWallCoverage(now: noon) == nil, "负采样秒不给覆盖率")
+    var nanSec = DailyStats(date: "2026-09-19"); nanSec.tempSeconds = .nan
+    expect(nanSec.archivedWallCoverage(now: noon) == nil, "NaN 采样秒不给覆盖率")
+
     // 诊断包必须真的把两个口径都印出来，且模板行数不变（19）。
     // 这里只断言**形状**（两个口径都在、墙钟侧不是 —）：报告内部走 Calendar.current，
     // 精确值在 DST 切换日会变，把 "0.17" 写死会让本测试在 2026-11-01 的 LA runner 上无因红。
@@ -298,8 +325,15 @@ func testWallClockWearRate() {
                                    encoding: .utf8) {
             let code = probe.split(separator: "\n").map(String.init)
                 .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }.joined()
-            expectEqual(code.components(separatedBy: "speedChangesPerWallMinute").count - 1, 1,
-                        "\(rel) 必须调用墙钟口径（出现 1 次；删掉即红，注释凑数不算）")
+            // 墙钟口径今日行独占（趋势表给的是覆盖率，无量纲、不需要分母）
+            let wallCalls = ["Sources/fanprobe/main.swift": 1, "Sources/SMCCore/DiagnosticReport.swift": 1]
+            expectEqual(code.components(separatedBy: "speedChangesPerWallMinute").count - 1,
+                        wallCalls[rel] ?? -1, "墙钟口径接线处数不符（删掉即红，注释凑数不算）: " + rel)
+            // R54：趋势表整行文本来自 SMCCore 的纯函数（否则用户可见产物零断言）。
+            // 用显式字典而不是 `rel.contains("fanprobe")` 的松散子串（审查 nit：未来同名前缀会白拿预算）
+            let rowCalls = ["Sources/fanprobe/main.swift": 1, "Sources/SMCCore/DiagnosticReport.swift": 0]
+            expectEqual(code.components(separatedBy: "wearTrendRow").count - 1,
+                        rowCalls[rel] ?? -1, "趋势行渲染接线处数不符（表被摘掉／报告私自渲染即红）: " + rel)
             // 倍数只在 fanprobe 印（报告里两列已够），所以另一侧必须是 0
             expectEqual(code.components(separatedBy: "wearRateInflation").count - 1,
                         rel.contains("fanprobe") ? 1 : 0,
@@ -436,6 +470,7 @@ func testHistogram() {
                                  "Sources/SMCCore/DiagnosticReport.swift": 1]
         // R53：墙钟口径是同一条门该管的第二个分母。两个 surface 曾各写一套单位串
         // （诊断包 "次/分"、fanprobe "次/墙钟分"），同一个数两种说法＝R45 立门的原罪重演。
+        // R54 修订：趋势表改用"墙钟覆盖率"（无量纲）后，fanprobe 只剩今日行用墙钟单位串 ⇒ 预算回到 1
         let wallRateCallSites = ["Sources/fanprobe/main.swift": 1,
                                  "Sources/SMCCore/DiagnosticReport.swift": 1]
         let repoRoot = URL(fileURLWithPath: #filePath)
