@@ -27,7 +27,12 @@ func testUIAnimationGuards() {
     }
     guard let gauge = source("Sources/FanCtlApp/GaugeViews.swift"),
           let model = source("Sources/FanCtlApp/FanModel.swift") else { return }
-    let row = String(gauge[gauge.range(of: "struct FanRow: View")!.lowerBound...])
+    // R51：锚点找不到要判红，不能靠 range(of:)! 崩掉整个测试进程（崩与红在 CI 上是两回事）
+    guard let anchor = gauge.range(of: "struct FanRow: View") else {
+        expect(false, "GaugeViews 里找不到 struct FanRow: View（改名要连门一起改，不得空转）")
+        return
+    }
+    let row = String(gauge[anchor.lowerBound...])
     // 次数用 components 数，不用 filter（filter 在 String 上逐 Character 迭代，$0.contains 不存在）
     expectEqual(row.components(separatedBy: ".contentTransition(.numericText())").count - 1, 0,
                 "FanRow 之后 numericText 出现次数=0（每拍数字不做转场）")
@@ -66,16 +71,22 @@ func testUIAnimationGuards() {
         codeOnly(s).joined().replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "\t", with: "")
     }
+    // 递归列举：SwiftPM 的源是递归收的，只列顶层会让 FanCtlApp/Sub/X.swift 同时躲开
+    // "文件数"与"逐文件预算"两颗牙（R51 独立审查抓到）
     let viewDir = root.appendingPathComponent("Sources/FanCtlApp")
-    let viewFiles = (try? FileManager.default.contentsOfDirectory(atPath: viewDir.path))?.sorted() ?? []
-    expectEqual(viewFiles.filter { $0.hasSuffix(".swift") }.count, 11,
+    let viewFiles = ((try? FileManager.default.subpathsOfDirectory(atPath: viewDir.path))?.sorted() ?? [])
+        .filter { $0.hasSuffix(".swift") }
+    expectEqual(viewFiles.count, 11,
                 "FanCtlApp 视图文件数=11（死数字：新增文件会同时进下面的转场预算）")
     var transTotal = 0
-    for f in viewFiles where f.hasSuffix(".swift") {
+    var tweenTotal = 0
+    for f in viewFiles {
         guard let src = source("Sources/FanCtlApp/\(f)") else { return }
-        let n = flat(src).components(separatedBy: "contentTransition(.numericText").count - 1
+        let flatSrc = flat(src)
+        let n = flatSrc.components(separatedBy: "contentTransition(.numericText").count - 1
         transTotal += n
-        // 逐文件死预算：加一处即红，**搬到别的文件/独立子视图也红**（绕路径①的完整版）
+        tweenTotal += flatSrc.components(separatedBy: ".animation(").count - 1
+        // 逐文件死预算：加一处即红，搬到别的文件/独立子视图也红（绕路径①的完整版）
         let expectN: Int
         switch f {
         case "GaugeViews.swift": expectN = 1
@@ -86,13 +97,16 @@ func testUIAnimationGuards() {
         expectEqual(n, expectN, "\(f) 的 numericText 处数=\(expectN)（每拍数字不做转场）")
         let lines = codeOnly(src)
         for (i, ln) in lines.enumerated() where ln.contains("Text(")
-            && (ln.contains("actualRPM") || ln.contains("loadFraction")) {
-            let window = lines[i..<min(lines.count, i + 4)].joined()
+            && (ln.contains("actualRPM") || ln.contains("loadFraction") || ln.contains("rpmText")) {
+            // 窗口也要过 flat：否则 `.contentTransition(\n .numericText())` 的换行写法
+            // 能躲开按行拼接的判据（R51 独立审查抓到）
+            let window = flat(lines[i..<min(lines.count, i + 4)].joined())
             expect(!window.contains("contentTransition(.numericText"),
                    "\(f):\(i + 1) 每拍数字（转速/占比）不挂转场——换宿主视图也一样红")
         }
     }
     expectEqual(transTotal, 10, "全面板 numericText 总数=10（死预算：新文件里加一处也红）")
+    expectEqual(tweenTotal, 37, "全面板 .animation( 总数=37（死预算：隐式动画只能减不能加）")
     expectEqual(flat(model).components(separatedBy: "withAnimation").count - 1, 3,
                 "FanModel 的 withAnimation 总数=3（死预算：新增一处事务级动画即红）")
     // :722 的 `withAnimation(.snappy(0.25)) { assign() }` **刻意不设反断言**：R51 用
@@ -121,8 +135,12 @@ func testTickBenchSafety() {
     // ① 不许出现真实数据目录的字面量：所有写盘必须走覆盖后的临时目录
     expect(!bench.contains("/Library/Application Support"),
            "量具里不得硬编码真实 support 目录（写盘只能落临时目录）")
-    // ② 顺序前提：先重定向路径，再构造 FanModel（否则 watch/config 读写打在真目录上）
-    let iOverride = bench.range(of: "setOverridesForTesting")?.lowerBound
+    // ② 顺序前提：先重定向路径，再构造 FanModel（否则 watch/config 读写打在真目录上）。
+    //    取**最后一次**出现的位置并钉次数=1：只查首次会被"收尾时再调一次恢复真实目录"
+    //    这种合法写法骗过去（R51 独立审查抓到的真洞）。
+    let overrideHits = bench.components(separatedBy: "setOverridesForTesting").count - 1
+    expectEqual(overrideHits, 1, "量具里 setOverridesForTesting 只能出现 1 次（跑完不得把路径改回真实目录）")
+    let iOverride = bench.range(of: "setOverridesForTesting", options: .backwards)?.lowerBound
     let iModel = bench.range(of: "FanModel()")?.lowerBound
     guard let o = iOverride, let m = iModel else {
         expect(false, "量具缺少 setOverridesForTesting 或 FanModel() 锚点（改名要连门一起改）")
@@ -132,9 +150,29 @@ func testTickBenchSafety() {
     // ③ 接线自证：入口真的被调用（存在性反断言不算牙，见 R47 教训）
     expect(appEntry.contains("--tickbench") && appEntry.contains("TickBench.run()"),
            "--tickbench 入口已接线到 App 启动路径")
-    // ④ 量具有"不测空气"的守卫：夹具读不到必须 exit 非零，不能静默出 0 成本
-    expect(bench.contains("ABORT=no-fixture") && bench.contains("exit(2)"),
-           "夹具缺席时量具判废退出（不做空气门）")
+    // ④ 判废守卫必须排在量具最前面：夹具缺席时 exit(2)，不能静默出 0 成本。
+    //    钉"ABORT 串在 FanModel() 之前"，让"把 exit 挪走/注释掉接线"不再是绿。
+    let iAbort = bench.range(of: "ABORT=no-fixture")?.lowerBound
+    guard let a = iAbort else {
+        expect(false, "量具缺少夹具缺席判废（读不到 status.json 必须出声）")
+        return
+    }
+    expect(a < m && bench.contains("code: 2"),
+           "夹具缺席时量具在建模前就判废退出（不做空气门）")
+    // ⑤ 用户态快照/还原必须包住**唯一**出口：面板可见会写 ~/Library/Caches 的趋势缓存、
+    //    消费 UserDefaults 的冲刺/静音承诺（R51 首版真的污染过 trend-history.json）。
+    //    结构判据：exit 只允许出现在 finish 里一处，且还原排在它之前——再加一条裸 exit 即红。
+    expectEqual(bench.components(separatedBy: "exit(").count - 1, 1,
+                "量具只有一个出口（多一条裸 exit 就绕过用户态还原）")
+    // 锚点取**调用处**而非定义处（定义总在文件前面，拿定义比顺序等于恒真）
+    let iSnap = bench.range(of: "= snapshotUserState()")?.lowerBound
+    let iRestore = bench.range(of: "restoreUserState(userState)", options: .backwards)?.lowerBound
+    let iExit = bench.range(of: "exit(", options: .backwards)?.lowerBound
+    guard let sn = iSnap, let rs = iRestore, let ex = iExit else {
+        expect(false, "量具缺少用户态快照/还原调用锚点（改名要连门一起改）")
+        return
+    }
+    expect(sn < m && rs < ex, "快照先于建模、还原先于唯一出口 exit")
 }
 
 func testInterpolation() {
