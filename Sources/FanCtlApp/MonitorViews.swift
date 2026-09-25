@@ -51,7 +51,8 @@ struct GlowBar: View {
                     .fill(color.gradient)
                     .frame(width: max(4, geo.size.width * min(max(fraction, 0), 1)))
                     .shadow(color: color.opacity(0.4), radius: 2.5, y: 0.5)
-                    .animation(.smooth(duration: 0.35), value: fraction)
+                    // R52：条形宽度不再每拍补间（键是原始 Double，武装即整面重栅格）
+
             }
         }
     }
@@ -160,8 +161,7 @@ struct HotspotList: View {
                 Text("\(Int(comp.temp.rounded()))°")
                     .font(MonitorStyle.numeral(idx == 0 ? 14 : 12))
                     .foregroundStyle(color.gradient)
-                    .contentTransition(.numericText())
-                    .animation(.snappy, value: comp.temp)
+                    // R52：部件温度列表每拍都在抖，转场会武装整面重栅格（同上）
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
             }
@@ -200,7 +200,7 @@ struct ProcessHogView: View {
                     Text("GPU").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
                     Text(gpuTemp > 1 ? "\(Int(gpuTemp))°" : "--")
                         .font(MonitorStyle.numeral(12)).foregroundStyle(MonitorStyle.color(gpuTemp).gradient)
-                        .contentTransition(.numericText()).animation(.snappy, value: gpuTemp)
+                        // R52：每拍抖动的温度读数不做转场（键是原始 Double，见 GaugeViews 同条注释）
                     Spacer(minLength: 4)
                     Text("GPU 忙 → 温度高")
                         .font(.system(size: 9)).foregroundStyle(.tertiary)

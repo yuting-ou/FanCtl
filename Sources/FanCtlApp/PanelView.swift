@@ -142,8 +142,11 @@ struct ContentView: View {
                     Text("\(Int(w.rounded()))W").font(.caption2.monospacedDigit().weight(.medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1).fixedSize()
-                        .contentTransition(.numericText())
-                        .animation(.snappy, value: w)
+                        // R52：头部功耗胶囊不再挂 numericText 转场/每拍补间。`w` 是每拍抖动的
+                        // 原始 Double（±1W 常态），而这里在**面板根节点**——转场一开就是整面
+                        // 重栅格（--tickbench 实测：只抖功耗 867ms/拍 vs 只抖转速 164ms/拍，
+                        // 火焰图差在 render_contents/Glyphs/vImage 整树那一支）。
+                        // 等宽直读保证宽度不跳，与 R47/R49 对转速、功耗占比的处置同族同法。
                 }
                 .help("整机实时功耗（发热根源）")
                 .transition(.opacity)

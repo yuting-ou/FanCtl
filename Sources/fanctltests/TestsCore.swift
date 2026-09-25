@@ -89,9 +89,11 @@ func testUIAnimationGuards() {
         // 逐文件死预算：加一处即红，搬到别的文件/独立子视图也红（绕路径①的完整版）
         let expectN: Int
         switch f {
-        case "GaugeViews.swift": expectN = 1
-        case "MonitorViews.swift": expectN = 2
-        case "PanelView.swift": expectN = 7
+        // R52 撤除每拍转场后重数：numericText 只剩 6 处，全在 PanelView。其中转速/占比/
+        // 温度/功耗四类每拍量已清零；仍挂着的 cur/diff/aiC 三处属 AI 模式读数（见下方已知边界）。
+        case "GaugeViews.swift": expectN = 0
+        case "MonitorViews.swift": expectN = 0
+        case "PanelView.swift": expectN = 6
         default: expectN = 0
         }
         expectEqual(n, expectN, "\(f) 的 numericText 处数=\(expectN)（每拍数字不做转场）")
@@ -105,8 +107,24 @@ func testUIAnimationGuards() {
                    "\(f):\(i + 1) 每拍数字（转速/占比）不挂转场——换宿主视图也一样红")
         }
     }
-    expectEqual(transTotal, 10, "全面板 numericText 总数=10（死预算：新文件里加一处也红）")
-    expectEqual(tweenTotal, 37, "全面板 .animation( 总数=37（死预算：隐式动画只能减不能加）")
+    expectEqual(transTotal, 6, "全面板 numericText 总数=6（死预算：新文件里加一处也红）")
+    expectEqual(tweenTotal, 33, "全面板 .animation( 总数=33（死预算：隐式动画只能减不能加）")
+    // 已知边界（R52 审查）：门只数**字面量**。① 把每拍量喂进别名变量（PanelView 的
+    // `cur`/`diff`/`aiC` 三处仍挂 numericText+补间，仅 AI 模式可见）不被数据源判据看见；
+    // ② `.contentTransition(.opacity)` 之类等价物不计入预算。要堵这两条需要语义级检查，
+    // 暂以本注释 + EVOLUTION 残余风险记账，别把"门绿"读成"没有每拍转场"。
+    // R52：趋势环按自身信息率采样 + 只在真变了才重发 history。
+    // 这条不是观感而是每拍成本：SwiftUI 侧 `history` 每拍换新数组 = 整张图重排重绘。
+    let modelCode = codeOnly(model).joined()
+    // 存在性反断言不算牙（R47 教训）：钉**次数**，把采样条件旁路掉但留着声明也会红
+    expectEqual(modelCode.components(separatedBy: "trendSampleSeconds").count - 1, 2,
+                "trendSampleSeconds 出现 2 次（声明 + 采样条件）——旁路节奏门即红")
+    expectEqual(modelCode.components(separatedBy: "lastTrendAppend").count - 1, 3,
+                "lastTrendAppend 出现 3 次（声明 + 比较 + 盖时间戳）——绕过计时即红")
+    expect(modelCode.contains("if trendDirty"),
+           "history 只在环真的动了才重发（无条件赋值等于每拍告诉 SwiftUI 图变了）")
+    expectEqual(modelCode.components(separatedBy: "history = historyBuffer.elements").count - 1, 2,
+                "history 赋值点=2（面板打开时全量 + 每拍条件式），加第三处即红")
     expectEqual(flat(model).components(separatedBy: "withAnimation").count - 1, 3,
                 "FanModel 的 withAnimation 总数=3（死预算：新增一处事务级动画即红）")
     // :722 的 `withAnimation(.snappy(0.25)) { assign() }` **刻意不设反断言**：R51 用

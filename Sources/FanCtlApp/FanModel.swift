@@ -207,12 +207,19 @@ final class FanModel: ObservableObject {
     typealias ProcessUsage = ProcessInfo
 
     private static let historyWindow: TimeInterval = 10 * 60
+    /// R52：趋势环按**它自己的信息率**采样——200 点铺满 600s 窗 = 3s/点。
+    /// 此前每拍（daemon 快拍可到 1s）都 append 并重发 history，SwiftUI 每拍重画整张
+    /// 趋势图；--tickbench 拆开归因实测：只让温度抖 = 853ms/拍，其余量都钉住 = 9ms/拍，
+    /// 差额就是这张图。快拍时段少采两拍不丢信息（环形缓冲本来就按 3s 分辨率显示）。
+    static let trendSampleSeconds: TimeInterval = 3
 
     private static let historyFile: URL = {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("com.fanctl.app/trend-history.json")
     }()
     private var historySaveCounter = 0
+    private var lastTrendAppend = Date.distantPast
+    private var trendDirty = false
 
     private static func loadHistoryBuffer() -> RingBuffer<TempSample> {
         var ring = RingBuffer<TempSample>(capacity: 200)
@@ -778,9 +785,12 @@ final class FanModel: ObservableObject {
 
         // 历史采样
         let hottest = max(cpuTemp, gpuTemp)
-        if hottest > 1 {
+        let nowT = Date()
+        if hottest > 1, nowT.timeIntervalSince(lastTrendAppend) >= Self.trendSampleSeconds {
+            lastTrendAppend = nowT
+            trendDirty = true
             // 内存采样照常：200 样本环形缓冲让"重开面板立即可见最近趋势"
-            historyBuffer.append(TempSample(id: Date(), cpu: cpuTemp, gpu: gpuTemp))
+            historyBuffer.append(TempSample(id: nowT, cpu: cpuTemp, gpu: gpuTemp))
             // #7: RingBuffer 自动淘汰最旧元素，O(1) 追加，无 removeAll 线性扫描
             // v3.5.1（R3）：落盘仅在面板可见时进行——trend 文件唯一消费者是面板
             // 打开时的快速恢复；面板长关期间每 30 事件一次 200 样本原子写是纯浪费
@@ -806,7 +816,12 @@ final class FanModel: ObservableObject {
         // 面板可见时同步额外数据
         if panelVisible {
             syncPanelDataFromSensors(sensors)
-            history = historyBuffer.elements
+            // R52：只在环真的动了才重发 history——`historyBuffer.elements` 每次都造新数组，
+            // 无条件赋值等于每拍都告诉 SwiftUI"图变了"，于是整张图重栅格。
+            if trendDirty {
+                history = historyBuffer.elements
+                trendDirty = false
+            }
             // 低频（30s）刷新只读文件数据：面板长开数小时后"经验/评测/战报/AI 效果"
             // 此前停留在打开瞬间的值，与实时学习/统计脱节
             if Date().timeIntervalSince(lastPanelFileSync) > 30 {

@@ -76,6 +76,12 @@ enum TickBench {
         // "每拍重算时 Liquid Glass 到底摊了多少"。
         let plain = args.contains("--plain")
         let onscreen = args.contains("--onscreen")
+        // --static：每拍只换 timestamp、数值一律不动。用来把"发布了"与"内容真变了"
+        // 两种成本分开——若 static 依然很贵，钱花在"整树重算/重栅格"，与显示值无关。
+        let staticValues = args.contains("--static")
+        // --vary temp,rpm,pct,power：只让选中的字段每拍抖动，其余钉死。用来把"哪一处文字
+        // 重栅格最贵"逐项拆开（全抖 830ms/拍 vs 全不抖 5ms/拍，中间必有主犯）。
+        let vary = Set((value(of: "--vary", in: args) ?? "").split(separator: ",").map(String.init))
         snapshotPlainCards = plain
 
         let userState = snapshotUserState()
@@ -139,7 +145,8 @@ enum TickBench {
         func tick() {
             tickIndex += 1
             lastWrittenTemp = writeTick(fixture: json, jitter: &jitter,
-                                        at: now.addingTimeInterval(Double(tickIndex)), to: statusURL)
+                                        at: now.addingTimeInterval(Double(tickIndex)),
+                                        to: statusURL, staticValues: staticValues, vary: vary)
         }
         tick()
         RunLoop.main.run(until: Date().addingTimeInterval(2.5))   // 建树 + 字体 + Charts 首布局
@@ -180,12 +187,20 @@ enum TickBench {
         let sorted = perTick.sorted()
         let median = sorted[sorted.count / 2]
         let mean = perTick.reduce(0, { $0 &+ $1 }) / UInt64(sorted.count)
+        // R52：只报 median 会被**双峰**骗——同一配置四次跑过 7ms 与 850ms 两种"中位数"。
+        // 分箱报形状：>100ms 算热拍，<=100ms 算冷拍，再看四分位。
+        let hot = perTick.filter { $0 > 100_000 }.count
+        let p25 = sorted[sorted.count / 4]
+        let p75 = sorted[sorted.count * 3 / 4]
         let rssDeltaKB = Int64(truncatingIfNeeded: rssEnd &- rssStart) / 1024
         // 自证两件事：数据真进了模型（model_temp ≈ written_temp，否则整轮在量静态树）、
         // 图有货（history_count，否则"图表不收费"是假绿）。形态写进同一行，便于复核。
         finish("TICKBENCH variant=\(variant) window=\(noWindow ? 0 : 1) onscreen=\(onscreen ? 1 : 0) "
-               + "quiet=\(quiet ? 1 : 0) plain=\(plain ? 1 : 0) ticks=\(sorted.count) "
+               + "quiet=\(quiet ? 1 : 0) plain=\(plain ? 1 : 0) static=\(staticValues ? 1 : 0) "
+               + "vary=\(vary.sorted().joined(separator: "+")) "
+               + "ticks=\(sorted.count) "
                + "median_us=\(median) mean_us=\(mean) max_us=\(sorted.last ?? 0) min_us=\(sorted.first ?? 0) "
+            + "p25_us=\(p25) p75_us=\(p75) hot=\(hot)/\(sorted.count) "
                + "head_med_us=\(medianOf(head)) tail_med_us=\(medianOf(tail)) "
                + "rss_delta_kb=\(rssDeltaKB) rss_per_tick_kb=\(rssDeltaKB / Int64(max(1, sorted.count))) "
                + "rss_series_kb=\(rssSeries.map { String($0) }.joined(separator: ",")) "
@@ -200,16 +215,23 @@ enum TickBench {
     /// 返回本拍写进去的 CPU 温度，供调用方与模型值对账。
     @discardableResult
     private static func writeTick(fixture: [String: Any], jitter: inout Jitter,
-                                  at date: Date, to url: URL) -> Double {
+                                  at date: Date, to url: URL, staticValues: Bool,
+                                  vary: Set<String>) -> Double {
         var json = fixture
+        let varyAll = vary.isEmpty
+        func jit(_ amp: Double, _ key: String) -> Double {
+            if staticValues { return 0 }
+            if !(varyAll || vary.contains(key)) { return 0 }
+            return jitter.span(amp)
+        }
         var sensors = (json["sensors"] as? [String: Any]) ?? [:]
         // 钳在 80° 以下：checkOverheat 是面板可见路径上的真通知（含首次授权弹窗），
         // 量具不该因为"机器当时很热"就去弹用户
-        let cpu = min(80, ((sensors["cpuDie"] as? Double) ?? 66) + jitter.span(0.8))
-        let gpu = min(80, ((sensors["gpuDie"] as? Double) ?? 52) + jitter.span(0.8))
+        let cpu = min(80, ((sensors["cpuDie"] as? Double) ?? 66) + jit(0.8, "temp"))
+        let gpu = min(80, ((sensors["gpuDie"] as? Double) ?? 52) + jit(0.8, "temp"))
         sensors["cpuDie"] = cpu
         sensors["gpuDie"] = gpu
-        if sensors["cpuAverage"] != nil { sensors["cpuAverage"] = cpu - 9 + jitter.span(1.5) }
+        if sensors["cpuAverage"] != nil { sensors["cpuAverage"] = cpu - 9 + jit(1.5, "temp") }
         json["sensors"] = sensors
         json["cpuTemp"] = cpu
         json["gpuTemp"] = gpu
@@ -218,19 +240,19 @@ enum TickBench {
                 let lo = (fans[k]["minRPM"] as? Double) ?? 1200
                 let hi = (fans[k]["maxRPM"] as? Double) ?? 5400
                 let mid = (fans[k]["targetRPM"] as? Double) ?? (lo + hi) / 2
-                fans[k]["actualRPM"] = min(hi, max(lo, mid + jitter.span(60)))
+                fans[k]["actualRPM"] = min(hi, max(lo, mid + jit(60, "rpm")))
             }
             json["fans"] = fans
         }
         if json["appliedPercent"] != nil {
-            json["appliedPercent"] = max(0, min(100, ((json["appliedPercent"] as? Double) ?? 50) + jitter.span(1.2)))
+            json["appliedPercent"] = max(0, min(100, ((json["appliedPercent"] as? Double) ?? 50) + jit(1.2, "pct")))
         }
         if var pcts = (json["appliedPercents"] as? [Double]) {
-            for k in pcts.indices { pcts[k] = max(0, min(100, pcts[k] + jitter.span(1.2))) }
+            for k in pcts.indices { pcts[k] = max(0, min(100, pcts[k] + jit(1.2, "pct"))) }
             json["appliedPercents"] = pcts
         }
         if json["powerWatts"] != nil {
-            json["powerWatts"] = max(0.2, ((json["powerWatts"] as? Double) ?? 30) + jitter.span(1.5))
+            json["powerWatts"] = max(0.2, ((json["powerWatts"] as? Double) ?? 30) + jit(1.5, "power"))
         }
         // 合成单调时钟：秒级时间戳逐拍必不同，App 的 timestamp != lastStatusTimestamp 去重
         // 不会把某一拍吞掉（用 Date() 时同秒两拍会丢刷新，成本就被摊平到"看起来更省"）

@@ -106,6 +106,10 @@ struct TempGaugeCard: View {
                         .background(Capsule().fill(color.opacity(0.15)))
                         .id(statusText)
                         .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                        // R52 审查回稿：卡级 `.animation(value: temp)` 撤掉后这颗胶囊的 transition
+                        // 就没了武装方（退化成"静态出现"，是观感退化）。改钉在**状态档位**上——
+                        // 它只在凉/温/热换档时才变，不是每拍抖动的量，观感回来而每拍成本不回来。
+                        .animation(.smooth(duration: 0.3), value: statusText)
                 }
             }
             // 主温度独占一行，保持视觉冲击力
@@ -114,9 +118,10 @@ struct TempGaugeCard: View {
                     .font(.system(size: 32, weight: .semibold, design: .rounded))
                     .foregroundStyle(color.gradient)
                     .monospacedDigit()
-                    // 主温度也用数字滚动（numericText），与 RPM/功耗/百分比一致，实时读数更"活"。
-                    // 由卡片级 .animation(.smooth(0.45)) 驱动，温度小幅变化时平滑滚动而非生硬跳变。
-                    .contentTransition(.numericText())
+                    // R52：主温度不再挂数字转场/卡级每拍补间。--tickbench 拆开归因后重判：
+                    // "补间只在显示值真变时才演"的前提不成立——`.animation(value: temp)` 的键是
+                    // 原始 Double，每拍都武装事务，而面板任一处武装 = **整面重栅格**
+                    // （只抖温度 810ms/拍 vs 什么都不抖 9ms/拍）。辉光保留（那是静态观感，不参与每拍）。
                     // 柔和辉光：让主温度数字从玻璃卡中"浮起"，强化视觉主从
                     .shadow(color: color.opacity(0.35), radius: 4, y: 1)
                 Text("°")
@@ -151,7 +156,9 @@ struct TempGaugeCard: View {
                 .animation(.smooth(duration: 0.4), value: color)
         }
         .cardStyle()
-        .animation(.smooth(duration: 0.45), value: temp)
+        // R52 审查回稿：副值 chip（"核心均温"）的出现/消失原本靠卡级 `.animation(value: temp)`
+        // 武装。改钉在 `showSubTemp`（差异是否 >1°）上——换档才动，不随每拍温度抖。
+        .animation(.smooth(duration: 0.3), value: showSubTemp)
     }
 }
 
@@ -208,7 +215,8 @@ struct FanRow: View {
                     }
                 }
                 .frame(height: 5)
-                .animation(.snappy(duration: 0.4), value: loadFraction)
+                // R52：能量条宽度不每拍补间（同上；转速数字本身已是等宽直读）
+
             }
             // 独立偏移调节：双风扇散热能力不均/个体噪音差异时微调单侧
             if let onOffsetChange {
