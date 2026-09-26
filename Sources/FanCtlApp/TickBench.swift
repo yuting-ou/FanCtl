@@ -187,6 +187,27 @@ enum TickBench {
         let rssEnd = residentBytes() ?? rssStart
         capture(host, to: pngPath)
 
+        // R64 探针：低占比截图里"右风扇图标塌成针尖"。先量清是 SwiftUI 给的 bounds 就小，
+        // 还是 bounds 对而 CALayer 没跟上——不量就改是 R59 的老路。
+        var geom: [String] = []
+        func collectGeom(_ v: NSView) {
+            if String(describing: type(of: v)).contains("FanSpinnerView") {
+                let subs = v.layer?.sublayers ?? []
+                let desc = subs.enumerated().map { i, l in
+                    "#\(i):fr\(Int(l.frame.width))x\(Int(l.frame.height))"
+                        + "bd\(Int(l.bounds.width))x\(Int(l.bounds.height))"
+                        + (l.contents == nil ? "" : "+img")
+                        + "@\(Int(l.position.x)),\(Int(l.position.y))"
+                }.joined(separator: ",")
+                geom.append("f(\(Int(v.frame.width))x\(Int(v.frame.height)))"
+                    + "b(\(Int(v.bounds.width))x\(Int(v.bounds.height)))"
+                    + "l(\(Int(v.layer?.frame.width ?? -1))x\(Int(v.layer?.frame.height ?? -1)))"
+                    + "n=\(subs.count)[\(desc.isEmpty ? "-" : desc)]")
+            }
+            for s in v.subviews { collectGeom(s) }
+        }
+        collectGeom(host)
+
         let sorted = perTick.sorted()
         let median = sorted[sorted.count / 2]
         let mean = perTick.reduce(0, { $0 &+ $1 }) / UInt64(sorted.count)
@@ -211,6 +232,7 @@ enum TickBench {
                + "rss_delta_kb=\(rssDeltaKB) rss_per_tick_kb=\(rssDeltaKB / Int64(max(1, sorted.count))) "
                + "rss_series_kb=\(rssSeries.map { String($0) }.joined(separator: ",")) "
                + "rss_points=\(rssSeries.count) "
+               + "fan_geom=\(geom.isEmpty ? "none" : geom.joined(separator: "|")) "
                + "view=\(Int(size.width))x\(Int(size.height)) history_count=\(model.history.count) "
                + "model_temp=\(String(format: "%.2f", model.cpuTemp)) written_temp=\(String(format: "%.2f", lastWrittenTemp)) "
                + "domain=\(Bundle.main.bundleIdentifier ?? "none") png=\(pngPath)", code: 0)

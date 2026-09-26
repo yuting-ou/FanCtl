@@ -315,7 +315,9 @@ final class FanSpinnerView: NSView {
 
     override func layout() {
         super.layout()
-        iconLayer.frame = bounds
+        // R64：不再赋 frame。旋转中的层 frame 是外接框，赋 frame 会反算并腐蚀 bounds。
+        iconLayer.bounds = bounds
+        iconLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
     }
 
     // 模板符号着色（sourceAtop 保留 alpha、替换颜色）
@@ -343,7 +345,9 @@ final class FanSpinnerView: NSView {
 
     func setRPM(_ rpm: Double, tint: NSColor) {
         if tint != animTint { updateTint(tint) }
-        if iconLayer.frame != bounds { iconLayer.frame = bounds }   // 布局兜底
+        // R64：同上，兜底也只写 bounds+position（幂等，且不受 transform 影响）
+        iconLayer.bounds = bounds
+        iconLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
         // v2.6.2：初始 currentRPM=-1 时即使 rpm=0 也要进入（停转半透明才生效）
         guard abs(rpm - currentRPM) > 1 || currentRPM < 0 else { return }
         let stopped = rpm < 50

@@ -25,6 +25,16 @@
 
 ## 本版变更要点
 
+- 4.2.25：**修掉"风扇图标会自己缩小"的真成因**（面板观感，实测定位而非猜）。
+  `FanSpinnerView` 每拍有一步"布局兜底" `if iconLayer.frame != bounds { iconLayer.frame = bounds }`——
+  但**旋转中的 CALayer 读 `frame` 得到的是旋转后的外接框**（本机实测 29×33、31×18，随相位变化），
+  于是这个判断恒真，每拍都给一个 `anchorPoint=(0.5,0.5)` 的旋转层赋 frame，而赋 frame 会反算
+  `bounds`/`position` ⇒ 图标尺寸被逐拍腐蚀，看着就是"风扇自己缩小了"。
+  改成只写 `bounds` + `position`（与 transform 无关、幂等）。量具新增 `fan_geom=` 出口直接打印
+  每个 spinner 的 `frame/bounds/layer/sublayer`，实测两个风扇的 layer `bounds` 恒为 `24x24`
+  （改前是 `29x33` / `31x18` 这种非方形外接框）。门加两条：`iconLayer.frame =` 不得再出现、
+  `iconLayer.bounds = bounds` 必须恰好 2 处（layout 与兜底各一）。
+  测试 5111 → 5114 断言 / 95 组；契约门槛双源 5105 → 5110。
 - 4.2.24：**把量具的数值门改成真数值门**（App target 诊断入口的测试，不改任何用户可见行为）。
   4.2.23 那条「RSS 必须逐拍采样」写的是 `tight.contains("rssSampleEvery=1")`——**子串**匹配，
   于是 `=10`、`=100`（比每 5 拍更稀的密度）四条门全绿：审查者把值改成 10 真跑，确认是假绿。

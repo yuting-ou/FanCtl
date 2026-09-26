@@ -307,6 +307,11 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
   靠它第一次看到形状：面板上屏时 40 拍里约 34 拍落在 ~0.8s 档、少数拍 ~15ms（median 818ms）；
   40 拍内看不出随拍号增长 ⇒ R59b 我写的"成本随拍数超线性累积"是过度推断，已在账本里降级。
   **注意口径**：那是单次运行、同批无第二臂，只算量级证据，不当代入验收基线（EVOLUTION R58 的规矩）。
+- **修掉"风扇图标自己缩小"的真成因（4.2.25）**：旋转中的 `CALayer` 读 `frame` 拿到的是**外接框**
+  （实测 29×33 / 31×18，随相位变），于是旧的 `if iconLayer.frame != bounds { iconLayer.frame = bounds }`
+  恒真 ⇒ 每拍都在给一个非默认 anchorPoint 的旋转层赋 frame，反算并腐蚀它的 `bounds`，图标就一格一格变小。
+  现在只写 `bounds` + `position`（与 transform 无关，幂等），实测两个风扇的 layer `bounds` 恒为 24×24。
+  门加两条（不得再赋 `iconLayer.frame`、`iconLayer.bounds = bounds` 必须恰好 2 处）。
 - **量具的采样密度与数值门（4.2.23 / 4.2.24）**：`--tickbench` 的 RSS 改成**逐拍**采样（30 拍从 6 个点
   变 30 个点），出口加 `rss_points=` 自证密度。4.2.24 把那条"必须逐拍"的门从**子串匹配**换成
   "取等号后面的连续数字再比"——旧写法下 `=10`/`=100`（比每 5 拍更稀）四条门全绿，是审查实测到的假绿。
@@ -319,7 +324,7 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
   静态门同步：PanelView 的 numericText 6→4、全面板 `.animation(` 33→32，并加**函数级门**
   （该函数体内再出现 numericText 字面量即红）。诚实边界：仍是字面量级检查，
   `let ct: ContentTransition = .numericText()` 这种注入绕得过（EVOLUTION R61 已知边界①）。
-- 测试 **4646 → 5111 断言 / 95 组**（断言数与契约门槛以顶部徽章 + `ci.yml`/`fanctltests` 双源为准；
+- 测试 **4646 → 5114 断言 / 95 组**（断言数与契约门槛以顶部徽章 + `ci.yml`/`fanctltests` 双源为准；
   两源同值本身由 `scripts/test-root-scripts.sh` 钉住）；两路独立审查共报
   11 项 → 9 修 3 证伪（其中一项的 P1 推翻了我自己先前的证伪，详见 EVOLUTION R35/R36）。
 ## 9. 4.0 变更摘要(2026-09,冷启动校准与诚实形态 + 审查修复轮)
