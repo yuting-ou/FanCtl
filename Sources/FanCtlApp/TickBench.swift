@@ -232,7 +232,7 @@ enum TickBench {
                + "rss_delta_kb=\(rssDeltaKB) rss_per_tick_kb=\(rssDeltaKB / Int64(max(1, sorted.count))) "
                + "rss_series_kb=\(rssSeries.map { String($0) }.joined(separator: ",")) "
                + "rss_points=\(rssSeries.count) "
-               + "fan_geom=\(geom.isEmpty ? "none" : geom.joined(separator: "|")) "
+               + "fan_geom=\(geom.isEmpty ? (plain ? "skip-plain-static" : "none") : geom.joined(separator: "|")) "
                + "view=\(Int(size.width))x\(Int(size.height)) history_count=\(model.history.count) "
                + "model_temp=\(String(format: "%.2f", model.cpuTemp)) written_temp=\(String(format: "%.2f", lastWrittenTemp)) "
                + "domain=\(Bundle.main.bundleIdentifier ?? "none") png=\(pngPath)", code: 0)

@@ -307,6 +307,10 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
   靠它第一次看到形状：面板上屏时 40 拍里约 34 拍落在 ~0.8s 档、少数拍 ~15ms（median 818ms）；
   40 拍内看不出随拍号增长 ⇒ R59b 我写的"成本随拍数超线性累积"是过度推断，已在账本里降级。
   **注意口径**：那是单次运行、同批无第二臂，只算量级证据，不当代入验收基线（EVOLUTION R58 的规矩）。
+- **把上一条的门写成 fail-closed（4.2.26）**：审查者实测到 4.2.25 那条"不得再赋 frame"用的是裸
+  `gauge.contains("iconLayer.frame =")`——把赋值**换行写**（`iconLayer\n .frame = bounds`）或换个接收者名
+  就静默绿、bug 原样复活，正是本仓 R51 记过并修过的同一族。现在改走 `flat()`（剥注释+去空白）并加一条
+  "本文件一律不得出现 `.frame = bounds`"，实测换行绕法从"四条门全绿"变成**红 3 条**。
 - **修掉"风扇图标自己缩小"的真成因（4.2.25）**：旋转中的 `CALayer` 读 `frame` 拿到的是**外接框**
   （实测 29×33 / 31×18，随相位变），于是旧的 `if iconLayer.frame != bounds { iconLayer.frame = bounds }`
   恒真 ⇒ 每拍都在给一个非默认 anchorPoint 的旋转层赋 frame，反算并腐蚀它的 `bounds`，图标就一格一格变小。
@@ -324,7 +328,7 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
   静态门同步：PanelView 的 numericText 6→4、全面板 `.animation(` 33→32，并加**函数级门**
   （该函数体内再出现 numericText 字面量即红）。诚实边界：仍是字面量级检查，
   `let ct: ContentTransition = .numericText()` 这种注入绕得过（EVOLUTION R61 已知边界①）。
-- 测试 **4646 → 5114 断言 / 95 组**（断言数与契约门槛以顶部徽章 + `ci.yml`/`fanctltests` 双源为准；
+- 测试 **4646 → 5116 断言 / 95 组**（断言数与契约门槛以顶部徽章 + `ci.yml`/`fanctltests` 双源为准；
   两源同值本身由 `scripts/test-root-scripts.sh` 钉住）；两路独立审查共报
   11 项 → 9 修 3 证伪（其中一项的 P1 推翻了我自己先前的证伪，详见 EVOLUTION R35/R36）。
 ## 9. 4.0 变更摘要(2026-09,冷启动校准与诚实形态 + 审查修复轮)

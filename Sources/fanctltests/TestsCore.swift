@@ -52,14 +52,11 @@ func testUIAnimationGuards() {
            "逐项功耗百分比不挂数字转场（每拍抖动的量，与 RPM 同族）")
     expectEqual(gauge.components(separatedBy: "frame(width: fanSpinnerSide").count - 1, 1,
                 "图标边长只在 FanSpinner 内部出现一次")
-    // R64：旋转中的 CALayer 读 frame 拿到的是**外接框**（实测 29x33 / 31x18），
-    // 于是旧的 `if iconLayer.frame != bounds { iconLayer.frame = bounds }` 恒真，
-    // 每次 setRPM 都给非默认 anchorPoint 的旋转层赋 frame ⇒ 反算并腐蚀 bounds
-    // ⇒ 图标一格一格缩小。这就是作者说的"风扇会自己缩小"的真成因。
-    expect(!gauge.contains("iconLayer.frame ="),
-           "iconLayer 不得再被赋 frame（旋转层的 frame 是外接框，赋它会腐蚀 bounds）")
-    expectEqual(gauge.components(separatedBy: "iconLayer.bounds = bounds").count - 1, 2,
-                "iconLayer 尺寸只有一个写入形式：layout + setRPM 兜底各一次（搬去别处或删一处即红）")
+    // R64：旋转中的 CALayer 读 frame 拿到的是**外接框**（实测 29x33 / 31x18），于是旧的
+    // `if iconLayer.frame != bounds { iconLayer.frame = bounds }` 恒真，每拍给非默认
+    // anchorPoint 的旋转层赋 frame ⇒ 反算并腐蚀 bounds ⇒ 图标一格一格缩小。
+    // 门写在下面 `flat` 定义之后（R64 审查 A P2：原来用裸 `gauge.contains` 是 fail-open，
+    // 换行写法与别名接收者都静默绿——正是 R51 记过并修过的同一族）。
     expect(model.contains("self.fans = fanStates"), "fans 仍被赋值（门不是靠删功能变绿）")
     expect(!model.contains("withAnimation(.snappy(duration: 0.25)) { self.fans ="),
            "fans 赋值不包 withAnimation")
@@ -79,6 +76,16 @@ func testUIAnimationGuards() {
         codeOnly(s).joined().replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "\t", with: "")
     }
+    let gflat = flat(gauge)
+    expect(!gflat.contains("iconLayer.frame="),
+           "iconLayer 不得再被赋 frame（旋转层的 frame 是外接框，赋它会腐蚀 bounds）")
+    expect(!gflat.contains(".frame=bounds"),
+           "本文件一律不得再出现 `x.frame = bounds` 写法（换接收者名也红）")
+    expect(gflat.contains("iconLayer.bounds=bounds")
+              && gflat.contains("position=CGPoint(x:bounds.midX,y:bounds.midY)"),
+           "图标尺寸只有一个写入形式：bounds + position 成对出现（改名或换写法即红）")
+    expectEqual(gflat.components(separatedBy: "iconLayer.bounds=bounds").count - 1, 2,
+                "bounds 写入恰好 2 处（layout + setRPM 兜底各一次）；抽成 helper 单点写要连这条门一起改")
     // 递归列举：SwiftPM 的源是递归收的，只列顶层会让 FanCtlApp/Sub/X.swift 同时躲开
     // "文件数"与"逐文件预算"两颗牙（R51 独立审查抓到）
     let viewDir = root.appendingPathComponent("Sources/FanCtlApp")

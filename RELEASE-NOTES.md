@@ -25,6 +25,14 @@
 
 ## 本版变更要点
 
+- 4.2.26：**把 4.2.25 那条"图标不得再赋 frame"的门改成 fail-closed**（纯测试/诊断，不改任何用户可见行为）。
+  上一版的门是 `gauge.contains("iconLayer.frame =")`——**子串 + 单接收者名 + 没走 `flat()`**，
+  于是把赋值写成换行形式（`iconLayer` 换行 `.frame = bounds`，Swift 合法、formatter 一断行就产得出）
+  或 `let l = iconLayer; l.frame = …` 都能静默绕过，缺陷原样复活。现在：门走 `flat()`（剥注释、去空格/Tab），
+  并加一条"本文件一律不得出现 `.frame = bounds`"（换接收者名也红）。实测同一个换行绕法：
+  **改前四条门全绿 → 改后红 3 条**。量具探针也补了一处歧义：`--plain` 下图标走静态 SF Symbol，
+  出口现在印 `fan_geom=skip-plain-static`，不再与"真没找到视图"的 `none` 同形。
+  测试 5114 → 5116 断言 / 95 组；契约门槛双源 5110 → 5115。
 - 4.2.25：**修掉"风扇图标会自己缩小"的真成因**（面板观感，实测定位而非猜）。
   `FanSpinnerView` 每拍有一步"布局兜底" `if iconLayer.frame != bounds { iconLayer.frame = bounds }`——
   但**旋转中的 CALayer 读 `frame` 得到的是旋转后的外接框**（本机实测 29×33、31×18，随相位变化），
