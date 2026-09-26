@@ -89,11 +89,13 @@ func testUIAnimationGuards() {
         // 逐文件死预算：加一处即红，搬到别的文件/独立子视图也红（绕路径①的完整版）
         let expectN: Int
         switch f {
-        // R52 撤除每拍转场后重数：numericText 只剩 6 处，全在 PanelView。其中转速/占比/
-        // 温度/功耗四类每拍量已清零；仍挂着的 cur/diff/aiC 三处属 AI 模式读数（见下方已知边界）。
+        // R52 撤除每拍转场后重数：numericText 只剩 6 处，全在 PanelView。
+        // R61 再撤 comboBar 的 diff/aiC（每拍随 AI 微调的输出百分比）⇒ 4 处：
+        //   manualPercent（手动档/冲刺·静音落档才写）、cur（AI 卡大温度，temp 类）、
+        //   learnedNow（经验 %，30 秒采样节奏）、points（已掌握点数，低频）。
         case "GaugeViews.swift": expectN = 0
         case "MonitorViews.swift": expectN = 0
-        case "PanelView.swift": expectN = 6
+        case "PanelView.swift": expectN = 4
         default: expectN = 0
         }
         expectEqual(n, expectN, "\(f) 的 numericText 处数=\(expectN)（每拍数字不做转场）")
@@ -107,11 +109,30 @@ func testUIAnimationGuards() {
                    "\(f):\(i + 1) 每拍数字（转速/占比）不挂转场——换宿主视图也一样红")
         }
     }
-    expectEqual(transTotal, 6, "全面板 numericText 总数=6（死预算：新文件里加一处也红）")
-    expectEqual(tweenTotal, 33, "全面板 .animation( 总数=33（死预算：隐式动画只能减不能加）")
-    // 已知边界（R52 审查）：门只数**字面量**。① 把每拍量喂进别名变量（PanelView 的
-    // `cur`/`diff`/`aiC` 三处仍挂 numericText+补间，仅 AI 模式可见）不被数据源判据看见；
-    // ② `.contentTransition(.opacity)` 之类等价物不计入预算。要堵这两条需要语义级检查，
+    expectEqual(transTotal, 4, "全面板 numericText 总数=4（死预算：新文件里加一处也红）")
+    expectEqual(tweenTotal, 32, "全面板 .animation( 总数=32（死预算：隐式动画只能减不能加）")
+    // R61：把 R52 记着的「别名宿主」洞按函数级堵上——comboBar 里 diff/aiC 是每拍随 AI
+    // 微调的输出百分比，改等宽直读后函数体内再出现 numericText 字面量就红。
+    // 诚实边界：这是**字面量级**检查，`let ct: ContentTransition = .numericText()` 那种注入绕得过。
+    let panel = source("Sources/FanCtlApp/PanelView.swift") ?? ""
+    if let start = panel.range(of: "private func curveAIComboBar") {
+        let tail = String(panel[start.upperBound...])
+        let body = tail.range(of: "\n    private ").map { String(tail[..<$0.lowerBound]) } ?? tail
+        expect(body.contains("intentStyle") == false,
+               "comboBar 切片止于下一个函数（终止串失配就等于把别人的函数也算进来）")
+        expect(!flat(body).contains("contentTransition(.numericText"),
+               "curveAIComboBar 内不得挂 numericText（diff/aiC 每拍变，等宽直读）")
+        // 反空转（R47 铁律：存在性断言不算牙，两处文字各钉一条）：删掉任一枝即红
+        expect(body.contains("Int(aiC))%"), "comboBar 仍打印「当前输出」")
+        expect(body.contains("AI 加码 +"), "comboBar 仍打印「AI 加码/放松」差额枝")
+    } else {
+        expect(false, "找不到 private func curveAIComboBar（改名要连门一起改，不得空转）")
+    }
+    // 已知边界（R61 更新）：门仍只数**字面量**。① 剩下 4 处 numericText 里 `cur`（AI 卡 24pt 大温度，
+    // PanelView:892）是 temp 类每拍量，本轮没动（R61 只测到 pct 类每拍 RSS 9.3→0.2MB 的路径，
+    // temp 类实测本就 1.8MB/拍）；`learnedNow`(:941) 的经验 % 由 30 秒节奏的采样驱动、非每拍；
+    // `manualPercent`(:777) 只有手动档与冲刺/静音落档时才写；`points`(:1182) 是低频计数。
+    // ② `.contentTransition(.opacity)` 之类等价物不计入预算。要堵需要语义级检查，
     // 暂以本注释 + EVOLUTION 残余风险记账，别把"门绿"读成"没有每拍转场"。
     // R52：趋势环按自身信息率采样 + 只在真变了才重发 history。
     // 这条不是观感而是每拍成本：SwiftUI 侧 `history` 每拍换新数组 = 整张图重排重绘。

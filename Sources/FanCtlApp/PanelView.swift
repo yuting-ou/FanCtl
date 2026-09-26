@@ -1109,18 +1109,19 @@ struct ContentView: View {
                     Text((diff > 0 ? "AI 加码 +" : "AI 放松 ") + "\(Int(abs(diff)))%")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(diff > 0 ? .orange : .green)
-                        .contentTransition(.numericText())
-                        .animation(.snappy, value: diff)
                         .transition(.opacity)
+                        // 出现/消失仍要淡入淡出，但补间只按「在不在」键值——按 diff 键值等于每拍演一次
+                        .animation(.snappy, value: hasDiff)
                 } else {
                     Text("AI 贴合曲线")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
+                // 「当前输出」每拍随 AI 微调（R60 实测：pct 类每拍 RSS +9.3MB，temp 类只 1.8MB）
+                // ⇒ 同族规则（R47/R49）：每拍抖动的量不挂数字转场，等宽直读。
                 Text("→ \(Int(aiC))%")
                     .font(.system(size: 10, weight: .semibold)).foregroundStyle(.purple)
-                    .monospacedDigit().contentTransition(.numericText())
-                    .animation(.snappy, value: aiC)
+                    .monospacedDigit()
             }
             GeometryReader { geo in
                 let w = geo.size.width
