@@ -344,6 +344,62 @@ func testWallClockWearRate() {
     }
 }
 
+func testZeroTempDayStillCounts() {
+    group("零可用温度日不吞账(R55)")
+    // 谓词：门从"温度可用"改成"这天有被计过的量"
+    expect(!DailyStats(date: "2026-09-20").hasAccountedActivity, "全零空账不入档（旧行为保持）")
+    var onlySpeed = DailyStats(date: "2026-09-20"); onlySpeed.speedChanges = 300
+    expect(onlySpeed.hasAccountedActivity, "只有调速次数也算有内容（温度整天被拒收的那天）")
+    var onlyPower = DailyStats(date: "2026-09-20"); onlyPower.powerCount = 1
+    expect(onlyPower.hasAccountedActivity, "只有功耗秒也算")
+    var onlyGuard = DailyStats(date: "2026-09-20"); onlyGuard.aiCyclingGuards = 1
+    expect(onlyGuard.hasAccountedActivity, "只有启停抑制计数也算")
+    var dirty = DailyStats(date: "2026-09-20"); dirty.speedChanges = -5
+    expect(!dirty.hasAccountedActivity, "负数不算内容（脏数据不因此入档）")
+
+    // 端到端：archiveDay 收下单日零温度、有 300 次调速的战报（旧门此处直接 return）
+    let dir = engineTestEnv()
+    FanCtlPaths.ensureDirectories()
+    defer {
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+    var z = DailyStats(date: "2026-09-21"); z.speedChanges = 300; z.revolutions = 9000
+    ConfigStore.archiveDay(z)
+    let h1 = ConfigStore.loadHistory()
+    expectEqual(h1.count, 1, "零可用温度日也要入档")
+    expectEqual(h1.first?.speedChanges, 300, "当天的磨损计数留在账上")
+    expectEqual(h1.first?.tempCount, 0, "温度计数如实为 0（不伪造样本）")
+    ConfigStore.archiveDay(DailyStats(date: "2026-09-22"))
+    expectEqual(ConfigStore.loadHistory().count, 1, "真正的全零空账仍不入档")
+
+    // 停机跨天：旧账要交还归档，而不是在重启时被丢掉
+    let now = Date()
+    let r = StatsSampler.restore(saved: z, now: now.addingTimeInterval(86_400))
+    expectEqual(r.toArchive?.speedChanges, 300, "跨天重启把零温度旧账交还归档（旧门此处 nil＝整天蒸发）")
+    let r2 = StatsSampler.restore(saved: DailyStats(date: "2026-09-23"), now: now)
+    expect(r2.toArchive == nil, "空账仍不归档")
+    var todayZero = DailyStats(date: DailyStats.dayString(for: now)); todayZero.speedChanges = 7
+    let r3 = StatsSampler.restore(saved: todayZero, now: now)
+    expect(r3.toArchive == nil, "同一天的零温度账不归档（它是今天）")
+    expectEqual(r3.sampler.stats.speedChanges, 7, "同一天续账保住已计的调速次数（旧门此处直接归零）")
+
+    // 不污染读者：混入零可用温度日，优化器结论逐字不变（各读者自按 tempCount 过滤）
+    var good = DailyStats(date: "2026-09-19")
+    good.maxTemp = 75; good.tempCount = 600; good.tempSum = 70 * 600; good.tempSeconds = 1800
+    for _ in 0..<600 { good.addTempSample(70, seconds: 3) }
+    let solo = CurveOptimizer.optimize(days: [good])
+    let mixed = CurveOptimizer.optimize(days: [z, good])
+    expect(solo != nil, "夹具本身够格出结论（否则下面的相等断言是空气）")
+    expectEqual(mixed?.summary ?? "nil", solo?.summary ?? "nil",
+                "零温度日进不了优化器：结论一字不差")
+    expectEqual(mixed?.hotRatio ?? -1, solo?.hotRatio ?? -1, "热压力不受零温度日影响")
+    // 趋势行：这样的日子渲染成 `— · 0%`，而不是伪装成"没磨损"
+    let future = now.addingTimeInterval(86_400)
+    expectEqual(z.wearTrendRow(now: future), "  2026-09-21: — · 0%（调速 300 次）",
+                "零采样日在趋势表里显式可见（左格 — 而非 0.00）")
+}
+
 func testInterpolation() {
     group("插值")
     let bal = CurvePreset.balanced.points

@@ -19,9 +19,11 @@ public struct StatsSampler {
     /// 停机跨天场景（daemon 未在跨天时刻运行，主循环的归档没机会执行）：
     /// stats.json 里是昨天的数据，若直接丢弃则前一天战报永久丢失，
     /// 这里把它返回给调用方归档后再开新账。
+    /// R55：门从 `tempCount > 0` 换成 `hasAccountedActivity`——旧门会让"温度整天不可用"的那本账
+    /// 在重启时被整本丢掉（当天的调速次数就此消失），而 `archiveDay` 那边也已经不再收它。
     public static func restore(saved: DailyStats?, now: Date)
         -> (sampler: StatsSampler, toArchive: DailyStats?) {
-        guard let s = saved, s.tempCount > 0 else { return (StatsSampler(now: now), nil) }
+        guard let s = saved, s.hasAccountedActivity else { return (StatsSampler(now: now), nil) }
         if s.date == DailyStats.dayString(for: now) { return (StatsSampler(stats: s), nil) }
         return (StatsSampler(now: now), s)   // 旧日期 → 先归档
     }

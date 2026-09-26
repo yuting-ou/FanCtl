@@ -902,6 +902,17 @@ public struct DailyStats: Codable {
         return speedChanges / (tempSeconds / 60.0)
     }
 
+    /// 这份战报是否"有内容值得入账"——**不要求温度可用**（R55）。
+    /// 旧的归档/恢复门是 `tempCount > 0`，于是"整天温度读数都被判失真"的日子（传感器退化、
+    /// 环境参照异常）会连带把当天的调速次数、转数、功耗秒、静音时长一起丢掉：那天风扇真的转了、
+    /// 真的在磨损，账上却一行都没有，趋势表连 `— · 0%` 都看不到。温度门该拦的是温度，不是整本账。
+    /// 放进 history 不会污染任何现有读者：`CurveOptimizer`、`FanModel.aggregate`、散热趋势卡、
+    /// `wearTrendRow` 的左格各自按 `tempCount`/`tempSeconds`/`avgPower` 过滤（R55 逐个核过）。
+    public var hasAccountedActivity: Bool {
+        tempCount > 0 || tempSeconds > 0 || speedChanges > 0 || revolutions > 0
+            || powerCount > 0 || highTempSeconds > 0 || quietSeconds > 0 || aiCyclingGuards > 0
+    }
+
     /// R53：**第二个分母**——当日墙钟分钟。`speedChangesPerMinute` 的分子在温度失真拍
     /// 也计数（`StatsSampler.record` 里 `speedChanges += 1` 在 `tempPlausible` 守卫之外），
     /// 分母却不计那些拍 ⇒ 速率被系统性抬高（R45 记过，当时只改了标签、没给量尺）。
@@ -1320,7 +1331,9 @@ public enum ConfigStore {
 
     // 跨天时把前一天的统计归档（同一天重复归档取最新，兼容 daemon 重启）
     public static func archiveDay(_ day: DailyStats) {
-        guard day.tempCount > 0 else { return }
+        // R55：门从 `tempCount > 0` 换成 `hasAccountedActivity`——温度整天不可用时，
+        // 当天的调速/转数/功耗秒仍要入账（读者各自按 tempCount/tempSeconds 过滤，不受影响）
+        guard day.hasAccountedActivity else { return }
         var days = loadHistory().filter { $0.date != day.date }
         days.append(day)
         days.sort { $0.date < $1.date }
