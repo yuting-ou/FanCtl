@@ -307,6 +307,11 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
   靠它第一次看到形状：面板上屏时 40 拍里约 34 拍落在 ~0.8s 档、少数拍 ~15ms（median 818ms）；
   40 拍内看不出随拍号增长 ⇒ R59b 我写的"成本随拍数超线性累积"是过度推断，已在账本里降级。
   **注意口径**：那是单次运行、同批无第二臂，只算量级证据，不当代入验收基线（EVOLUTION R58 的规矩）。
+- **量具的采样密度与数值门（4.2.23 / 4.2.24）**：`--tickbench` 的 RSS 改成**逐拍**采样（30 拍从 6 个点
+  变 30 个点），出口加 `rss_points=` 自证密度。4.2.24 把那条"必须逐拍"的门从**子串匹配**换成
+  "取等号后面的连续数字再比"——旧写法下 `=10`/`=100`（比每 5 拍更稀）四条门全绿，是审查实测到的假绿。
+  诚实边界：R61 报的"每拍几十 MB"是用 6 点序列的**点距(4)**当分母算出来的，逐拍之后同一句话会小 5 倍
+  ⇒ 跨轮绝对值不可比，只有同批 A/B 的比值能引用（README/EVOLUTION 都按这条口径写）。
 - **撤掉「曲线 × AI 协同」里两处每拍数字转场（4.2.22）**：`curveAIComboBar` 的「→ N%」与
   「AI 加码/放松 ±N%」是**每拍随 AI 微调**的量，原来挂着 `.contentTransition(.numericText())`+补间。
   同批 A/B 交替 5 次量到：逐拍 RSS 堆积从 20–44MB 降到 −5…0.2MB（B/A≈0.006），没动过的 temp 类
@@ -314,7 +319,7 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
   静态门同步：PanelView 的 numericText 6→4、全面板 `.animation(` 33→32，并加**函数级门**
   （该函数体内再出现 numericText 字面量即红）。诚实边界：仍是字面量级检查，
   `let ct: ContentTransition = .numericText()` 这种注入绕得过（EVOLUTION R61 已知边界①）。
-- 测试 **4646 → 5110 断言 / 95 组**（断言数与契约门槛以顶部徽章 + `ci.yml`/`fanctltests` 双源为准；
+- 测试 **4646 → 5111 断言 / 95 组**（断言数与契约门槛以顶部徽章 + `ci.yml`/`fanctltests` 双源为准；
   两源同值本身由 `scripts/test-root-scripts.sh` 钉住）；两路独立审查共报
   11 项 → 9 修 3 证伪（其中一项的 P1 推翻了我自己先前的证伪，详见 EVOLUTION R35/R36）。
 ## 9. 4.0 变更摘要(2026-09,冷启动校准与诚实形态 + 审查修复轮)

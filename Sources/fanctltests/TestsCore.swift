@@ -1438,8 +1438,16 @@ func testTickBenchPerTickSeries() {
     // 足以让逐拍堆积的归因翻车（R61 已知边界③）——密度本身是要钉住的量。
     expectEqual(code.components(separatedBy: "rssSampleEvery").count - 1, 2,
                 "rssSampleEvery 出现 2 次（声明 + 采样条件）——内联掉常量或旁路密度即红")
-    expect(tight.contains("rssSampleEvery=1"),
-           "RSS 必须逐拍采样（改回每 5 拍即红：判据的点数直接塌到 1/5）")
+    // 数值门不能是子串匹配：`=10`/`=100`（比每 5 拍更稀）此前四条门全绿（R62 审查 A P2）
+    if let r = tight.range(of: "rssSampleEvery=") {
+        let digits = tight[r.upperBound...].prefix(while: { $0.isNumber })
+        expectEqual(String(digits), "1",
+                    "RSS 必须逐拍采样（=1/之后紧跟数字即红：改回 5 或更稀的密度都要红）")
+    } else {
+        expect(false, "找不到 rssSampleEvery= 的赋值（改成别的写法绕过数值门，同样要红）")
+    }
+    expect(tight.contains("rss_points=\\(rssSeries.count)"),
+           "rss_points 必须取 rssSeries 自身的长度（换成 sorted.count 就是一条恒等拍数的假自证）")
     expectEqual(code.components(separatedBy: "rss_points=").count - 1, 1,
                 "出口要自证采样点数（没这列，密度退化只能靠人工数序列发现）")
     expectEqual(code.components(separatedBy: "rss_series_kb=").count - 1, 1,
