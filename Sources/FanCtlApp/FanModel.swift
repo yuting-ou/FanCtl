@@ -1137,8 +1137,10 @@ final class FanModel: ObservableObject {
                                   today: preloadedStats ?? ConfigStore.loadStats())
     }
 
-    private static func aggregate(_ days: [DailyStats]) -> (avg: Double, hot: Double)? {
-        let valid = days.filter { $0.tempCount > 0 }
+    private static func aggregate(_ days: [DailyStats], now: Date = Date()) -> (avg: Double, hot: Double)? {
+        // R57 审查 P1：过滤必须与 dataDayCount 同一条 isUsableDay —— 天数砍了、均温没砍，
+        // 就是「启用 3 天 · 均温 45°→61°」里两个数各自数不同的日子
+        let valid = days.filter { $0.tempCount > 0 && $0.isUsableDay(now: now) }
         guard !valid.isEmpty else { return nil }
         let tempSum = valid.reduce(0.0) { $0 + $1.tempSum }
         let hotSeconds = valid.reduce(0.0) { $0 + $1.highTempSeconds }
@@ -1167,8 +1169,12 @@ final class FanModel: ObservableObject {
         // R55：天数一律用 dataDayCount（`tempCount > 0` 的天）。history 现在允许出现
         // "当天真在跑、温度全被拒收"的空日行——它们该进磨损账，但不该把「启用 N 天」
         // 与再优化/aiNudge 的 3 天门槛喂虚（审查抓到的正是这条隐式不变量）
-        let days = after.dataDayCount
-        guard let ag = Self.aggregate(after) else { return (days, nil) }
+        let now = Date()
+        let days = after.dataDayCount(now: now)
+        // R57 审查 P2：天数被新判据砍到 0 时不能再还给面板一份「均温已变」的效果卡
+        //（「启用 0 天 · 均温 45°→61°」是自相矛盾的谎），此时只报 0 天、不给结论。
+        guard days > 0 else { return (0, nil) }
+        guard let ag = Self.aggregate(after, now: now) else { return (days, nil) }
         return (days, AIEffect(days: days, beforeAvg: b.avgTemp,
                                afterAvg: ag.avg, beforeHot: b.hotRatio, afterHot: ag.hot))
     }

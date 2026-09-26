@@ -993,6 +993,11 @@ public struct DailyStats: Codable {
         return tempSeconds / 86400.0
     }
 
+    /// 这行能不能当「某个自然日」被数、被聚合（R57 审查 P1）。**单一判据**：
+    /// `dataDayCount` 与 `FanModel.aggregate` 必须同源，否则同一张卡上「启用 N 天」与
+    /// 「均温 A→B」各自过滤不同行集，两个数不再等价同一批日子（R55 立的不变量）。
+    public func isUsableDay(now: Date) -> Bool { unusableDayNote(now: now) == nil }
+
     /// 采样口径速率的最低分母门槛（秒）：不足就不给速率。`speedChangesPerMinute` 的守卫与
     /// 趋势表的渲染**必须共用这一个数**（R54 审查 P8：此前 fanprobe 里另写死一个 30，谁调谁分叉）。
     public static let minSampledSecondsForRate: Double = 30
@@ -1004,7 +1009,20 @@ public struct DailyStats: Codable {
         let rate = tempSeconds > Self.minSampledSecondsForRate
             ? String(format: "%.2f", speedChangesPerMinute) : "—"
         let cov = archivedWallCoverage(now: now).map { String(format: "%.0f%%", $0 * 100) } ?? "—"
-        return String(format: "  %@: %@ · %@（调速 %.0f 次）", date, rate, cov, speedChanges)
+        let note = unusableDayNote(now: now).map { " · " + $0 } ?? ""
+        return String(format: "  %@: %@ · %@（调速 %.0f 次%@）", date, rate, cov, speedChanges, note)
+    }
+
+    /// 这一行能不能当"某个自然日"来读（R57）。R56 之后坏日键与未来日**会长期留在** history
+    /// （日历裁不删它们，只受行数封顶约束），所以表里必须显式说明"这行不是可用的日子"——
+    /// 否则 `"2026-9-26"` 被读成 9 月 26 日、`"9999-01-01"` 被当成"还没到的一天"，
+    /// 而 `dataDayCount`（「AI 启用 N 天」）会把它们照数。合法行给 nil（不加尾注）。
+    public func unusableDayNote(now: Date) -> String? {
+        guard Self.epochDay(ofDayKey: date) != nil else { return "日键不可解析" }
+        // 与 archivedWallCoverage 共用同一把尺（日键字典序 vs 今天的键）。R57 审查 P2-1：
+        // 这里若改用日序数，"2026-02-30" 这类"格式对但日不存在"的键会在两把尺之间分裂
+        // ——同一行既被标成"晚于今天"又给出墙钟覆盖率，等于当着读者的面自相矛盾。
+        return date > Self.dayString(for: now) ? "晚于今天（时钟跳变/手改）" : nil
     }
 
     /// 采样口径 ÷ 墙钟 的抬高倍数。**等价于「墙钟分钟 ÷ 采样分钟」**（分子 `speedChanges`
@@ -1044,11 +1062,16 @@ public extension Array where Element == DailyStats {
         filter { $0.date > baselineDate }
     }
 
-    /// "有温度数据的天数"。R55 之后 history 允许出现 `tempCount == 0` 的行（那天真的在跑但
-    /// 温度全被拒收），它们占日历位置、也进磨损账，但**不能算成"AI 启用了 N 天"**——
-    /// R55 审查抓到的正是这条被打破的隐式不变量（`after.count` 曾直接把空日计成有数据的一天，
-    /// 「启用 N 天」文案、`aiNudge` 与再优化触发门都跟着虚高）。
-    var dataDayCount: Int { filter { $0.tempCount > 0 }.count }
+    /// "有温度数据、且这一行真是某个自然日"的天数。R55 之后 history 允许出现 `tempCount == 0`
+    /// 的行（那天真的在跑但温度全被拒收），它们占日历位置、也进磨损账，但**不能算成"AI 启用了
+    /// N 天"**——R55 审查抓到的正是这条被打破的隐式不变量（`after.count` 曾直接把空日计成有数据
+    /// 的一天，「启用 N 天」文案、`aiNudge` 与再优化触发门都跟着虚高）。
+    /// R57 再补两个判据（同一条不变量的另一半）：坏日键（`epochDay` 给 nil）与**晚于今天**的行
+    /// 也不算——R56 让这两类行能长期留在 history 里，只数 `tempCount` 就等于让时钟跳变前的
+    /// 一行"未来日"冒充一天账。默认参数只为调用点省事，测试一律显式注入 `now`。
+    func dataDayCount(now: Date = Date()) -> Int {
+        filter { $0.tempCount > 0 && $0.isUsableDay(now: now) }.count
+    }
 }
 
 // MARK: - 文件存取

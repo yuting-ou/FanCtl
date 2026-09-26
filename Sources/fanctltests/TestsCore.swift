@@ -402,13 +402,13 @@ func testZeroTempDayStillCounts() {
     // R55 审查（两路同报）：入账之后，"AI 启用了 N 天"这类**天数语义**不能被空日喂虚。
     // dataDayCount 是所有"数天数"的单一口径；FanModel 走的是 App target（测试不编译它），
     // 所以那一侧用源码级门钉住——存在性反断言不算牙，改回旧写法必须红。
-    expectEqual([good, z].dataDayCount, 1, "空日不计入有数据的天数")
+    expectEqual([good, z].dataDayCount(now: Date()), 1, "空日不计入有数据的天数")
     var z2 = DailyStats(date: "2026-09-22"); z2.powerCount = 500
-    expectEqual([good, z, z2].dataDayCount, 1, "多条空日也不虚增天数")
-    expectEqual([z].dataDayCount, 0, "只有空日 ⇒ 0 天（而不是 1 天）")
-    expectEqual([DailyStats(date: "2026-09-19")].dataDayCount, 0, "全零空账同样不算一天")
+    expectEqual([good, z, z2].dataDayCount(now: Date()), 1, "多条空日也不虚增天数")
+    expectEqual([z].dataDayCount(now: Date()), 0, "只有空日 ⇒ 0 天（而不是 1 天）")
+    expectEqual([DailyStats(date: "2026-09-19")].dataDayCount(now: Date()), 0, "全零空账同样不算一天")
     var good3 = good; good3.date = "2026-09-18"
-    expectEqual([good, good3].dataDayCount, 2, "正常路径不受影响")
+    expectEqual([good, good3].dataDayCount(now: Date()), 2, "正常路径不受影响")
     // FanModel 属 App target（测试不编译它）⇒ 用源码级门钉住"天数一律走 dataDayCount"
     let fmRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -416,8 +416,14 @@ func testZeroTempDayStillCounts() {
                             encoding: .utf8) {
         let fmCode = fm.split(separator: "\n").map(String.init)
             .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }.joined()
-        expectEqual(fmCode.components(separatedBy: "after.dataDayCount").count - 1, 1,
-                    "AI 效果天数必须走 dataDayCount（改回 after.count 即红：空日会把「启用 N 天」喂虚）")
+        expectEqual(fmCode.components(separatedBy: "after.dataDayCount(now: now)").count - 1, 1,
+                    "AI 效果天数必须走 dataDayCount(now: now)（改回 after.count 即红：空日把「启用 N 天」喂虚）")
+        // 形状洞（R57 审查 P3-1）：只数前缀的话，自挑一把尺子的写法照样绿 ⇒ 钉死
+        // 「App 只能注入同一次 now」；再钉住 aggregate 与天数同源（审查 A 路 P1）
+        expect(!fmCode.contains("dataDayCount(now: ."),
+               "App 侧不得注入字面量时刻（那等于自己挑一把让天数变好看的尺）")
+        expectEqual(fmCode.components(separatedBy: "isUsableDay(now: now)").count - 1, 1,
+                    "aggregate 的过滤必须走同一条 isUsableDay（少一处=天数与均温不同源，卡片自相矛盾）")
         expect(!fmCode.contains("AIEffect(days: after.count"),
               "AIEffect 不得再拿未过滤的行数当天数")
     } else {
@@ -1180,6 +1186,8 @@ func testAIMetricsWeighted() {
 /// AI 效果天数与趋势底座跟着虚短。这里钉三件事：窗口形状、坏日键的兜底、参照点不是墙钟今天。
 func testHistoryRetentionByCalendarDays() {
     group("归档窗口按日历日裁(R56)")
+    // R57 起 dataDayCount 要注入 now（默认 Date()）：夹具日期全在过去，取当下即可复现
+    let ref = Date()
     func day(_ s: String) -> Int { DailyStats.epochDay(ofDayKey: s) ?? -999_999 }
     // 日序数用外部算好的常量钉死（含闰日/世纪闰/闰年前后），别拿实现当期望值
     expectEqual(day("1970-01-01"), 0, "epoch 起点")
@@ -1226,7 +1234,7 @@ func testHistoryRetentionByCalendarDays() {
     expectEqual(h.count, 31, "窗口=31 行（最晚日往前日差 ≤30，含首末共 31 天）")
     expectEqual(h.first?.date, "2026-08-10", "窗口内最早一行仍在（旧法裁到 08-11）")
     expectEqual(h.last?.date, "2026-09-09", "参照点=最晚归档日")
-    expectEqual(h.dataDayCount, 24, "窗口内真数据日 24 天（旧法 23：空日挤掉一个真数据日）")
+    expectEqual(h.dataDayCount(now: ref), 24, "窗口内真数据日 24 天（旧法 23：空日挤掉一个真数据日）")
     expect(!h.contains { $0.date == "2026-08-09" }, "超窗（日差 31）仍要裁掉——不是只放不裁")
     // P1 冻结回归（R56 独立审查抓到，M7 第一版逃过——坏键必须在"还需要裁"的时候就坐在末位）：
     // 未补零的 "2026-9-26" 字典序排在所有 "2026-…" 之后 ⇒ 若参照点取末行，base=nil
@@ -1244,7 +1252,7 @@ func testHistoryRetentionByCalendarDays() {
     expectEqual(fr.last?.date, "2026-9-26", "坏日键坐在末位（旧实现正是拿它当参照点）")
     expectEqual(fr.count, 32, "末行是坏键时窗口照裁：08-05…09-04 共 31 行 + 1 个坏键行（旧实现 36 行只放不裁）")
     expectEqual(fr.first?.date, "2026-08-05", "裁到的仍是「最晚可解析日往前 30 天」")
-    expectEqual(fr.dataDayCount, 31, "空日/坏键都不许挤掉窗口内的真数据日")
+    expectEqual(fr.dataDayCount(now: ref), 31, "空日/坏键都不许挤掉窗口内的真数据日")
     // 兜底：全是坏日键时日历裁一条都删不掉 ⇒ 行数封顶必须接手（旧法唯一的裁法就是它）
     ConfigStore.saveHistory([])
     for n in 1...65 {
@@ -1294,7 +1302,7 @@ func testHistoryRetentionByCalendarDays() {
     }
     let fut = ConfigStore.loadHistory()
     expectEqual(fut.count, 13, "12 个真日 + 1 个未来日全留（未修 ③ 时此处只剩未来日 1 行）")
-    expectEqual(fut.dataDayCount, 12, "真数据日一条没被未来日抹掉")
+    expectEqual(fut.dataDayCount(now: ref), 12, "真数据日一条没被未来日抹掉")
     // 封顶时坏键先走，不许挤掉真数据日（审查 B P1：removeFirst 按字典序删，坏键排在真日之后就先吃真账）
     ConfigStore.saveHistory([])
     for k in keys.prefix(9) {
@@ -1309,7 +1317,7 @@ func testHistoryRetentionByCalendarDays() {
     }
     let mixed = ConfigStore.loadHistory()
     expectEqual(mixed.count, 60, "69 行（9 真 + 60 坏键）洪泛 → 封顶 60")
-    expectEqual(mixed.dataDayCount, 9, "封顶先丢坏键：9 个真数据日一条不丢（先按字典序删的实现此处 0）")
+    expectEqual(mixed.dataDayCount(now: ref), 9, "封顶先丢坏键：9 个真数据日一条不丢（先按字典序删的实现此处 0）")
     // 同一洞的另一半：**可解析但晚于今天**的键也进不了参照点、也不该占窗（62 条 ⇒ 日历裁整段跳过）
     ConfigStore.saveHistory([])
     for k in keys.prefix(9) {
@@ -1324,8 +1332,65 @@ func testHistoryRetentionByCalendarDays() {
     }
     let flood = ConfigStore.loadHistory()
     expectEqual(flood.count, 60, "未来日洪泛仍封顶 60（日历裁无尺可用时的兜底）")
-    expectEqual(flood.dataDayCount, 9, "封顶先丢未来日：9 个真数据日全留（按字典序删的实现此处 0）")
+    expectEqual(flood.dataDayCount(now: ref), 9, "封顶先丢未来日：9 个真数据日全留（按字典序删的实现此处 0）")
     // 文案漂移哨：真正的牙是上面那组形状断言（31 行 / 24 数据日 / 封顶 60 全是字面量）——
     // 改窗口常量而不改期望值会先红。这条常量断言只负责"改了常量也同步改了所有期望值"时留痕。
     expectEqual(DailyStats.retentionDays, 30, "窗口常量=30（README/注释里的「30 天」随它一起改）")
+}
+
+/// R57：坏日键与"晚于今天"的行不许冒充某个自然日。R56 让这两类行能**长期留在** history 里
+/// （日历裁不删、只在封顶时优先出局），而 `dataDayCount` 只数 `tempCount > 0` ⇒ 时钟回拨前
+/// 写下的一行"未来日"会被数成"AI 启用的一天"，趋势表也会把 `"2026-9-26"` 当 9 月 26 日排版。
+func testUnusableHistoryRows() {
+    group("不可用日不冒充数据日(R57)")
+    // 单一注入时刻：2026-09-26 12:00 UTC。所有"和今天比"的键都从它派生 ⇒
+    // TZ -12…+14 全不变红（首版写死 09-26/09-27 时，UTC+14 下 4 条红，已实测）。
+    let now = Date(timeIntervalSince1970: 1_790_424_000)
+    let todayKey = DailyStats.dayString(for: now)
+    let yestKey = DailyStats.dayString(for: now.addingTimeInterval(-86_400))
+    let tmKey = DailyStats.dayString(for: now.addingTimeInterval(86_400))
+    // 交叉核对两条独立实现：dayString（DateFormatter）↔ epochDay（纯算术），谁漂谁红
+    func ed(_ k: String) -> Int { DailyStats.epochDay(ofDayKey: k) ?? -999_999 }
+    expectEqual(ed(tmKey) - ed(todayKey), 1, "明天键 = 今天 +1 个日历日（formatter 与算术不互相圆谎）")
+    expectEqual(ed(todayKey) - ed(yestKey), 1, "昨天键 = 今天 -1 个日历日")
+    func rec(_ key: String, temp: Bool) -> DailyStats {
+        var d = DailyStats(date: key)
+        d.speedChanges = 10
+        if temp { d.tempCount = 600; d.tempSum = 70 * 600; d.tempSeconds = 1800; d.maxTemp = 75 }
+        return d
+    }
+    expect(rec(yestKey, temp: true).unusableDayNote(now: now) == nil, "昨天 = 可用日（无尾注）")
+    expect(rec(todayKey, temp: true).unusableDayNote(now: now) == nil, "今天本身不是未来日（等号边界）")
+    expectEqual(rec("not-a-day", temp: true).unusableDayNote(now: now), "日键不可解析", "坏日键要明说")
+    expectEqual(rec("2026-09-2", temp: true).unusableDayNote(now: now), "日键不可解析",
+                "排在今天之前的坏键同样要明说（否则 ceiling 一挡就看不出判据被删）")
+    expect(rec(yestKey, temp: true).isUsableDay(now: now), "可用日谓词：合法过去日为真")
+    expect(!rec(tmKey, temp: true).isUsableDay(now: now), "可用日谓词：未来日为假")
+    expectEqual(rec(tmKey, temp: true).unusableDayNote(now: now), "晚于今天（时钟跳变/手改）", "未来日要明说")
+    // "2026-09-2" 是**排在今天之前**的坏键：只有 epochDay 判据能挡它（ceiling 挡不住），
+    // 缺了它 N5（只删 epochDay 判据）会存活——审查 P2-3 指出的正是这个覆盖面
+    let rows = [rec("2026-09-24", temp: true), rec(yestKey, temp: true), rec(todayKey, temp: true),
+                rec(tmKey, temp: true), rec("not-a-day", temp: true), rec("2026-09-2", temp: true),
+                rec(todayKey, temp: false)]
+    expectEqual(rows.filter { $0.tempCount > 0 }.count, 6, "同一批行按旧口径是 6 天（本轮要杀的就是这 3 天）")
+    expectEqual(rows.dataDayCount(now: now), 3, "坏日键与未来日不计入「AI 启用 N 天」")
+    expectEqual(rows.dataDayCount(now: now.addingTimeInterval(86_400)), 4,
+                "把时钟拨到明天，那行「未来日」就变成合法一天（判据跟着 now 走，不是写死日期）")
+    expectEqual(rec(tmKey, temp: true).archivedWallCoverage(now: now), nil, "未来日不给墙钟覆盖率")
+    // 两把尺统一（审查 P2-1）：`2026-02-30` 是"格式合法、字典序在过去、日序数却等于 3/2"的键，
+    // 覆盖率按字典序给了数 ⇒ 尾注必须同向给 nil（旧写法按日序数会标成"晚于今天"，同行自相矛盾）
+    expectEqual(rec("2026-02-30", temp: true).archivedWallCoverage(now: now) != nil, true,
+                "夹具键 2026-02-30 确实被覆盖率判成过去日（这条是下一条的前提）")
+    expectEqual(rec("2026-02-30", temp: true).unusableDayNote(now: now), nil,
+                "同一行的两个判据方向一致：字典序判在过去 ⇒ 不打「晚于今天」尾注")
+    expectEqual(rec("2026-09-24", temp: true).wearTrendRow(now: now),
+                "  2026-09-24: 0.33 · 2%（调速 10 次）",
+                "合法过去行的整行文本（速率+覆盖率+无尾注）用绝对日键钉死，防两条实现互相圆谎")
+    expectEqual(rec(todayKey, temp: true).wearTrendRow(now: now),
+                "  \(todayKey): 0.33 · —（调速 10 次）", "今天行不给覆盖率也不打尾注")
+    expectEqual(rec("not-a-day", temp: true).wearTrendRow(now: now),
+                "  not-a-day: 0.33 · —（调速 10 次 · 日键不可解析）", "坏键行在表里带显式尾注")
+    expectEqual(rec(tmKey, temp: true).wearTrendRow(now: now),
+                "  \(tmKey): 0.33 · —（调速 10 次 · 晚于今天（时钟跳变/手改））", "未来日行带显式尾注")
+    expectEqual([rec(yestKey, temp: true)].dataDayCount(now: now), 1, "正常路径不被新判据误杀")
 }
