@@ -813,6 +813,33 @@ public struct DailyStats: Codable {
 
     public static func today() -> String { dayString(for: Date()) }
 
+    // MARK: 归档保留窗口（R56）
+    // 窗口以「日历日」计：天数序列可能含 tempCount==0 的空日（R55 起会入档），
+    // 按行数裁会让空日挤掉真数据日 ⇒ 名义"保留 30 天"实得不足 30 天。
+    // 为此需要一个**不看宿主时区**的日序数——dayFormatter 跟本地时区走（这条已经记过账），
+    // 所以这里直接从 yyyy-MM-dd 三元组做纯算术（days_from_civil），坏日键给 nil。
+    /// 与「能解析的最晚归档日」的日历日差上限（含首末共 retentionDays+1 个日历日）
+    public static let retentionDays = 30
+    /// 行数封顶兜底：坏日键（手改/损坏 JSON）走不了日历裁，只有一条裁法时文件会无限膨胀
+    public static let retentionRowCap = 60
+
+    /// 日键 → 1970-01-01 起的日历日序号（纯算术，不看宿主时区与 locale）。
+    /// nil 的判据只有**格式**：缺分隔、段数不对、未补零、月份越界。月份合法而日不存在
+    /// （"2026-02-30"）按公式外推成 2026-03-02（月内溢出的滚动，不是日历归整）——
+    /// 归档按 `date` 字符串去重，所以这种手改键可能与真次日并存成两行（R56 已知边界③）。
+    public static func epochDay(ofDayKey key: String) -> Int? {
+        let p = key.split(separator: "-", omittingEmptySubsequences: false)
+        guard p.count == 3, p[0].count == 4, p[1].count == 2, p[2].count == 2,
+              let y = Int(p[0]), let m = Int(p[1]), let d = Int(p[2]),
+              (1...12).contains(m), (1...31).contains(d) else { return nil }
+        let yy = y - (m <= 2 ? 1 : 0)
+        let era = (yy >= 0 ? yy : yy - 399) / 400
+        let yoe = yy - era * 400
+        let doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+        return era * 146097 + doe - 719468
+    }
+
     // 自定义 Codable：powerSum/powerCount 是 v8 新增字段，旧战报 JSON 无此字段，
     // 非 Optional 的合成解码会直接失败——decodeIfPresent 缺省 0 保持旧数据兼容
     private enum CodingKeys: String, CodingKey {
@@ -1289,7 +1316,7 @@ public enum ConfigStore {
                                    decoder: decoder, readOnly: readOnly)?.sanitized()
     }
 
-    // MARK: 历史战报（按天归档，保留 30 天）
+    // MARK: 历史战报（按天归档，保留最近 30 个日历日 · R56）
 
     public static func loadHistory(readOnly: Bool = false) -> [DailyStats] {
         let decoder = JSONDecoder()
@@ -1348,7 +1375,39 @@ public enum ConfigStore {
         var days = loadHistory().filter { $0.date != day.date }
         days.append(day)
         days.sort { $0.date < $1.date }
-        if days.count > 30 { days.removeFirst(days.count - 30) }
+        // R56：窗口从「最近 30 行」改成「与最晚归档日的日历日差 ≤ retentionDays」。旧裁法在 R55
+        // 之后会说谎——空日（tempCount==0 但那天真在跑）也占一行，把真数据日挤出窗口，于是
+        // 注释/README 承诺的"保留 30 天"实得不足 30 天，AI 效果天数与趋势底座跟着虚短。
+        // 参照点取「不晚于今天、且能解析出的最晚日」，三条边界都是刻意的：
+        // ① 不是墙钟今天 ⇒ 停摆期间（没有归档发生）不裁，跨天归档时才按窗裁；
+        // ② 不是字典序末行（R56 审查 A P1）⇒ 手改出的坏键（"2026-9-26" 未补零、'9'>'0' 会排到
+        //    末位）若当参照点，base=nil 让整段日历裁被跳过，只剩行数封顶——恰好退回按行裁；
+        // ③ 必须 ≤ 今天（R56 审查 B P1）⇒ 一条 `"9999-12-31"` 若当参照点，`base - e > 30` 对
+        //    所有真日子恒真 ⇒ 次日归档会把整本旧账裁光。未来日只当普通行留着，没资格当尺。
+        let ceiling = DailyStats.epochDay(ofDayKey: DailyStats.today())
+        let anchored = days.compactMap { d -> Int? in
+            guard let e = DailyStats.epochDay(ofDayKey: d.date), e <= (ceiling ?? e) else { return nil }
+            return e
+        }
+        if let base = anchored.max() {
+            days.removeAll { d in
+                guard let e = DailyStats.epochDay(ofDayKey: d.date) else { return false }
+                return base - e > DailyStats.retentionDays
+            }
+        }
+        // 坏日键与未来日都进不了日历裁（一条都删不掉）⇒ 行数封顶兜底。封顶先丢"没资格占窗"的
+        // 行（不可解析键、晚于今天的键），仍超才按字典序丢最旧：坏数据没资格挤掉真数据日
+        // （R56 审查 B P1：旧写法 removeFirst 先吃字典序最前，而真日子恰好排在坏键/未来日之前）。
+        let overflow = days.count - DailyStats.retentionRowCap
+        if overflow > 0 {
+            func unanchored(_ key: String) -> Bool {
+                guard let e = DailyStats.epochDay(ofDayKey: key) else { return true }
+                return ceiling.map { e > $0 } ?? false
+            }
+            let droppable = days.indices.filter { unanchored(days[$0].date) }
+            for i in droppable.prefix(overflow).reversed() { days.remove(at: i) }
+            if days.count > DailyStats.retentionRowCap { days.removeFirst(days.count - DailyStats.retentionRowCap) }
+        }
         // R35 审查（P3）：归档落盘失败不再静默——saveHistory 返回 Bool 却无人读，
         // 磁盘满/权限坏时那一日数据直接蒸发，而它正是 C1 逐日抢救想保的 30 天底座。
         if !saveHistory(days) {

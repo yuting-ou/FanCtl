@@ -1174,3 +1174,158 @@ func testAIMetricsWeighted() {
         expect(false, "垃圾账本应可解码（Optional 字段容忍缺键）: \(error)")
     }
 }
+
+/// R56：归档窗口按**日历日**裁。旧法按行数裁（>30 行删最旧的），而 R55 之后 history 里
+/// 会出现 tempCount==0 的空日——它们占行不占数据，于是"保留 30 天"实得不足 30 天，
+/// AI 效果天数与趋势底座跟着虚短。这里钉三件事：窗口形状、坏日键的兜底、参照点不是墙钟今天。
+func testHistoryRetentionByCalendarDays() {
+    group("归档窗口按日历日裁(R56)")
+    func day(_ s: String) -> Int { DailyStats.epochDay(ofDayKey: s) ?? -999_999 }
+    // 日序数用外部算好的常量钉死（含闰日/世纪闰/闰年前后），别拿实现当期望值
+    expectEqual(day("1970-01-01"), 0, "epoch 起点")
+    expectEqual(day("2000-02-29"), 11016, "2000-02-29（世纪闰年）")
+    expectEqual(day("2026-01-01"), 20454, "2026 元旦")
+    expectEqual(day("2026-09-26"), 20722, "2026-09-26")
+    expectEqual(day("2026-03-01") - day("2026-02-28"), 1, "平年 2/28→3/1 相邻")
+    expectEqual(day("2024-03-01") - day("2024-02-28"), 2, "闰年 2/29 占一格")
+    expectEqual(day("1970-01-01") - day("1969-12-31"), 1, "跨 epoch 往前不跳格")
+    // 坏日键一律 nil（不猜、不当 0 用——那会把整窗裁成"从 1970 起算"）
+    expect(DailyStats.epochDay(ofDayKey: "2026-9-6") == nil, "月/日未补零 → nil")
+    expect(DailyStats.epochDay(ofDayKey: "2026-13-01") == nil, "月份越界 → nil")
+    expectEqual(DailyStats.epochDay(ofDayKey: "2026-02-30") ?? -1, day("2026-03-02"),
+                "格式对但日不存在：纯公式外推（2026 无 2/30 ⇒ 与 3/2 同号），不是日历归整")
+    expect(DailyStats.epochDay(ofDayKey: "20260101") == nil, "无分隔符 → nil")
+    expect(DailyStats.epochDay(ofDayKey: "") == nil, "空键 → nil")
+    expect(DailyStats.epochDay(ofDayKey: "2026-01-01T00:00") == nil, "带时间的键 → nil（键形态只此一种）")
+
+    let dir = engineTestEnv()
+    FanCtlPaths.ensureDirectories()
+    defer {
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+    // 40 个日历日（2026-08-01…09-09），每逢 i%4==0 写成"只有磨损账"的空日 ⇒ 10 空 30 数据
+    let keys = ["2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04", "2026-08-05",
+                "2026-08-06", "2026-08-07", "2026-08-08", "2026-08-09", "2026-08-10",
+                "2026-08-11", "2026-08-12", "2026-08-13", "2026-08-14", "2026-08-15",
+                "2026-08-16", "2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20",
+                "2026-08-21", "2026-08-22", "2026-08-23", "2026-08-24", "2026-08-25",
+                "2026-08-26", "2026-08-27", "2026-08-28", "2026-08-29", "2026-08-30",
+                "2026-08-31", "2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04",
+                "2026-09-05", "2026-09-06", "2026-09-07", "2026-09-08", "2026-09-09"]
+    expectEqual(keys.count, 40, "夹具 40 个日历日")
+    for (i, k) in keys.enumerated() {
+        var d = DailyStats(date: k)
+        d.speedChanges = i % 4 == 0 ? 100 : 50
+        if i % 4 != 0 { d.tempCount = 600; d.tempSum = 70 * 600; d.tempSeconds = 1800; d.maxTemp = 75 }
+        ConfigStore.archiveDay(d)
+    }
+    let h = ConfigStore.loadHistory()
+    // 最晚日 09-09、窗口"日差 ≤30" ⇒ 留 08-10…09-09 = 31 行（含首末 31 个日历日）。
+    // 旧法此处只剩 30 行，且被裁掉的 08-10 恰是数据日 ⇒ 真数据日少一天
+    expectEqual(h.count, 31, "窗口=31 行（最晚日往前日差 ≤30，含首末共 31 天）")
+    expectEqual(h.first?.date, "2026-08-10", "窗口内最早一行仍在（旧法裁到 08-11）")
+    expectEqual(h.last?.date, "2026-09-09", "参照点=最晚归档日")
+    expectEqual(h.dataDayCount, 24, "窗口内真数据日 24 天（旧法 23：空日挤掉一个真数据日）")
+    expect(!h.contains { $0.date == "2026-08-09" }, "超窗（日差 31）仍要裁掉——不是只放不裁")
+    // P1 冻结回归（R56 独立审查抓到，M7 第一版逃过——坏键必须在"还需要裁"的时候就坐在末位）：
+    // 未补零的 "2026-9-26" 字典序排在所有 "2026-…" 之后 ⇒ 若参照点取末行，base=nil
+    // 让整段日历裁被跳过，只剩 60 行封顶——恰好退回本轮要消灭的"按行裁/只放不裁"。
+    ConfigStore.saveHistory([])
+    var earlyJunk = DailyStats(date: "2026-9-26")
+    earlyJunk.speedChanges = 5
+    ConfigStore.archiveDay(earlyJunk)
+    for k in keys.prefix(35) {   // 2026-08-01…08-31 + 09-01…09-04（全是数据日，别再掺空日混淆这一段的期望值）
+        var g = DailyStats(date: k)
+        g.speedChanges = 7; g.tempCount = 600; g.tempSum = 70 * 600; g.tempSeconds = 1800; g.maxTemp = 75
+        ConfigStore.archiveDay(g)
+    }
+    let fr = ConfigStore.loadHistory()
+    expectEqual(fr.last?.date, "2026-9-26", "坏日键坐在末位（旧实现正是拿它当参照点）")
+    expectEqual(fr.count, 32, "末行是坏键时窗口照裁：08-05…09-04 共 31 行 + 1 个坏键行（旧实现 36 行只放不裁）")
+    expectEqual(fr.first?.date, "2026-08-05", "裁到的仍是「最晚可解析日往前 30 天」")
+    expectEqual(fr.dataDayCount, 31, "空日/坏键都不许挤掉窗口内的真数据日")
+    // 兜底：全是坏日键时日历裁一条都删不掉 ⇒ 行数封顶必须接手（旧法唯一的裁法就是它）
+    ConfigStore.saveHistory([])
+    for n in 1...65 {
+        var junk = DailyStats(date: "g\(n)")
+        junk.speedChanges = 5
+        ConfigStore.archiveDay(junk)
+    }
+    let capped = ConfigStore.loadHistory()
+    expectEqual(capped.count, 60, "坏日键洪泛时仍按行数封顶（不靠日历裁；60=字面量，改常量必须同步改这里）")
+    expect(capped.allSatisfy { DailyStats.epochDay(ofDayKey: $0.date) == nil }, "兜底样本确实都是坏日键")
+    // 坏日键**不因窗口被删**（M6 首轮存活暴露的洞：这里若无断言，把 `else { return false }`
+    // 写成 `?? 0` 就等于把坏键当天当成 1970 年裁掉——静默丢数据，而旧法不会）
+    ConfigStore.saveHistory([])
+    var anchor = DailyStats(date: "2026-09-09"); anchor.speedChanges = 10
+    ConfigStore.archiveDay(anchor)
+    for key in ["1997-13-01", "1998-13-01", "1999-13-01"] {   // 都排在锚点日之前，且月份越界 → nil
+        var junk = DailyStats(date: key)
+        junk.speedChanges = 5
+        ConfigStore.archiveDay(junk)
+    }
+    let keep = ConfigStore.loadHistory()
+    expectEqual(keep.count, 4, "最晚日可解析时坏日键行仍保留（不把 nil 当 1970 裁掉）")
+    expect(keep.contains { $0.date == "2026-09-09" }, "可解析的锚点行留在原位")
+    // 参照点用最晚归档日而非墙钟今天 ⇒ 裁只在"有新归档发生"时推进：停摆两个月期间不动账
+    ConfigStore.saveHistory([])
+    for k in ["2026-05-01", "2026-05-02"] {
+        var d = DailyStats(date: k)
+        d.speedChanges = 10
+        ConfigStore.archiveDay(d)
+    }
+    expectEqual(ConfigStore.loadHistory().count, 2, "两个月没归档时旧账原样留着（墙钟今天不参与裁）")
+    // 诚实的另一半：一旦有新日子跨天归档，超窗旧账就是要让位——这是"日历窗"的定义，别当成保票
+    var back = DailyStats(date: "2026-07-10")
+    back.speedChanges = 10
+    ConfigStore.archiveDay(back)
+    expectEqual(ConfigStore.loadHistory().count, 1, "跨天归档后两个月前的旧账按窗让位（R56 审查 B P2 的措辞校正）")
+    // 未来日不得当参照点（审查 B P1）："2099-01-01" 若当尺，base-e>30 对一切真日子恒真
+    // ⇒ 次日归档把整本旧账裁光。它只能当普通行留着，既不当尺也不被日历裁掉。
+    ConfigStore.saveHistory([])
+    var far = DailyStats(date: "2099-01-01")
+    far.speedChanges = 5
+    ConfigStore.archiveDay(far)
+    for k in keys.suffix(12) {   // 2026-08-29…09-09，全在真实今天之前
+        var g = DailyStats(date: k)
+        g.speedChanges = 7; g.tempCount = 600; g.tempSum = 70 * 600; g.tempSeconds = 1800; g.maxTemp = 75
+        ConfigStore.archiveDay(g)
+    }
+    let fut = ConfigStore.loadHistory()
+    expectEqual(fut.count, 13, "12 个真日 + 1 个未来日全留（未修 ③ 时此处只剩未来日 1 行）")
+    expectEqual(fut.dataDayCount, 12, "真数据日一条没被未来日抹掉")
+    // 封顶时坏键先走，不许挤掉真数据日（审查 B P1：removeFirst 按字典序删，坏键排在真日之后就先吃真账）
+    ConfigStore.saveHistory([])
+    for k in keys.prefix(9) {
+        var g = DailyStats(date: k)
+        g.speedChanges = 7; g.tempCount = 600; g.tempSum = 70 * 600; g.tempSeconds = 1800; g.maxTemp = 75
+        ConfigStore.archiveDay(g)
+    }
+    for n in 1...60 {
+        var z = DailyStats(date: "z\(n)")
+        z.speedChanges = 5
+        ConfigStore.archiveDay(z)
+    }
+    let mixed = ConfigStore.loadHistory()
+    expectEqual(mixed.count, 60, "69 行（9 真 + 60 坏键）洪泛 → 封顶 60")
+    expectEqual(mixed.dataDayCount, 9, "封顶先丢坏键：9 个真数据日一条不丢（先按字典序删的实现此处 0）")
+    // 同一洞的另一半：**可解析但晚于今天**的键也进不了参照点、也不该占窗（62 条 ⇒ 日历裁整段跳过）
+    ConfigStore.saveHistory([])
+    for k in keys.prefix(9) {
+        var g = DailyStats(date: k)
+        g.speedChanges = 7; g.tempCount = 600; g.tempSum = 70 * 600; g.tempSeconds = 1800; g.maxTemp = 75
+        ConfigStore.archiveDay(g)
+    }
+    for y in 2099...2160 {   // 62 条格式合法、但全晚于真实今天
+        var f = DailyStats(date: "\(y)-01-01")
+        f.speedChanges = 5
+        ConfigStore.archiveDay(f)
+    }
+    let flood = ConfigStore.loadHistory()
+    expectEqual(flood.count, 60, "未来日洪泛仍封顶 60（日历裁无尺可用时的兜底）")
+    expectEqual(flood.dataDayCount, 9, "封顶先丢未来日：9 个真数据日全留（按字典序删的实现此处 0）")
+    // 文案漂移哨：真正的牙是上面那组形状断言（31 行 / 24 数据日 / 封顶 60 全是字面量）——
+    // 改窗口常量而不改期望值会先红。这条常量断言只负责"改了常量也同步改了所有期望值"时留痕。
+    expectEqual(DailyStats.retentionDays, 30, "窗口常量=30（README/注释里的「30 天」随它一起改）")
+}
