@@ -398,6 +398,31 @@ func testZeroTempDayStillCounts() {
     let future = now.addingTimeInterval(86_400)
     expectEqual(z.wearTrendRow(now: future), "  2026-09-21: — · 0%（调速 300 次）",
                 "零采样日在趋势表里显式可见（左格 — 而非 0.00）")
+
+    // R55 审查（两路同报）：入账之后，"AI 启用了 N 天"这类**天数语义**不能被空日喂虚。
+    // dataDayCount 是所有"数天数"的单一口径；FanModel 走的是 App target（测试不编译它），
+    // 所以那一侧用源码级门钉住——存在性反断言不算牙，改回旧写法必须红。
+    expectEqual([good, z].dataDayCount, 1, "空日不计入有数据的天数")
+    var z2 = DailyStats(date: "2026-09-22"); z2.powerCount = 500
+    expectEqual([good, z, z2].dataDayCount, 1, "多条空日也不虚增天数")
+    expectEqual([z].dataDayCount, 0, "只有空日 ⇒ 0 天（而不是 1 天）")
+    expectEqual([DailyStats(date: "2026-09-19")].dataDayCount, 0, "全零空账同样不算一天")
+    var good3 = good; good3.date = "2026-09-18"
+    expectEqual([good, good3].dataDayCount, 2, "正常路径不受影响")
+    // FanModel 属 App target（测试不编译它）⇒ 用源码级门钉住"天数一律走 dataDayCount"
+    let fmRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    if let fm = try? String(contentsOfFile: fmRoot.appendingPathComponent("Sources/FanCtlApp/FanModel.swift").path,
+                            encoding: .utf8) {
+        let fmCode = fm.split(separator: "\n").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }.joined()
+        expectEqual(fmCode.components(separatedBy: "after.dataDayCount").count - 1, 1,
+                    "AI 效果天数必须走 dataDayCount（改回 after.count 即红：空日会把「启用 N 天」喂虚）")
+        expect(!fmCode.contains("AIEffect(days: after.count"),
+              "AIEffect 不得再拿未过滤的行数当天数")
+    } else {
+        expect(false, "静态门读不到 FanModel.swift（源码缺席必须判红，不得空转）")
+    }
 }
 
 func testInterpolation() {

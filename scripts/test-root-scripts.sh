@@ -503,8 +503,8 @@ WF="$ROOT/.github/workflows/ci.yml"
 # R54（独立审查 P4）：断言数契约门槛有**两个源**——`fanctltests` 的 minAssertions 与 ci.yml 的
 # `-lt N`。历史上每次都靠人记着同步，而漏改一个**不会让任何东西变红**（本地全绿、CI 拿旧下限，
 # 门形同虚设）。所以把"两源同值"本身做成一条门。
-MA=$(grep -oE '^let minAssertions = [0-9]+' "$ROOT/Sources/fanctltests/main.swift" | grep -oE '[0-9]+')
-CF=$(grep -oE '"\$N" -lt [0-9]+' "$WF" | grep -oE '[0-9]+')
+MA=$(grep -oE '^let minAssertions = [0-9]+' "$ROOT/Sources/fanctltests/main.swift" | grep -oE '[0-9]+' || true)
+CF=$(grep -oE '"\$N" -lt [0-9]+' "$WF" | grep -oE '[0-9]+' || true)
 if [[ -n "$MA" && -n "$CF" && "$MA" == "$CF" ]]; then
     ok "断言数契约门槛双源同值：$MA = fanctltests = ci.yml"
 else

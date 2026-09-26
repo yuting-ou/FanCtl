@@ -907,7 +907,12 @@ public struct DailyStats: Codable {
     /// 环境参照异常）会连带把当天的调速次数、转数、功耗秒、静音时长一起丢掉：那天风扇真的转了、
     /// 真的在磨损，账上却一行都没有，趋势表连 `— · 0%` 都看不到。温度门该拦的是温度，不是整本账。
     /// 放进 history 不会污染任何现有读者：`CurveOptimizer`、`FanModel.aggregate`、散热趋势卡、
-    /// `wearTrendRow` 的左格各自按 `tempCount`/`tempSeconds`/`avgPower` 过滤（R55 逐个核过）。
+    /// `wearTrendRow` 的左格、`dataDayCount` 各自按 `tempCount`/`tempSeconds`/`avgPower` 过滤
+    /// （R55 逐个核过并各加断言）。
+    /// 列了 8 项累计量而不是"全部"：`overshootPeak` 不在内——它 >0 蕴含当天必有拍被计（转数或
+    /// 调速至少一项已 >0），加进来只会多一条没有归属的死分支（R53 的教训）。
+    /// `tempSeconds`/`highTempSeconds` 在写路径上被 `tempCount` 蕴含，留着是为了手改/半损坏的
+    /// stats.json 也能被承认"这天真跑过"。
     public var hasAccountedActivity: Bool {
         tempCount > 0 || tempSeconds > 0 || speedChanges > 0 || revolutions > 0
             || powerCount > 0 || highTempSeconds > 0 || quietSeconds > 0 || aiCyclingGuards > 0
@@ -1011,6 +1016,12 @@ public extension Array where Element == DailyStats {
     func after(baselineDate: String) -> [DailyStats] {
         filter { $0.date > baselineDate }
     }
+
+    /// "有温度数据的天数"。R55 之后 history 允许出现 `tempCount == 0` 的行（那天真的在跑但
+    /// 温度全被拒收），它们占日历位置、也进磨损账，但**不能算成"AI 启用了 N 天"**——
+    /// R55 审查抓到的正是这条被打破的隐式不变量（`after.count` 曾直接把空日计成有数据的一天，
+    /// 「启用 N 天」文案、`aiNudge` 与再优化触发门都跟着虚高）。
+    var dataDayCount: Int { filter { $0.tempCount > 0 }.count }
 }
 
 // MARK: - 文件存取

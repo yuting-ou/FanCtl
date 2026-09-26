@@ -1164,9 +1164,13 @@ final class FanModel: ObservableObject {
     private func reoptimizeState(preloadedDays: [DailyStats]? = nil) -> (afterDays: Int, effect: AIEffect?) {
         guard let b = loadBaseline() else { return (0, nil) }
         let after = (preloadedDays ?? loadDaysWithToday()).after(baselineDate: b.date)
-        guard let ag = Self.aggregate(after) else { return (after.count, nil) }
-        return (after.count, AIEffect(days: after.count, beforeAvg: b.avgTemp,
-                                      afterAvg: ag.avg, beforeHot: b.hotRatio, afterHot: ag.hot))
+        // R55：天数一律用 dataDayCount（`tempCount > 0` 的天）。history 现在允许出现
+        // "当天真在跑、温度全被拒收"的空日行——它们该进磨损账，但不该把「启用 N 天」
+        // 与再优化/aiNudge 的 3 天门槛喂虚（审查抓到的正是这条隐式不变量）
+        let days = after.dataDayCount
+        guard let ag = Self.aggregate(after) else { return (days, nil) }
+        return (days, AIEffect(days: days, beforeAvg: b.avgTemp,
+                               afterAvg: ag.avg, beforeHot: b.hotRatio, afterHot: ag.hot))
     }
 
     private func refreshAIStatus(preloadedDays: [DailyStats]? = nil) {
