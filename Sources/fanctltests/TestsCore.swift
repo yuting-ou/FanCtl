@@ -1394,3 +1394,23 @@ func testUnusableHistoryRows() {
                 "  \(tmKey): 0.33 · —（调速 10 次 · 晚于今天（时钟跳变/手改））", "未来日行带显式尾注")
     expectEqual([rec(yestKey, temp: true)].dataDayCount(now: now), 1, "正常路径不被新判据误杀")
 }
+
+/// R60：量具必须吐"逐拍形状"，不然 median 会被双峰骗第二次（R52 已经栽过一次）。
+/// 这条门钉住 TickBench 的 `tick_ms_series` 出口：删掉它 = 又只剩一个中位数。
+func testTickBenchPerTickSeries() {
+    group("量具逐拍序列(R60)")
+    let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    guard let s = try? String(contentsOfFile: root.appendingPathComponent(
+        "Sources/FanCtlApp/TickBench.swift").path, encoding: .utf8) else {
+        expect(false, "静态门读不到 TickBench.swift（源码缺席必须判红，不得空转）"); return
+    }
+    let code = s.split(separator: "\n").map(String.init)
+        .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }.joined()
+    expectEqual(code.components(separatedBy: "tick_ms_series=").count - 1, 1,
+                "TickBench 必须有 1 个 tick_ms_series= 出口（R60 用它区分 ~820ms 拍与 ~15ms 拍）")
+    expect(code.contains("perTick.enumerated()"), "序列来自 per-tick 数组本身（不是拿 median 复算出来的假序列）")
+    let tight = code.replacingOccurrences(of: " ", with: "")
+    expect(tight.contains("$0.element/1000"), "序列的每个元素取自 perTick 本身（换成 median/常量即红）")
+    expect(tight.contains("offset%2==0"), "步长仍是每 2 拍一个（改步长要同时改文档与这条门）")
+}

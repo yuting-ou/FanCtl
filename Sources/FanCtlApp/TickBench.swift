@@ -201,6 +201,9 @@ enum TickBench {
                + "ticks=\(sorted.count) "
                + "median_us=\(median) mean_us=\(mean) max_us=\(sorted.last ?? 0) min_us=\(sorted.first ?? 0) "
             + "p25_us=\(p25) p75_us=\(p75) hot=\(hot)/\(sorted.count) "
+                           + "tick_ms_series=" + perTick.enumerated()
+                               .compactMap { $0.offset % 2 == 0 ? String($0.element / 1000) : nil }
+                               .joined(separator: ",") + " "
                + "head_med_us=\(medianOf(head)) tail_med_us=\(medianOf(tail)) "
                + "rss_delta_kb=\(rssDeltaKB) rss_per_tick_kb=\(rssDeltaKB / Int64(max(1, sorted.count))) "
                + "rss_series_kb=\(rssSeries.map { String($0) }.joined(separator: ",")) "
