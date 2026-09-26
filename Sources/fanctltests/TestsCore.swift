@@ -1434,4 +1434,14 @@ func testTickBenchPerTickSeries() {
     let tight = code.replacingOccurrences(of: " ", with: "")
     expect(tight.contains("$0.element/1000"), "序列的每个元素取自 perTick 本身（换成 median/常量即红）")
     expect(tight.contains("offset%2==0"), "步长仍是每 2 拍一个（改步长要同时改文档与这条门）")
+    // R62：RSS 采样密度改成逐拍。30 拍 × 每 5 拍一点 ⇒ "尾段均值"只有 2 个点，
+    // 足以让逐拍堆积的归因翻车（R61 已知边界③）——密度本身是要钉住的量。
+    expectEqual(code.components(separatedBy: "rssSampleEvery").count - 1, 2,
+                "rssSampleEvery 出现 2 次（声明 + 采样条件）——内联掉常量或旁路密度即红")
+    expect(tight.contains("rssSampleEvery=1"),
+           "RSS 必须逐拍采样（改回每 5 拍即红：判据的点数直接塌到 1/5）")
+    expectEqual(code.components(separatedBy: "rss_points=").count - 1, 1,
+                "出口要自证采样点数（没这列，密度退化只能靠人工数序列发现）")
+    expectEqual(code.components(separatedBy: "rss_series_kb=").count - 1, 1,
+                "RSS 序列出口必须还在（删序列留点数 = 只剩一个自证不来的计数）")
 }

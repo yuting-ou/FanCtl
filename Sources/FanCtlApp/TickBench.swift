@@ -158,6 +158,9 @@ enum TickBench {
         var tail: [UInt64] = []
         var perTick: [UInt64] = []
         var rssSeries: [Int] = []
+        // R62：RSS 采样密度从"每 5 拍"改成**逐拍**。30 拍原来只有 6 个点，"尾段均值"实为 2 个点，
+        // 判据粗到足以让归因翻车（R61 的边界③）。一次 task_info 调用是微秒级，摊在 1s 的拍里可忽略。
+        let rssSampleEvery = 1
         guard let rssStart = residentBytes() else {
             finish("TICKBENCH variant=\(variant) ABORT=task-info-failed（读不到自身内存，不出数）", code: 3)
         }
@@ -179,7 +182,7 @@ enum TickBench {
             tail.append(c3 &- c2)
             perTick.append(c3 &- c0)
             // 有符号差：中途 RSS 会回落，无符号减会回绕成天文数字
-            if i % 5 == 0, let r = residentBytes() { rssSeries.append(Int((Int64(r) - Int64(rssStart)) / 1024)) }
+            if i % rssSampleEvery == 0, let r = residentBytes() { rssSeries.append(Int((Int64(r) - Int64(rssStart)) / 1024)) }
         }
         let rssEnd = residentBytes() ?? rssStart
         capture(host, to: pngPath)
@@ -207,6 +210,7 @@ enum TickBench {
                + "head_med_us=\(medianOf(head)) tail_med_us=\(medianOf(tail)) "
                + "rss_delta_kb=\(rssDeltaKB) rss_per_tick_kb=\(rssDeltaKB / Int64(max(1, sorted.count))) "
                + "rss_series_kb=\(rssSeries.map { String($0) }.joined(separator: ",")) "
+               + "rss_points=\(rssSeries.count) "
                + "view=\(Int(size.width))x\(Int(size.height)) history_count=\(model.history.count) "
                + "model_temp=\(String(format: "%.2f", model.cpuTemp)) written_temp=\(String(format: "%.2f", lastWrittenTemp)) "
                + "domain=\(Bundle.main.bundleIdentifier ?? "none") png=\(pngPath)", code: 0)
