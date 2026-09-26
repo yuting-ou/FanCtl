@@ -847,6 +847,28 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
   顶层 6 项 / bundle 内 0 脚本 / 三个 .sh 皆 755 / `fanctld 4.2.24 (115)` == plist `4.2.24`+`115` /
   `fanprobe --report` 19 行。
 
+## R64（未开工：已复现的观感缺陷 + 定好的查法，别再凭猜下刀）
+
+- **现场（真窗口截图，非合成点击）**：`/Applications/清风.app` 起 `--tickbench --onscreen --ticks 6`，
+  在**低占比**夹具下（本机实测 左 1,372 RPM / 右 1,458 RPM，两行都 `0%`）稳定复现两处：
+  ① **右风扇的图标缩成一个针尖大的点**，而同一屏的左风扇图标是完整 24pt —— 这正是作者点名的
+  "风扇会自己缩小"那一族，且**不是动画**（两行代码完全相同，只差一个视图的落点）；
+  ② 两行的能量条退化成一个孤立小圆点，位置还偏到图标列下方（`loadFraction≈0` 时
+  `frame(width: max(4, w*f))` + 蓝色阴影 ⇒ 4pt 胶囊带阴影看着像渲染故障，不像"转速贴着下限"）。
+- **对照（同一 App、同一夹具形态）**：高占比时（4,648 / 4,994 RPM，82% / 81%）两行图标都完整、
+  能量条是正常长条 ⇒ 缺陷与**低占比/低 RPM 路径**相关，不是整体尺寸主张坏了。
+- **复现命令**：`/Applications/清风.app/Contents/MacOS/FanCtl --tickbench --variant lowX --onscreen --ticks 6`
+  然后 `sips -c 420 680 --out crop.png <png>` 看风扇行那一带（png 路径在输出的 `png=` 字段里）。
+- **下一轮的查法（先量再改，R59 的教训）**：`FanSpinnerView` 是 `NSView + CALayer`，
+  图标尺寸 = `iconLayer.frame = bounds`（`GaugeViews.swift:316-319` 的 `layout()`），
+  另有一条兜底 `if iconLayer.frame != bounds { ... }` 在 `setRPM` 里（`:346`）——
+  **但 `setRPM` 开头有 `abs(rpm - currentRPM) > 1` 的守卫（`:348`）**，转速不变时兜底就不再执行。
+  ⇒ 第一步是把这个"第二个 spinner 的 bounds/layer.frame 到底是多少"打出来（离屏量具里读
+  `nsView.frame` / `iconLayer.frame`，或 `layout()` 次数），确认是"bounds 就是小"还是
+  "bounds 对但 layer 没跟上"。两种成因的修法完全不同，**没拿到这个数之前不要动代码**。
+- **顺带记一条**：`--plain`（快照降级）走的是 SF Symbol 静态图标，两行必然一致 ⇒ 它**不能**用来判这条缺陷，
+  别把"plain 下正常"当成"没问题"。
+
 ## 交接口（2026-09-26 · 仓库/发行 = 4.2.24(115)，main=origin/main，工作区干净）
 - **R62 的一条未闭合项（别当已审）**：4.2.23 的代码/文档/Release 都已交付并解包验证，
   但**两路独立对抗审查（量具口径 + 交付链）是在发版之后才跑的，写这一行时结论还没回来**。
