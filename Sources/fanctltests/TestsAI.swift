@@ -2042,3 +2042,72 @@ func testAIModeVersusCurve() {
     expect(abs(a1.maxO - a10.maxO) <= 3.0,
            "AI 过冲对拍距的敏感度天花板 3°（1s 臂 +\(a1.maxO)° vs 10s 臂 +\(a10.maxO)°）")
 }
+
+// MARK: - R71：把两条"读代码才知道"的缺陷变成量具里的数字（只测量，不动控制行为）
+
+/// ① 输入滤波器的等效时间常数随拍距线性放大。
+/// `FanControlLaw.smooth` 的 α 是**每拍常数**（无 dt 参数）⇒ 同一物理信号在 1s 拍距下
+/// τ≈2.6s，在 20s 拍距下 τ≈51s——D 项吃的正是这个差分。宪法禁止在账本 <7 天时改 α，
+/// 但"缺陷可见"不需要改代码：这里把 τ 与放大倍数量出来，并把"τ 必须与 dt 成正比"钉成门
+/// （将来谁把 α 改成秒基，这条会红，那时连它一起改）。
+func testFilterTauScalesWithDt() {
+    group("滤波滞后可观测性(R71)")
+    let target = 80.0
+    func ticksToReach(alpha: Double, dt: Double, fraction: Double) -> (ticks: Int, tauSeconds: Double) {
+        var c = FanCurveController(tuning: { var t = FanControlTuning(); t.alphaUp = alpha; t.alphaDown = alpha
+                                             t.alphaSettle = alpha; return t }())
+        _ = c.smooth(rawTemp: target)                       // 从稳态开始
+        var n = 0
+        while n < 10_000 {
+            n += 1
+            guard let v = c.smooth(rawTemp: target + 10) else { continue }
+            if v - target >= 10 * fraction { break }
+        }
+        // 一阶 EMA 的 63.2% 时间常数：τ = −dt / ln(1−α)
+        let tau = -dt / log(1 - alpha)
+        return (n, tau)
+    }
+    for (alpha, dt) in [(0.35, 1.0), (0.35, 3.0), (0.35, 20.0), (0.2, 3.0)] {
+        let r = ticksToReach(alpha: alpha, dt: dt, fraction: 0.632)
+        print(String(format: "TAU alpha=%.2f dt=%.0fs → 63.2%% 用了 %d 拍，物理时间常数 τ=%.1fs",
+                     alpha, dt, r.ticks, r.tauSeconds))
+    }
+    let t1 = ticksToReach(alpha: 0.35, dt: 1.0, fraction: 0.632)
+    let t20 = ticksToReach(alpha: 0.35, dt: 20.0, fraction: 0.632)
+    expectEqual(t1.ticks, 3, "α=0.35 时 63.2% 需 3 拍（每拍 α 与 dt 无关 ⇒ 拍数不变）")
+    expectEqual(t20.ticks, 3, "同样 α、dt=20s 仍是 3 拍 ⇒ 物理时间常数被拍距放大了 20 倍（缺陷本体）")
+    expect(abs(t1.tauSeconds - 2.32) < 0.02, "τ(1s)=2.32s：快拍下滤波几乎无滞后（−ln(0.65)=0.4308）")
+    expect(abs(t20.tauSeconds - 46.4) < 0.2, "τ(20s)=46.4s：慢拍下滤波比虚拟热机 τ=40s 还慢（斜率被抹平）")
+    expect(abs(t20.tauSeconds / t1.tauSeconds - 20.0) < 0.01,
+           "τ 必须与 dt 成正比（倍数 20）——这正是「滤波器没按 dt 归一」的可复核签名")
+}
+
+/// ② 曲线锚定的步长被限速迟滞吞掉：设计意图 1.5pp/25s 的小步，实际变成 ≥4pp/75s 的台阶。
+/// 量法：每 anchorProbeSeconds 向目标推 1.5pp，过 `slew(hysteresis:4)`，看实际写入的台阶。
+func testAnchorStepSwallowedBySlew() {
+    group("锚定台阶可观测性(R71)")
+    var c = FanCurveController()
+    var target = 40.0
+    var applied: Double? = nil
+    var changes: [(Double, Double)] = []      // (时间秒, 台阶 pp)
+    var t = 0.0
+    for _ in 0..<20 {                          // 20 个探测周期 × 25s = 500s
+        t += 25
+        target = min(target + 1.5, 100)         // anchorStepPercent 步进
+        let out = c.slew(target: target, force: false, hysteresis: 4)
+        if let prev = applied, abs(out - prev) >= 0.001 {
+            changes.append((t, out - prev))
+        }
+        applied = out
+    }
+    print("ANCHOR 台阶：\(changes.map { String(format: "t=%.0fs %+.1fpp", $0.0, $0.1) }.joined(separator: " | "))")
+    expectEqual(changes.count, 6, "500s 内实际只发生 6 次台阶（而不是 20 次小步；首次在第 4 个探测点）")
+    expectEqual(String(format: "%.1f", changes[0].0), "100.0", "第一次台阶在 t=100s：1.5pp 的意图步要攒够迟滞 4pp 才落得下去")
+    expectEqual(String(format: "%.0f", changes[1].0 - changes[0].0), "75", "此后每 75s（3 个探测周期）才有一次台阶")
+    for (_, step) in changes {
+        expect(abs(step) >= 4.0 - 0.001, "每次台阶 ≥4pp（= 迟滞宽度；1.5pp 的意图步被吞）")
+        expect(abs(step) <= 4.5 + 0.001, "每次台阶 ≤4.5pp（= 迟滞 + 1.5pp，不是连续滑移）")
+    }
+    expectEqual(String(format: "%.1f", changes[0].1), "4.5",
+                "每次台阶 +4.5pp（= 迟滞 4 + 落后 1.5 的意图步），不是设计意图的 1.5pp 小步")
+}
