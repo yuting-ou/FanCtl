@@ -2111,3 +2111,94 @@ func testAnchorStepSwallowedBySlew() {
     expectEqual(String(format: "%.1f", changes[0].1), "4.5",
                 "每次台阶 +4.5pp（= 迟滞 4 + 落后 1.5 的意图步），不是设计意图的 1.5pp 小步")
 }
+
+// MARK: - R72：把热机换成一阶以上——R70 的"拍距越慢 AI 越差"是否只在单时间常数模型下成立？
+
+/// 双时间常数热机：die（快，τ≈8s）+ 散热片/机壳（慢，τ≈120s）耦合。
+/// 现有 `VirtualMachine` 是一阶（τ=40s、单状态），而 R70 的因果结论建立在它上面 ⇒ 必须换模型复核。
+/// 参数只求"物理上说得通"（45W 无风时 die 落在 ~70°、环境 25°），不是真机标定。
+private struct ThermalVM2 {
+    var die: Double = 45
+    var sink: Double = 40
+    let env: Double = 25
+    let Rd: Double = 0.8      // °C/W：die 对功耗的内阻
+    let Rdis: Double = 0.25   // °C/W：die→散热片
+    let Renv: Double = 0.6    // °C/W：散热片→环境
+    let Cd: Double = 8.0      // s·°C/W：die 热容（快）
+    let Cs: Double = 120.0    // s·°C/W：散热片热容（慢）
+    let k: Double = 0.004     // °C/s/%：风扇对 die 的直接抽热
+
+    // 指数松弛（对步内常输入是精确解、无条件稳定）。显式欧拉在这里会炸：
+    // dt·(1/Rdis + k·%)/Cd 在 dt=20s 时 ≈11 ⇒ |增益|>1 直接发散，与控制器无关。
+    mutating func step(power: Double, percent: Double, dt: Double) {
+        let bD = (1 / Rdis + k * percent) / Cd
+        let aD = (power * Rd + sink / Rdis + k * percent * env) / Cd
+        die = aD / bD + (die - aD / bD) * exp(-bD * dt)
+        let bS = (1 / Rdis + 1 / Renv) / Cs
+        let aS = (die / Rdis + env / Renv) / Cs
+        sink = aS / bS + (sink - aS / bS) * exp(-bS * dt)
+    }
+}
+
+/// 与 `runModeArm` 同构，只是换热机；同样只让控制器这一个变量变。
+private func runModeArm2(ai: Bool, dt: Double, seconds: Double, target: Double)
+    -> (maxO: Double, highSec: Double, rmsDie: Double, rmsSink: Double, changes: Int, avgOut: Double, nan: Bool) {
+    var vm = ThermalVM2()
+    var aiCtl = AIController()
+    aiCtl.tuning.targetTemp = target
+    var ctrl = FanCurveController()
+    let curve = CurvePreset.balanced.points
+    var prevOut = 0.0, changes = 0, sumDie = 0.0, sumSink = 0.0, n = 0.0, maxO = 0.0, highSec = 0.0, sumOut = 0.0
+    var nan = false
+    let steps = Int(seconds / dt)
+    for i in 0..<steps {
+        let t = Double(i) * dt
+        // 负载加倍：一阶版用 45W 让 die≈76；双时间常数版 45W 只到 57.5°（目标根本没被逼近，
+        // 两臂都没被压到工作区 ⇒ 比较退化）。按同一物理量标定到目标附近再比。
+        let power = 95 + 28 * sin(t / 300.0 * .pi) + ((Int(t / 600) % 2 == 0) ? 16 : 0)
+        let want: Double = ai
+            ? (aiCtl.step(temp: vm.die, powerWatts: power, dt: dt) ?? 0)
+            : FanConfig.percent(temp: vm.die, curve: curve)
+        let applied = ctrl.slew(target: want, force: false, hysteresis: 4)
+        if abs(applied - prevOut) >= 3 { changes += 1 }
+        prevOut = applied
+        vm.step(power: power, percent: applied, dt: dt)
+        guard vm.die.isFinite, vm.sink.isFinite, applied.isFinite, applied >= 0, applied <= 100
+        else { nan = true; break }
+        sumDie += vm.die * vm.die; sumSink += vm.sink * vm.sink; n += 1; sumOut += applied
+        maxO = max(maxO, vm.die - target)
+        if vm.die > target + 2 { highSec += dt }
+    }
+    return (maxO, highSec, n > 0 ? (sumDie / n).squareRoot() : 0, n > 0 ? (sumSink / n).squareRoot() : 0,
+            changes, n > 0 ? sumOut / n : 0, nan)
+}
+
+func testAIModeVersusCurveTwoTau() {
+    group("AI 双时间常数对照(R72)")
+    let target = 76.0
+    var results: [String: (maxO: Double, highSec: Double)] = [:]
+    for dt in [1.0, 3.0, 10.0, 20.0] {
+        let a = runModeArm2(ai: true, dt: dt, seconds: 3600, target: target)
+        let c = runModeArm2(ai: false, dt: dt, seconds: 3600, target: target)
+        results["a\(Int(dt))"] = (a.maxO, a.highSec)
+        results["c\(Int(dt))"] = (c.maxO, c.highSec)
+        print(String(format: "TAU2 dt=%4.0fs  AI: 过冲+%.2f° 超温%.0fs RMS die %.2f sink %.2f 调速%d 均输出%.1f%%  |  曲线: 过冲+%.2f° 超温%.0fs RMS die %.2f sink %.2f 调速%d 均输出%.1f%%",
+                     dt, a.maxO, a.highSec, a.rmsDie, a.rmsSink, a.changes, a.avgOut,
+                     c.maxO, c.highSec, c.rmsDie, c.rmsSink, c.changes, c.avgOut))
+        expect(!a.nan && !c.nan, "双时间常数热机 dt=\(dt) 两臂都不出 NaN/越界")
+    }
+    let d1 = results["a1"]!, d20 = results["a20"]!
+    let c1 = results["c1"]!, c20 = results["c20"]!
+    let dGap1 = d1.maxO - c1.maxO, dGap20 = d20.maxO - c20.maxO
+    print(String(format: "TAU2 拍距敏感性：AI 过冲 %.2f°→%.2f°（%+.2f°），曲线 %.2f°→%.2f°（%+.2f°）；AI 相对曲线的差 %+.2f°→%+.2f°",
+                 d1.maxO, d20.maxO, d20.maxO - d1.maxO, c1.maxO, c20.maxO, c20.maxO - c1.maxO, dGap1, dGap20))
+    // R70 在一阶模型（单 τ=40s）下看到"AI 对拍距的过冲恶化远大于曲线"。**这个结论没有迁移过来**：
+    // 双时间常数下两臂的拍距敏感度几乎相同（见上行的打印）。所以门只钉"两臂差距不得随拍距放大"，
+    // 并如实注明：一阶模型的敏感性数字**不能**当作真机预期引用。
+    expect(abs(dGap20 - dGap1) <= 1.5,
+           "AI 与曲线的过冲差距不得随拍距明显放大（1s 差 \(String(format: "%.2f", dGap1))°，20s 差 \(String(format: "%.2f", dGap20))°）")
+    for dt in [1, 3, 10, 20] {
+        let a = results["a\(dt)"]!, c = results["c\(dt)"]!
+        expect(abs(a.maxO - c.maxO) <= 5.0, "dt=\(dt)s 两臂过冲差 ≤5°（同热机同负载）")
+    }
+}
