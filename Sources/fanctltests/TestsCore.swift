@@ -1470,3 +1470,34 @@ func testTickBenchPerTickSeries() {
     expectEqual(code.components(separatedBy: "rss_series_kb=").count - 1, 1,
                 "RSS 序列出口必须还在（删序列留点数 = 只剩一个自证不来的计数）")
 }
+
+// R68：`FanConfig.percent(temp:curve:)` 的语义基线（smoothstep 形状、钳位、空/单点、
+// 顺序无关、NaN）。**注意**：这组测试原本是为"严格升序免排序"的快路径写的，
+// 那条快路径已被 A/B 证伪并回滚（见 EVOLUTION R68 与失败账本）——测试留下来了，
+// 因为它把这个控制律核心函数的语义钉得比原来紧。
+func testCurveLookupFastPath() {
+    group("曲线查表语义基线(R68)")
+    func cp(_ t: Double, _ p: Double) -> CurvePoint { CurvePoint(temp: t, percent: p) }
+    let asc = [cp(45, 10), cp(60, 30), cp(75, 60), cp(95, 100)]
+    expectEqual(FanConfig.percent(temp: 45, curve: asc), 10, "首点原值返回")
+    expectEqual(FanConfig.percent(temp: 95, curve: asc), 100, "末点原值返回")
+    expectEqual(FanConfig.percent(temp: 40, curve: asc), 10, "低于首点钳到首点")
+    expectEqual(FanConfig.percent(temp: 99, curve: asc), 100, "高于末点钳到末点")
+    expectEqual(FanConfig.percent(temp: 52.5, curve: asc), 20, "段中点：smoothstep(0.5)=0.5 ⇒ 10+0.5·20")
+    expect(abs(FanConfig.percent(temp: 48.75, curve: asc) - 13.125) < 1e-12,
+           "t=0.25 时 smoothstep=0.15625 ⇒ 13.125（快路径不得改语义）")
+    let desc = [cp(95, 100), cp(75, 60), cp(60, 30), cp(45, 10)]
+    let shuf = [cp(75, 60), cp(45, 10), cp(95, 100), cp(60, 30)]
+    for t in [50.0, 62.0, 88.0] {
+        expectEqual(FanConfig.percent(temp: t, curve: shuf), FanConfig.percent(temp: t, curve: asc),
+                    "乱序曲线与升序同值（排序路径仍在）")
+        expectEqual(FanConfig.percent(temp: t, curve: desc), FanConfig.percent(temp: t, curve: asc),
+                    "降序曲线与升序同值（短路判定必须拒绝非严格升序）")
+    }
+    expectEqual(FanConfig.percent(temp: 70, curve: []), 0, "空曲线→0")
+    expectEqual(FanConfig.percent(temp: 70, curve: [cp(50, 42)]), 42, "单点曲线恒等于该点")
+    expectEqual(FanConfig.percent(temp: .nan, curve: asc), 0, "NaN→0（在快路径之前先挡）")
+    expectEqual(FanConfig.percent(temp: 70, curve: [cp(70, 55), cp(70, 20)]),
+                FanConfig.percent(temp: 70, curve: [cp(70, 55), cp(70, 20)]),
+                "等温点曲线不自相矛盾（重复温度走排序路径）")
+}
