@@ -1497,7 +1497,8 @@ func testCurveLookupFastPath() {
     expectEqual(FanConfig.percent(temp: 70, curve: []), 0, "空曲线→0")
     expectEqual(FanConfig.percent(temp: 70, curve: [cp(50, 42)]), 42, "单点曲线恒等于该点")
     expectEqual(FanConfig.percent(temp: .nan, curve: asc), 0, "NaN→0（在快路径之前先挡）")
-    expectEqual(FanConfig.percent(temp: 70, curve: [cp(70, 55), cp(70, 20)]),
-                FanConfig.percent(temp: 70, curve: [cp(70, 55), cp(70, 20)]),
-                "等温点曲线不自相矛盾（重复温度走排序路径）")
+    // 等温点：Swift 的 sort 不稳定 ⇒ 两点的先后不保证，但结果**必须是两者之一**，
+    // 不得凭空插出一个第三值。（写成 `f(x)==f(x)` 是同义反复，R68 自查时换掉的）
+    let dupV = FanConfig.percent(temp: 70, curve: [cp(70, 55), cp(70, 20)])
+    expect(dupV == 55 || dupV == 20, "等温点必须返回两点之一的百分比（得 55 或 20，实得 \(dupV)）")
 }
