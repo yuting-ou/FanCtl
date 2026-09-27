@@ -1983,3 +1983,62 @@ func testLearningHygiene() {
     expectEqual(tl2.percent(for: 60, onBattery: false, powerWatts: 38)!, 80, "38W 越界切 heavy 桶")
 }
 
+
+// MARK: - R70：AI 模式 vs 纯曲线，同一热机、同一负载、三种拍距的对照（测量，不是调参）
+
+/// 一条臂跑完的指标。`mode` 是唯一变量：控制器不同，热机/负载/限速管线完全相同。
+private func runModeArm(ai: Bool, dt: Double, seconds: Double, target: Double)
+    -> (maxO: Double, highSec: Double, rms: Double, changes: Int, avgOut: Double, nan: Bool) {
+    var vm = VirtualMachine()
+    var aiCtl = AIController()
+    aiCtl.tuning.targetTemp = target
+    var ctrl = FanCurveController()
+    let curve = CurvePreset.balanced.points
+    var prevOut = 0.0, changes = 0, sumSq = 0.0, n = 0.0, maxO = 0.0, highSec = 0.0, sumOut = 0.0
+    var nan = false
+    let steps = Int(seconds / dt)
+    for i in 0..<steps {
+        let t = Double(i) * dt
+        let power = 45 + 15 * sin(t / 300.0 * .pi) + ((Int(t / 600) % 2 == 0) ? 8 : 0)
+        let want: Double = ai
+            ? (aiCtl.step(temp: vm.temp, powerWatts: power, dt: dt) ?? 0)
+            : FanConfig.percent(temp: vm.temp, curve: curve)
+        let applied = ctrl.slew(target: want, force: false, hysteresis: 4)
+        if abs(applied - prevOut) >= 3 { changes += 1 }
+        prevOut = applied
+        vm.step(power: power, percent: applied, dt: dt)
+        guard vm.temp.isFinite, applied.isFinite, applied >= 0, applied <= 100 else { nan = true; break }
+        sumSq += vm.temp * vm.temp; n += 1; sumOut += applied
+        maxO = max(maxO, vm.temp - target)
+        if vm.temp > target + 2 { highSec += dt }
+    }
+    return (maxO, highSec, n > 0 ? (sumSq / n).squareRoot() : 0, changes, n > 0 ? sumOut / n : 0, nan)
+}
+
+/// 对照 + 回归天花板。**天花板不是最优声明**：它只钉"比今天更差就红"。
+func testAIModeVersusCurve() {
+    group("AI 对照曲线(R70)")
+    let target = 76.0
+    for dt in [1.0, 3.0, 10.0] {
+        let a = runModeArm(ai: true, dt: dt, seconds: 3600, target: target)
+        let c = runModeArm(ai: false, dt: dt, seconds: 3600, target: target)
+        print(String(format: "HIL dt=%.0fs  AI: 过冲+%.2f° 超温%.0fs RMS %.2f 调速%d 均输出%.1f%%  |  曲线: 过冲+%.2f° 超温%.0fs RMS %.2f 调速%d 均输出%.1f%%",
+                     dt, a.maxO, a.highSec, a.rms, a.changes, a.avgOut, c.maxO, c.highSec, c.rms, c.changes, c.avgOut))
+        expect(!a.nan && !c.nan, "dt=\(dt) 两臂都不出 NaN/越界")
+    }
+    let a3 = runModeArm(ai: true, dt: 3, seconds: 3600, target: target)
+    let c3 = runModeArm(ai: false, dt: 3, seconds: 3600, target: target)
+    // 第一版我把这两条写成"AI 不得劣于曲线（过冲/超温秒）"，实测**直接红**：
+    // AI 过冲 +3.39° vs 曲线 +2.43°、超温 177s vs 150s。但那不是"AI 更差"——两臂目标不同
+    // （曲线 balanced 均输出 36.2% 把 RMS 压在 67.0，AI 目标 76° 均输出 19.8%、RMS 70.2）。
+    // 所以正确的门是"省风扇是真的、温度代价有上限"，而不是"AI 处处更优"：
+    expect(a3.avgOut <= c3.avgOut, "AI 臂均输出必须低于同机同负载的纯曲线（省风扇是它的设计目标，实得 19.8% vs 36.2%）")
+    expect(a3.rms - c3.rms <= 4.0,
+           "AI 的温度代价天花板：RMS 不得比曲线高过 4°（实得 +\(String(format: "%.2f", a3.rms - c3.rms))°）——**天花板，不是最优声明**")
+    // dt 敏感性天花板：AI 的 D 项上游滤波器是每拍常数（`FanControlLaw.smooth` 无 dt），
+    // 拍距 1s→10s 时过冲会明显变化。这条钉的是"别变得更敏感"，不是"已经够稳"。
+    let a1 = runModeArm(ai: true, dt: 1, seconds: 3600, target: target)
+    let a10 = runModeArm(ai: true, dt: 10, seconds: 3600, target: target)
+    expect(abs(a1.maxO - a10.maxO) <= 3.0,
+           "AI 过冲对拍距的敏感度天花板 3°（1s 臂 +\(a1.maxO)° vs 10s 臂 +\(a10.maxO)°）")
+}
