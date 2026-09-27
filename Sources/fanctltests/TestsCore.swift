@@ -1471,34 +1471,26 @@ func testTickBenchPerTickSeries() {
                 "RSS 序列出口必须还在（删序列留点数 = 只剩一个自证不来的计数）")
 }
 
-// R68：`FanConfig.percent(temp:curve:)` 的语义基线（smoothstep 形状、钳位、空/单点、
-// 顺序无关、NaN）。**注意**：这组测试原本是为"严格升序免排序"的快路径写的，
-// 那条快路径已被 A/B 证伪并回滚（见 EVOLUTION R68 与失败账本）——测试留下来了，
-// 因为它把这个控制律核心函数的语义钉得比原来紧。
-func testCurveLookupFastPath() {
+// R68/R69：`FanConfig.percent(temp:curve:)` 的语义基线。
+// R69 自查（审查 A 抓到）：原来这组 12 条里有 7 条与既有「插值」组重复（空曲线、乱序等价、
+// 单点、NaN/±Inf 都已覆盖），另有 6 条期望值是"实现自己算出来的值"（违反本仓手写字面量铁律），
+// 还有两条（段中点 20、等温点二选一）对单行改动零区分力。全部删掉，只留下面 5 条有牙的。
+func testCurveLookupSemantics() {
     group("曲线查表语义基线(R68)")
     func cp(_ t: Double, _ p: Double) -> CurvePoint { CurvePoint(temp: t, percent: p) }
     let asc = [cp(45, 10), cp(60, 30), cp(75, 60), cp(95, 100)]
-    expectEqual(FanConfig.percent(temp: 45, curve: asc), 10, "首点原值返回")
-    expectEqual(FanConfig.percent(temp: 95, curve: asc), 100, "末点原值返回")
-    expectEqual(FanConfig.percent(temp: 40, curve: asc), 10, "低于首点钳到首点")
-    expectEqual(FanConfig.percent(temp: 99, curve: asc), 100, "高于末点钳到末点")
-    expectEqual(FanConfig.percent(temp: 52.5, curve: asc), 20, "段中点：smoothstep(0.5)=0.5 ⇒ 10+0.5·20")
-    expect(abs(FanConfig.percent(temp: 48.75, curve: asc) - 13.125) < 1e-12,
-           "t=0.25 时 smoothstep=0.15625 ⇒ 13.125（快路径不得改语义）")
+    // 形状：smoothstep t²(3−2t)。线性插值会给出 15 / 28.75 ⇒ 这两条专挡"把曲线改成线性"
+    expectEqual(FanConfig.percent(temp: 48.75, curve: asc), 13.125,
+                "t=0.25 → smoothstep=0.15625 ⇒ 10+0.15625·20=13.125（线性会得 15）")
+    expectEqual(FanConfig.percent(temp: 56.25, curve: asc), 26.875,
+                "t=0.75 → smoothstep=0.84375 ⇒ 26.875（线性会得 25，与上一条对称夹住曲线形状）")
+    // 钳位：两端都用"非 0 非 100"的百分比，否则 fallthrough 也能凑对（审查 A P3）
+    let clamped = [cp(45, 10), cp(95, 80)]
+    expectEqual(FanConfig.percent(temp: 40, curve: clamped), 10, "低于首点必须钳到首点百分比 10（不得外推）")
+    expectEqual(FanConfig.percent(temp: 99, curve: clamped), 80, "高于末点必须钳到末点百分比 80（钳到 100 即红）")
+    // 排序：降序输入必须与升序同值——期望值写死字面量，不拿实现算出的值当基准
     let desc = [cp(95, 100), cp(75, 60), cp(60, 30), cp(45, 10)]
-    let shuf = [cp(75, 60), cp(45, 10), cp(95, 100), cp(60, 30)]
-    for t in [50.0, 62.0, 88.0] {
-        expectEqual(FanConfig.percent(temp: t, curve: shuf), FanConfig.percent(temp: t, curve: asc),
-                    "乱序曲线与升序同值（排序路径仍在）")
-        expectEqual(FanConfig.percent(temp: t, curve: desc), FanConfig.percent(temp: t, curve: asc),
-                    "降序曲线与升序同值（短路判定必须拒绝非严格升序）")
-    }
-    expectEqual(FanConfig.percent(temp: 70, curve: []), 0, "空曲线→0")
-    expectEqual(FanConfig.percent(temp: 70, curve: [cp(50, 42)]), 42, "单点曲线恒等于该点")
-    expectEqual(FanConfig.percent(temp: .nan, curve: asc), 0, "NaN→0（在快路径之前先挡）")
-    // 等温点：Swift 的 sort 不稳定 ⇒ 两点的先后不保证，但结果**必须是两者之一**，
-    // 不得凭空插出一个第三值。（写成 `f(x)==f(x)` 是同义反复，R68 自查时换掉的）
-    let dupV = FanConfig.percent(temp: 70, curve: [cp(70, 55), cp(70, 20)])
-    expect(dupV == 55 || dupV == 20, "等温点必须返回两点之一的百分比（得 55 或 20，实得 \(dupV)）")
+    expectEqual(FanConfig.percent(temp: 48.75, curve: desc), 13.125,
+                "降序曲线与升序同值（删掉排序会得 100，即红）")
 }
+
