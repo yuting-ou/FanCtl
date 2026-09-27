@@ -1044,8 +1044,11 @@ watcher 设计 10 角扫描（取消孤儿/标记竞态/超时窗口/收养假�
 - **记账**：VERSION `4.2.27(118)` → **`4.2.28(119)`**；断言 5132 → **5121 / 96 组**；门槛双源 5125 → **5115**。
 - **发行链闭合**：tag `v4.2.28` → CI success → 徽章回推合并（`5121 assertions`）→ 资产解包已验
   （6 项 / bundle 内 0 脚本 / `install.sh` 755 / `fanctld 4.2.28 (119)` / `--report` 19 行）。
-  本机 App 仍停在 4.2.26、daemon 4.2.24：4.2.27/4.2.28 两轮**都没有一行运行时代码差异**
-  （只动测试目标、文档与 CI 门槛）⇒ 不热替换、不再弹授权窗。
+  ~~本机 App 仍停在 4.2.26、daemon 4.2.24~~ —— **作者要求装齐，2026-09-27 已全量装到 4.2.28**：
+  `deploy.sh`（App 免密）+ 从 Release 包 `/tmp/fanrel28/install.sh`（osascript 弹窗提权，作者只输密码）。
+  实测：App `4.2.28 / build 119`、属主 `yu:staff`（R29 的 console 用户 chown 在弹窗路径下仍成立）、
+  daemon `fanctld 4.2.28 (119)` pid 在场、`launchctl print system/com.fanctl.daemon` = `state = running`、
+  `fanprobe --report` 19 行、热模型可用（样本 518）。install.sh 会换 bundle 但不自启 App ⇒ 补了一次 `open`。
 
 ## 交接口（2026-09-27 · 仓库/发行 = 4.2.28(119)，main=origin/main，工作区干净）
 - **R62 的一条未闭合项（别当已审）**：4.2.23 的代码/文档/Release 都已交付并解包验证，
