@@ -1573,3 +1573,92 @@ func testFreshInstallAndUpgrade() {
     expectEqual(both.manualPercent, 50, "双坏时手动百分比回默认 50")
     expectEqual(both.curve.count, 5, "双坏时曲线回默认 5 点")
 }
+
+// MARK: - R75：写盘写到一半进程被杀——此前只有 fd 纪律测试，没有"半写文件"测试
+
+/// 真实崩溃形态：daemon 在 `rename` 之前被杀 / 断电，留下**半写**的状态文件。
+/// fd 纪律（O_CREAT|O_EXCL|O_NOFOLLOW、rename 不跟随链接）早有测试，但"读到一个坏文件会怎样"
+/// 只覆盖过 config 一条（R35/R74）。本轮把其余六个状态文件全覆盖，并加一条**双计检测**：
+/// save→load→save→load 必须幂等，否则崩溃恢复后账本会翻倍（dt 账本正是 ≥7 天裁决的依据）。
+func testHalfWrittenStateFiles() {
+    group("半写状态文件与幂等(R75)")
+    let dir = engineTestEnv()
+    FanCtlPaths.ensureDirectories()
+    defer {
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    // 先写一份**完整合法**的状态，后面所有损坏形态都从它派生
+    var st = DaemonStatus(cpuTemp: 70, gpuTemp: 55, mode: .ai, appliedPercent: 40, fans: [])
+    st.appliedPercents = [40, 41]
+    expect(ConfigStore.saveStatus(st), "先落一份合法 status")
+    var day = DailyStats(date: "2026-09-20")
+    day.speedChanges = 120; day.tempSum = 7000; day.tempCount = 100; day.revolutions = 900
+    day.highTempSeconds = 60; day.powerCount = 300; day.tempSeconds = 1200; day.overshootPeak = 3
+    expect(ConfigStore.saveStats(day), "先落一份合法 stats")
+    expect(ConfigStore.saveHistory([day]), "先落一份合法 history")
+    var learn = ThermalLearn()
+    learn.record(temp: 70, percent: 50, now: Date(timeIntervalSince1970: 1_800_000_000))
+    expect(ConfigStore.saveLearn(learn), "先落一份合法学习表")
+    var ledger = DTLedgerState()
+    ledger.fast = DTermLedgerBucket(samples: 100, seconds: 300, dAbsSum: 12, pAbsSum: 5, slopeWeightedSum: 2)
+    ledger.nominal = DTermLedgerBucket(samples: 200, seconds: 600, dAbsSum: 6, pAbsSum: 4, slopeWeightedSum: 1)
+    ledger.startedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    expect(ConfigStore.saveDTLedger(ledger), "先落一份合法 dt 账本")
+
+    let statusURL = dir.appendingPathComponent("status.json")
+    let statsURL = dir.appendingPathComponent("stats.json")
+    let histURL = dir.appendingPathComponent("history.json")
+    let learnURL = FanCtlPaths.learnFile
+    let ledgerURL = FanCtlPaths.dtLedgerFile
+
+    func full(_ url: URL) -> Data { (try? Data(contentsOf: url)) ?? Data() }
+
+    // 四种崩溃形态：截断 / 空 / 尾部垃圾 / 头部垃圾
+    let shapes: [(String, (Data) -> Data)] = [
+        ("截断", { d in d.prefix(max(1, d.count / 2)) }),
+        ("空文件", { _ in Data() }),
+        ("尾部垃圾", { d in d + Data("{{{trailing".utf8) }),
+        ("头部垃圾", { d in Data("garbage\n".utf8) + d }),
+    ]
+
+    for (name, f) in shapes {
+        // status：不得崩、要么拿到合法值要么 nil
+        try? f(full(statusURL)).write(to: statusURL, options: .atomic)
+        let s = ConfigStore.loadStatus()
+        if let s { expect(s.appliedPercent.isFinite && s.appliedPercent >= 0 && s.appliedPercent <= 100,
+                          "\(name) status：读出的百分比必须落在合法域") }
+        // stats / history / learn / ledger：一律不得崩
+        try? f(full(statsURL)).write(to: statsURL, options: .atomic)
+        _ = ConfigStore.loadStats()
+        try? f(full(histURL)).write(to: histURL, options: .atomic)
+        _ = ConfigStore.loadHistory()
+        try? f(full(learnURL)).write(to: learnURL, options: .atomic)
+        let l = ConfigStore.loadLearn()
+        if let l, let pv = l.percent(for: 70) { expect(pv.isFinite, "\(name) 学习表：查表值必须有限") }
+        try? f(full(ledgerURL)).write(to: ledgerURL, options: .atomic)
+        if let ld = ConfigStore.loadDTLedger() {
+            expect(ld.totalSeconds.isFinite && ld.totalSeconds >= 0, "\(name) dt 账本：总时长必须有限非负")
+            expect((ld.fast?.seconds ?? 0) >= 0 && (ld.nominal?.seconds ?? 0) >= 0 && (ld.slow?.seconds ?? 0) >= 0,
+                   "\(name) dt 账本：各桶秒数不得为负")
+        }
+    }
+
+    // 双计检测：save→load→save→load 必须幂等（否则崩溃恢复后账本翻倍）
+    expect(ConfigStore.saveDTLedger(ledger), "恢复后重写账本")
+    let r1 = ConfigStore.loadDTLedger()
+    expectEqual(r1?.totalSeconds ?? -1, 900, "读回的受控总时长 = 300+600（不丢）")
+    expect(ConfigStore.saveDTLedger(r1 ?? ledger), "再写一次")
+    let r2 = ConfigStore.loadDTLedger()
+    expectEqual(r2?.totalSeconds ?? -1, 900, "第二次读回仍是 900（save/load 幂等，不双计）")
+    expectEqual(r2?.fast?.samples ?? -1, 100, "快拍样本数不因反复读写翻倍")
+    expectEqual(r2?.fast?.seconds ?? -1, 300, "快拍秒数不因反复读写翻倍")
+
+    // 学习表同样要幂等（EMA 反复重放会把旧样本越加权越重）
+    let l1 = ConfigStore.loadLearn()
+    expect(ConfigStore.saveLearn(l1 ?? learn), "学习表重写")
+    let l2 = ConfigStore.loadLearn()
+    let p1 = l1?.percent(for: 70), p2 = l2?.percent(for: 70)
+    expect(p1 == p2, "学习表 save/load 幂等（不得因恢复重放而漂移；前 \(p1 == nil ? "nil" : "有值") 后 \(p2 == nil ? "nil" : "有值")）")
+}

@@ -345,7 +345,7 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
   静态门同步：PanelView 的 numericText 6→4、全面板 `.animation(` 33→32，并加**函数级门**
   （该函数体内再出现 numericText 字面量即红）。诚实边界：仍是字面量级检查，
   `let ct: ContentTransition = .numericText()` 这种注入绕得过（EVOLUTION R61 已知边界①）。
-- 测试 **4646 → 5207 断言 / 102 组**（4.2.28 删掉 11 条重复/无牙断言，见下条）（断言数与契约门槛以顶部徽章 + `ci.yml`/`fanctltests` 双源为准；
+- 测试 **4646 → 5220 断言 / 103 组**（4.2.28 删掉 11 条重复/无牙断言，见下条）（断言数与契约门槛以顶部徽章 + `ci.yml`/`fanctltests` 双源为准；
   两源同值本身由 `scripts/test-root-scripts.sh` 钉住）；两路独立审查共报
   11 项 → 9 修 3 证伪（其中一项的 P1 推翻了我自己先前的证伪，详见 EVOLUTION R35/R36）。
 ## 9. 4.0 变更摘要(2026-09,冷启动校准与诚实形态 + 审查修复轮)
