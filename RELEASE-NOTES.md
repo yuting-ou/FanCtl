@@ -25,6 +25,22 @@
 
 ## 本版变更要点
 
+- 4.2.33：**补上首装/升级夹具**（纯测试，零控制行为改动）。
+  此前只验证过"已装机器的 Release 包装机"，**全新机器首装**与**旧版本升级**两条路径从未覆盖——
+  而这正是"任何人机器上可信"的第一问。新增 28 条断言：
+  ① 空 supportDir 首装：`loadConfig` 给出文档默认值（curve / 50 / 5 点 balanced / envCompensation=true /
+  quietHours=false），`saveConfig` 后读回一致且**同时落 last-good**；
+  ② 4.2.8 时代的旧 config（只写 mode/manualPercent/curve/preset）完整解码，v8 起新增的字段
+  （envCompensation/quietHours/aiTargetTemp/fanOffsets/nightCurve/envTempOverride/quietUntil）
+  各自拿到文档默认值——`aiTargetTemp` 被规范成 76 而不是把 nil 泄给 UI；
+  ③ config.json 截断 ⇒ 走 **last-good 自愈**（拿到的是上次成功加载的内容，不是出厂默认）；
+  ④ config 与 last-good **都**不可解析才落出厂默认（daemon 仍能启动、曲线非空）。
+  变异证据：把 `envCompensation` 从 `decodeIfPresent ?? true` 改成必需 `decode` ⇒ **红 4 条**，
+  其中新组那条正是"升级后用户选的模式保住 — got curve, want ai"（升级丢配置的失效形态）。
+  如实记两条：① `aiTargetTemp` nil→76 的规范化、② 截断 config 走 last-good 而非默认——
+  两条我一开始都当成 bug，核代码后确认是设计；还有一条是**我自己的测试写错**：字符串字面量用
+  `\\` 续行写出了字面反斜杠 ⇒ JSON 非法 ⇒ 被测代码回退默认，我差点把"测试自己错"记成"升级丢配置"。
+  测试 5179 → 5207 断言 / 101 → **102 组**；契约门槛双源 5170 → 5195。
 - 4.2.32：**给安全红线补上"误触发面"与"恢复轨迹"**（纯测试，零控制行为改动）。
   此前的红线测试只覆盖"该触发时触发"；误触发比漏触发更伤信任（陌生人机器上误全速 = 噪音 + 无谓磨损）。
   新增 12 条断言：单拍 raw≥92 只全速一拍且下一拍必须释放（不锁存）；88–92 之间未激活不得触发、

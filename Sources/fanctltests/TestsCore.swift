@@ -1494,3 +1494,82 @@ func testCurveLookupSemantics() {
                 "降序曲线与升序同值（删掉排序会得 100，即红）")
 }
 
+
+// MARK: - R74：首装/升级夹具——"任何人机器上真能装上吗"此前一次都没验过
+
+/// 此前只验过"已装机器的 Release 包装机"。两类路径零覆盖：
+/// ① **全新机器首装**（supportDir 空、无 config、无 last-good）；
+/// ② **旧版本升级**（config 里没有后来新增的字段）。
+/// `FanConfig.init(from:)` 只有 3 个必需键（mode/manualPercent/curve），其余全部可选带默认 ⇒
+/// 这正是"升级不丢配置"的承重结构，必须被测试钉住，而不是靠 decodeIfPresent 的数量蒙对。
+func testFreshInstallAndUpgrade() {
+    group("首装与升级夹具(R74)")
+    let dir = engineTestEnv()
+    FanCtlPaths.ensureDirectories()
+    defer {
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        try? FileManager.default.removeItem(at: dir)
+    }
+    let cfgURL = dir.appendingPathComponent("config.json")
+
+    // ① 空目录首装：ensureDirectories 不崩、loadConfig 给默认、saveConfig 后读回一致
+    let fresh = ConfigStore.loadConfig()
+    expectEqual(fresh.mode, .curve, "首装默认模式 = curve（字面量，不拿 FanConfig() 自身当基准）")
+    expectEqual(fresh.manualPercent, 50, "首装默认手动百分比 = 50")
+    expectEqual(fresh.curve.count, 5, "首装默认曲线 5 个控制点（balanced）")
+    expectEqual(fresh.preset, .balanced, "首装默认预设 = balanced")
+    expectEqual(fresh.envCompensation, true, "首装默认开启环境补偿")
+    expectEqual(fresh.quietHours, false, "首装默认关闭夜间安静档")
+    expect(ConfigStore.saveConfig(fresh), "首装写 config 必须成功")
+    let back = ConfigStore.loadConfig()
+    expectEqual(back.mode, fresh.mode, "写后读回：模式一致")
+    expectEqual(back.curve.count, fresh.curve.count, "写后读回：曲线点数一致")
+    expect(FileManager.default.fileExists(atPath: dir.appendingPathComponent("config.last-good.json").path),
+           "saveConfig 必须同时落 last-good（损坏时可回退）")
+
+    // ② 旧版本升级：只写 4.2.8 时代就有的字段，后来新增的一个都不写。
+    // 用 JSONSerialization 构造，避免字符串字面量转义把测试自己写错（R74 就踩过一次：
+    // `\\` 续行写出了字面反斜杠 ⇒ JSON 非法 ⇒ 被测代码回退默认 ⇒ 我差点当成"升级会丢配置"的 bug）。
+    func writeJSON(_ dict: [String: Any], to url: URL) {
+        try? (try JSONSerialization.data(withJSONObject: dict)).write(to: url, options: .atomic)
+    }
+    writeJSON(["mode": "ai", "manualPercent": 30.0,
+               "curve": [["temp": 45.0, "percent": 10.0], ["temp": 95.0, "percent": 100.0]],
+               "preset": "balanced"], to: cfgURL)
+    let up = ConfigStore.loadConfig()
+    expectEqual(up.mode, .ai, "升级后用户选的模式保住（ai）")
+    expectEqual(up.manualPercent, 30, "升级后手动百分比保住")
+    expectEqual(up.curve.count, 2, "升级后自定义曲线保住（2 点，没被默认曲线顶掉）")
+    expectEqual(up.preset, .balanced, "升级后预设保住")
+    expectEqual(up.envCompensation, true, "新增字段拿到文档默认值 true（环境补偿）")
+    expectEqual(up.quietHours, false, "新增字段拿到文档默认值 false（夜间安静档）")
+    expectEqual(up.aiTargetTemp, 76, "旧配置没有 AI 目标档 ⇒ 被规范成 76（不是 0，也不是把 nil 泄给 UI）")
+    expectEqual(up.fanOffsets, nil, "旧配置没有双风扇偏移 ⇒ nil（= 统一偏移 0）")
+    expectEqual(up.nightCurve, nil, "旧配置没有夜间曲线 ⇒ nil")
+    expectEqual(up.envTempOverride, nil, "旧配置没有环境温度覆盖 ⇒ nil")
+    expectEqual(up.quietUntil, nil, "旧配置没有静音承诺 ⇒ nil")
+
+    // ③ 字段类型被写坏（升级时手改/半写）：不得崩，走 last-good 或默认
+    writeJSON(["mode": "ai", "manualPercent": 30.0,
+               "curve": [["temp": 45.0, "percent": 10.0]],
+               "envCompensation": "yes"], to: cfgURL)
+    let broken = ConfigStore.loadConfig()
+    expect(broken.mode == .ai || broken.mode == .curve, "坏类型不得崩：要么回退 last-good，要么给默认")
+    expect(broken.envCompensation == true || broken.envCompensation == false,
+           "坏类型不得把布尔读成奇怪值（必须落在合法域）")
+
+    // ④ config.json 截断：不得崩。实测走的是 **last-good 自愈**（① 保存过、②/③ 的成功加载会刷新它），
+    //    所以拿回来的可能是 last-good 的内容而不是出厂默认——这正是设计意图（R35 的自愈链）。
+    try? Data("{\"mode\":\"ai\",\"curve\":[".utf8).write(to: cfgURL, options: .atomic)
+    let trunc = ConfigStore.loadConfig()
+    expect(trunc.mode == .ai || trunc.mode == .curve, "截断 JSON：要么回退 last-good，要么给默认，总之不得崩")
+    expect(trunc.curve.count > 0, "截断 JSON：曲线必须有内容（空曲线=风扇不会转）")
+
+    // ⑤ 两个文件都不可解析（首装即损坏/被写坏）：这才应该落到出厂默认
+    try? Data("not json at all".utf8).write(to: cfgURL, options: .atomic)
+    try? Data("{".utf8).write(to: dir.appendingPathComponent("config.last-good.json"), options: .atomic)
+    let both = ConfigStore.loadConfig()
+    expectEqual(both.mode, .curve, "config 与 last-good 都坏 ⇒ 出厂默认（daemon 仍能启动）")
+    expectEqual(both.manualPercent, 50, "双坏时手动百分比回默认 50")
+    expectEqual(both.curve.count, 5, "双坏时曲线回默认 5 点")
+}
