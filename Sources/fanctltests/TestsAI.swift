@@ -2202,3 +2202,79 @@ func testAIModeVersusCurveTwoTau() {
         expect(abs(a.maxO - c.maxO) <= 5.0, "dt=\(dt)s 两臂过冲差 ≤5°（同热机同负载）")
     }
 }
+
+// MARK: - R73：红线的"误触发面"与"恢复轨迹"——此前的测试全是"该触发时触发"
+
+/// 已知取舍（`FanPipeline.swift:15-17`）：兜底刻意用 **raw** 而非平滑值，"毛刺不漏报"。
+/// 所以单拍尖峰 ≥92 会触发一次全速——这不是 bug。真正必须成立的是它的**边界**：
+///   不得锁存、不得在 88–92 之间抖动、恢复单调、坏值不会把输出卡死。
+/// 误触发比漏触发更伤信任：陌生人机器上误全速 = 噪音投诉 + 无谓磨损。
+func testRedLineFalseTriggerAndRecovery() {
+    group("红线误触发与恢复(R73)")
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    var cfg = FanConfig()
+    cfg.mode = .ai
+
+    func beat(raw: Double = 70, smoothed: Double = 70, nand: Double = 40, batt: Double = 30,
+              wasFailsafe: Bool = false, wasSSD: Bool = false, wasSSDCrit: Bool = false,
+              mode: FanMode = .ai) -> FanPipeline.Decision {
+        var c = cfg
+        c.mode = mode
+        return FanPipeline.decide(config: c, smoothedTemp: smoothed, rawTemp: raw, nandTemp: nand,
+                                  onBattery: false, aiPercent: 50, now: now,
+                                  wasSSDGuardActive: wasSSD, wasSSDCriticalActive: wasSSDCrit,
+                                  wasFailsafeActive: wasFailsafe, battTemp: batt)
+    }
+
+    // ① 单拍尖峰：该拍全速（设计取舍），但**下一拍必须释放**，不得锁存
+    let spike = beat(raw: 92)
+    expectEqual(spike.targetPercent, 100, "单拍 raw=92：该拍全速（刻意用 raw）")
+    expect(spike.failsafeActive, "该拍 failsafeActive 置位（daemon 据此记边沿日志）")
+    let after = beat(raw: 80, wasFailsafe: true)
+    expect(!after.failsafeActive, "尖峰后一拍 raw=80（<释放线 88）必须释放，不得锁存")
+    expect(after.targetPercent != 100, "释放后不得保持全速")
+
+    // ② 迟滞两侧：未激活时 88–92 之间**不得**触发；已激活时同区间**必须**保持
+    for raw in [88.0, 89.5, 91.0, 91.9] {
+        let d = beat(raw: raw)
+        expect(!d.failsafeActive, "未激活态 raw=\(raw)（<92）不得触发兜底")
+    }
+    for raw in [88.0, 89.5, 91.0, 91.9] {
+        let d = beat(raw: raw, wasFailsafe: true)
+        expect(d.failsafeActive, "已激活态 raw=\(raw)（≥释放线 88）必须保持兜底（迟滞防抖）")
+    }
+    expect(!beat(raw: 87.9, wasFailsafe: true).failsafeActive, "已激活态 raw=87.9（<88）才释放")
+
+    // ③ 恢复轨迹：从 92 逐拍降温到 86，输出必须单调非增、中途不得二次触发
+    var prevTarget = 101.0
+    var reTriggered = false
+    var raw = 92.0
+    while raw >= 86 {
+        let d = beat(raw: raw, wasFailsafe: true)
+        if let t = d.targetPercent {
+            if t > prevTarget + 0.001 { reTriggered = true }   // 回升即算二次触发
+            prevTarget = t
+        }
+        raw -= 1
+    }
+    expect(!reTriggered, "降温过程中输出不得回升（单调回落）")
+    expect(!beat(raw: 86, wasFailsafe: true).failsafeActive, "降到 86 必须已释放")
+
+    // ④ 坏读数不会把输出卡死：92 之后紧跟一个荒谬低值（骤降），必须正常释放
+    let crash = beat(raw: 20, wasFailsafe: true)
+    expect(!crash.failsafeActive, "raw 从 92 骤降到 20：必须释放（不得因坏读卡在全速）")
+
+    // ⑤ SSD/电池同构：单拍越线触发一次，下一拍回落即释放；未越线不得触发
+    expectEqual(beat(nand: 78, wasSSDCrit: false).targetPercent, 100, "单拍 NAND=78 触发危急档")
+    expect(!beat(nand: 60, wasSSDCrit: true).ssdGuard, "NAND 回落到 60（<67）必须解除托底")
+    expect(!beat(nand: 69.9).ssdGuard, "未激活态 NAND=69.9（<70）不得触发托底")
+    // 危急档**蕴含**警告档（`ssdState` 里 `guardActive = critical || …`，消费者把 ssdGuard 当"安全在生效"用）
+    // ⇒ 我原来的断言"78 只进危急、不标 guard"是错的，按设计改。
+    let crit = beat(nand: 78, wasSSDCrit: false)
+    expect(crit.ssdGuard && crit.ssdCriticalActive && crit.targetPercent == 100,
+           "NAND=78：危急档蕴含警告标记且强制全速（设计如此）")
+    let warn = beat(nand: 72)
+    expect(warn.ssdGuard && !warn.ssdCriticalActive && warn.targetPercent == 60,
+           "NAND=72：只进警告档（60%），不标危急")
+    expect(!beat(batt: 44.9).batteryGuard, "未激活态电池 44.9（<45）不得触发托底")
+}
