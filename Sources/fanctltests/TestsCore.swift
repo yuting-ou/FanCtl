@@ -1662,3 +1662,50 @@ func testHalfWrittenStateFiles() {
     let p1 = l1?.percent(for: 70), p2 = l2?.percent(for: 70)
     expect(p1 == p2, "学习表 save/load 幂等（不得因恢复重放而漂移；前 \(p1 == nil ? "nil" : "有值") 后 \(p2 == nil ? "nil" : "有值")）")
 }
+
+// MARK: - R76：趋势图上屏整理（剔坏读数 + 端点收缩平滑）——真机"地震图"的两位元凶
+
+func testTrendCurvePrepare() {
+    group("趋势图上屏整理(R76)")
+    // 元凶一：坏读数。真机连收 45 条 cpuDie≈8.4°C，一条就把 y 轴从 45–74° 拉成 8–74°。
+    let raw: [Double] = [48, 49, 8.4, 50, 51, 52, 53, 54, 55, 56]
+    let times: [Double] = (0..<raw.count).map { Double($0) * 3 }
+    let p = TrendCurve.prepare(rawTemps: raw, times: times, window: 5, envTemp: nil)
+    expectEqual(p.temps.count, raw.count - 1, "8.4°C 那条坏读数被剔掉（daemon 同谓词：无环境参照 <15 判失真）")
+    expect(!p.times.contains(6), "时间戳与温度成对过滤：坏读数（index 2，t=6s）那一拍的时间也一起走（不留空洞点）")
+    expectEqual(p.lo, 48, "y 轴下界回到真实最低 48（不是被坏读数拉到 8）")
+    expectEqual(p.hi, 56, "y 轴上界 56")
+    // 元凶二：传感器噪声逐点画 = 地震图。平滑后同长度、且**单调段的极值不被抹掉**
+    let ramp: [Double] = [50, 51, 52, 53, 54, 55, 56, 57]
+    let s = TrendCurve.movingAverage(ramp, window: 5)
+    expectEqual(s.count, ramp.count, "平滑不改变样本数（不许丢点）")
+    // 端点收缩：窗口 5（half=2）时首点覆盖 [0,2] 三点 ⇒ 51；末点覆盖 [5,7] ⇒ 56
+    expect(abs((s.first ?? 0) - 51) < 1e-9, "端点收缩：首点=首三点均值 51（不补零、不复制端点）")
+    expect(abs((s.last ?? 0) - 56) < 1e-9, "末点=末三点均值 56")
+    expect(abs((s[4] ) - 54) < 1e-9, "中间点=±2 拍均值（窗口 5）")
+    expectEqual(TrendCurve.movingAverage(ramp, window: 1), ramp, "window=1 原样返回（不做伪平滑）")
+    // 真实热峰必须留下：平滑只压噪声，不改极值标签来源
+    let peak: [Double] = [50, 50, 90, 50, 50]
+    let pp = TrendCurve.prepare(rawTemps: peak, times: times, window: 3, envTemp: nil)
+    expectEqual(pp.hi, 90, "真实热峰 90° 仍是 hi（平滑值 ≈63 只用于画线，标签取原始极值）")
+    expect((pp.temps.max() ?? 0) < 90, "但画线用的是平滑值（峰被压圆，不尖）")
+    // 负向 & 边界
+    let allBad = TrendCurve.prepare(rawTemps: [0, 0.5, -3], times: [0, 1, 2], window: 3)
+    expectEqual(allBad.temps.count, 0, "全不可信 ⇒ 空序列（由调用方显示'正在收集数据'）")
+    expectEqual(allBad.lo, 0, "空序列 lo=0（调用方不会拿到 NaN）")
+    expectEqual(TrendCurve.prepare(rawTemps: [50], times: [0, 1, 2], window: 3).temps.count, 1,
+                "两个数组不等长时按较短者截断（防调用方拼错）")
+    // 源码级门：入口与渲染都必须走这条路
+    let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    guard let modelSrc = try? String(contentsOfFile: root.appendingPathComponent(
+        "Sources/FanCtlApp/FanModel.swift").path, encoding: .utf8),
+          let viewsSrc = try? String(contentsOfFile: root.appendingPathComponent(
+        "Sources/FanCtlApp/MonitorViews.swift").path, encoding: .utf8) else {
+        expect(false, "静态门读不到源码（缺席必须判红）"); return
+    }
+    expect(modelSrc.contains("StatsSampler.tempPlausible(hottest, envTemp: envTemp)"),
+           "趋势入环前必须过与 daemon 同源的 tempPlausible（撤掉即红）")
+    expect(viewsSrc.contains("TrendCurve.prepare(rawTemps:"),
+           "TrendChart 必须走上屏整理（绕过去即红）")
+}

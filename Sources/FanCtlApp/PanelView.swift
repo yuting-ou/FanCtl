@@ -415,7 +415,7 @@ struct ContentView: View {
                 case 1: HotspotList(components: model.components).transition(.opacity)
                 case 2: TodayStatsView(stats: model.stats).transition(.opacity)
                 case 3: ProcessHogView(processes: model.topProcesses, gpuTemp: model.gpuTemp).transition(.opacity)
-                default: TrendChart(samples: model.history).transition(.opacity)
+                default: TrendChart(samples: model.history, envTemp: model.envTemp).transition(.opacity)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .top)

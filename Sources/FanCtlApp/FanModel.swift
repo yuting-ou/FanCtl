@@ -791,7 +791,10 @@ final class FanModel: ObservableObject {
         // 历史采样
         let hottest = max(cpuTemp, gpuTemp)
         let nowT = Date()
-        if hottest > 1, nowT.timeIntervalSince(lastTrendAppend) >= Self.trendSampleSeconds {
+        // R76：入环前先过可信门（与 daemon 统计同一谓词）——8.4°C 那种坏读数此前只被
+        // `> 1` 放行，真机曾连进 45 条，把趋势图 y 轴从 45–74° 拉成 8–74°。
+        if hottest > 1, StatsSampler.tempPlausible(hottest, envTemp: envTemp),
+           nowT.timeIntervalSince(lastTrendAppend) >= Self.trendSampleSeconds {
             lastTrendAppend = nowT
             trendDirty = true
             // 内存采样照常：200 样本环形缓冲让"重开面板立即可见最近趋势"

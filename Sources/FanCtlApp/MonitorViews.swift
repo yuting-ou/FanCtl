@@ -62,38 +62,53 @@ struct GlowBar: View {
 // 右侧附最高/最低刻度，摆脱 Swift Charts “外来图表”观感
 struct TrendChart: View {
     let samples: [FanModel.TempSample]
+    var envTemp: Double? = nil
+
+    /// 平滑窗口（拍）：采样 3s 一拍，5 拍 = ±6s。真机相邻样本中位差 2.97°C 的传感器噪声
+    /// 逐点画出来就是"地震图"，看不出趋势；窗口再大就会把真实阶跃抹圆。
+    static let smoothWindow = 5
 
     var body: some View {
         if samples.count < 5 {
             MonitorEmpty(text: "正在收集数据…")
         } else {
-            let temps = samples.map(\.temp)
-            let hi = temps.max() ?? 0
-            let lo = temps.min() ?? 0
-            // 趋势色跟随当前（最新）温度，与最热共用同一色彩语义
-            let accent = MonitorStyle.color(samples.last?.temp ?? 60)
-            // 按时间戳映射 x（事件驱动采样下拍间隔 1~20s 不均，均匀映射会失真斜率）
-            let times = samples.map { $0.id.timeIntervalSince1970 }
-            let t0 = times.first ?? 0
-            let span = max((times.last ?? 0) - t0, 1)
-            let fractions = times.map { ($0 - t0) / span }
-            HStack(spacing: 8) {
-                SparkLine(values: temps, color: accent, xFractions: fractions)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 6)
-                    // 与"最热"行背景呼应，给趋势窗一个淡色轨道
-                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(.secondary.opacity(0.05)))
-                // 右侧极值刻度（圆体渐变数字，与面板同源）
-                VStack(alignment: .trailing, spacing: 0) {
-                    Text("\(Int(hi))°").font(MonitorStyle.numeral(11)).foregroundStyle(accent.gradient)
-                    Spacer(minLength: 0)
-                    Text("\(Int(lo))°").font(MonitorStyle.numeral(11)).foregroundStyle(.secondary)
+            // R76：上屏前先剔不可信读数、再做端点收缩的轻度平滑（`TrendCurve`，纯函数、有测试）。
+            // 真机曾连收 45 条 cpuDie≈8.4°C 的坏读数：一条就把 y 轴从 45–74° 拉成 8–74°，
+            // 正常波动被压成上沿一条线。过滤用与 daemon 统计同一个谓词（`tempPlausible`），
+            // **不按"偏离均值太大"**——真实热峰必须留下。
+            let prepared = TrendCurve.prepare(rawTemps: samples.map(\.temp),
+                                              times: samples.map { $0.id.timeIntervalSince1970 },
+                                              window: Self.smoothWindow,
+                                              envTemp: envTemp)
+            if prepared.temps.count < 5 {
+                MonitorEmpty(text: "正在收集数据…")
+            } else {
+                // 趋势色跟随当前（最新）温度，与最热共用同一色彩语义
+                let accent = MonitorStyle.color(prepared.temps.last ?? 60)
+                // 按时间戳映射 x（事件驱动采样下拍间隔 1~20s 不均，均匀映射会失真斜率）
+                let t0 = prepared.times.first ?? 0
+                let span = max((prepared.times.last ?? 0) - t0, 1)
+                let fractions = prepared.times.map { ($0 - t0) / span }
+                HStack(spacing: 8) {
+                    SparkLine(values: prepared.temps, color: accent, xFractions: fractions)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 6)
+                        // 与"最热"行背景呼应，给趋势窗一个淡色轨道
+                        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(.secondary.opacity(0.05)))
+                    // 右侧极值刻度：**过滤后原始值**的极值（不是平滑值），平滑不抹掉真实峰谷
+                    VStack(alignment: .trailing, spacing: 0) {
+                        Text("\(Int(prepared.hi))°").font(MonitorStyle.numeral(11))
+                            .foregroundStyle(accent.gradient)
+                        Spacer(minLength: 0)
+                        Text("\(Int(prepared.lo))°").font(MonitorStyle.numeral(11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(width: 30)
+                    .padding(.vertical, 2)
                 }
-                .frame(width: 30)
-                .padding(.vertical, 2)
+                .frame(height: MonitorStyle.height)
             }
-            .frame(height: MonitorStyle.height)
         }
     }
 }
