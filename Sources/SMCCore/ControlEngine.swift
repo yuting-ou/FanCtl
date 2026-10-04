@@ -73,7 +73,7 @@ public final class ControlEngine {
     }
 
     public let hooks: Hooks
-    public let fans: FanController
+    public let fans: FanActuating
     public let sensors: TemperatureSensors
 
     // MARK: - 主循环状态（自 main.swift 逐字段迁入，语义不变）
@@ -127,6 +127,11 @@ public final class ControlEngine {
     var targetUnreachable = false
     var targetUnreachableSince: Date? = nil
     var targetUnreachableLogged = false
+    // R77：AI 全力散热（targetUnreachable 的前置弱信号）。时长计时器必须活在 daemon 里——
+    // 此前 App 自己计时，UI 进程一重启就归零，"持续 20s"实际测不准；且阈值与 daemon 分叉。
+    // 这里只做"是否已满 20s"的边沿状态，落盘值见 status 组装处。
+    var aiHighEffortState = false
+    var aiHighEffortSince: Date? = nil
     var boostExpiredLogged = false
     var passiveModeLogged = false
     // 4.0 B2 冷启动校准：非持久化状态——学习表是真状态，重启后自然续上/结束；
@@ -183,7 +188,7 @@ public final class ControlEngine {
 
     // MARK: - 初始化（含启动清洗/衰减/战报恢复，原 main.swift 启动段迁入）
 
-    public init(fans: FanController, sensors: TemperatureSensors, hooks: Hooks) {
+    public init(fans: FanActuating, sensors: TemperatureSensors, hooks: Hooks) {
         self.fans = fans
         self.sensors = sensors
         self.hooks = hooks
@@ -289,6 +294,15 @@ public final class ControlEngine {
         targetUnreachable = false
         targetUnreachableSince = nil
         targetUnreachableLogged = false
+        // R77：全力散热计时器同理——"已持续 20s"的语义不能跨过一次睡眠
+        aiHighEffortState = false
+        aiHighEffortSince = nil
+        // R77：启停抑制边沿记忆同步复位。上面已 aiController.reset()（把 cyclingGuardArmed
+        // 置 false），但"上一次是否武装"若留在 true，醒来第一拍就会打出一条假边沿日志
+        // "抑制解除，恢复空闲交还评估"，且文案时长取自 currentGuardSeconds（已被 reset 清零）
+        // → 出现"解除 0 分钟"这种自相矛盾的日志。抑制针对的是上一次清醒会话的循环，
+        // 醒后本就该重新判定，故对齐到"未武装"。
+        aiCyclingGuardActive = false
         boostExpiredLogged = false
         sensors.rescanAllSensors()
         hooks.schedule(0)
@@ -349,9 +363,10 @@ public final class ControlEngine {
             if let last = lastLoopStart {
                 let elapsed = loopStart.timeIntervalSince(last)
                 // 钳制：睡眠唤醒/时钟跳变后 elapsed 可能极大，限制到合理范围。
-                // 上界 20s 对齐 idle 最大间隔（AIController 内部另有 [0.5,15] 钳制），
-                // 统计秒数与 LearningGate 的 °C/s 语义在 idle 长拍下保持精确。
-                actualInterval = min(max(elapsed, 0.5), 20.0)
+                // R77：改用 FanDt 单一定义——此前这里钳到 20s，而注释里写的"AIController 内部
+                // 另有 [0.5,15] 钳制"正是那处静默漂移（15 会把 °C/s 与 P/D 增量口径放宽 25%）。
+                // 现在三处（引擎/AI/LearningGate）同源；非有限值退回标称 3s 而不是把 NaN 传下去。
+                actualInterval = FanDt.clamped(elapsed)
             } else {
                 actualInterval = currentLoopInterval
             }
@@ -362,20 +377,7 @@ public final class ControlEngine {
         if !fastConfigApply { loopCount += 1 }
 
         // AI 热经验重置请求
-        if FileManager.default.fileExists(atPath: FanCtlPaths.resetLearnFlag.path) {
-            do {
-                try FileManager.default.removeItem(at: FanCtlPaths.resetLearnFlag)
-                thermalLearn = ThermalLearn()
-                calibrationSamples = 0
-                calibrationTimedOut = false
-                learnDirty = true
-                hooks.log("AI 热经验已重置，将从零重新积累")
-            } catch {
-                // v3.6.1：删除失败必须中止本拍重置——`try?` 吞掉后标志永存，
-                // 每拍重置学习 + 每 60s 落盘空表，学习永久无法积累
-                hooks.log("AI 热经验重置标志删除失败（\(error)），下拍重试")
-            }
-        }
+        applyPendingLearnReset()
 
         // 1. 热加载配置
         let mtime = ConfigStore.configModificationDate() ?? .distantPast
@@ -437,42 +439,10 @@ public final class ControlEngine {
         //      < 12）——先观察系统自控的实际平衡写进学习表，成熟后下一拍接管
         //      （AI 播种链 learned 优先，从经验起步而非公式种子猜）。
         // 不修改 config 本身（App 模式选择保留用户意志）；各打一次边沿日志。
-        let passiveMachine: Bool
-        if fans.fanCount == 0 {
-            // 4.0 审查修复：FNum 在 init 只读一次，启动瞬时读取失败会把有扇机器
-            // 永久钉在 passive 语义（B1 前该故障走 controlFault 响亮路径，B1 后
-            // 变成安静的错误语义）。fanCount==0 期间每 30s 低频重探，恢复即翻正
-            // 并更正画像；真 passive 机器代价 = 每 30s 一次单键读。
-            if fans.rescanFanCountIfNeeded(now: hooks.now()) {
-                hardwareProfile?.fanCount = fans.fanCount
-                hooks.log("FNum 读取恢复：检测到 \(fans.fanCount) 个风扇，退出 passive 语义（硬件画像已更正）")
-            }
-        }
-        passiveMachine = fans.fanCount == 0
+        let passiveMachine = detectPassiveMachine()
         // 超时 latch 解除时机：离开 AI 模式（用户重新选择 = 重新给观察窗），
         // 或本就无扇可校准（passive 门接管语义）。AI 在选期间 latch 恒保持。
-        if effectiveConfig.mode != .ai || passiveMachine {
-            calibrationTimedOut = false
-        }
-        let calibrationDue = effectiveConfig.mode == .ai && !passiveMachine && !calibrationTimedOut
-            && thermalLearn.learnedBucketCount < CALIBRATION_MATURE_BUCKETS
-            && calibrationSamples < CALIBRATION_MIN_SAMPLES
-        if calibrationDue != calibrating {
-            calibrating = calibrationDue
-            calibratingStartedAt = calibrationDue ? hooks.now() : nil
-            if calibrationDue {
-                hooks.log("AI 校准中：学习表未成熟，先观察系统散热特性（≤45 分钟或采够即接管）")
-            } else {
-                // R23（P2 修复）：校准退出边沿必须重置 AI 控制器——观察期 step() 不被调用，
-                // lastTemp 冻结在进期前；接管首拍把分钟级温漂当 3s 拍斜率（kD/dtNom=24×，
-                // -4°C 冷漂 → D 项 -96% 一拍猛打）。模式切换 reset（上方）只认 config.mode，
-                // calibrating 的语义切换不触它 → 在此收口。重置项与模式切换对齐（含 aiIdleActive）。
-                aiController.reset()
-                lastAIOutput = nil
-                lastAIIntent = nil
-                aiIdleActive = false
-            }
-        }
+        updateCalibrationState(configMode: effectiveConfig.mode, passiveMachine: passiveMachine)
         if passiveMachine || calibrating {
             if passiveMachine, effectiveConfig.mode != .auto {
                 effectiveConfig.mode = .auto
@@ -790,29 +760,7 @@ public final class ControlEngine {
         // 热安全向：交还=交给 EC 调度，与 92°C 兜底的最终形态（restoreAutoAll）同向；
         // 多等 6s + 一拍远小于热时间常数 25–70s，期间 CPU 侧兜底照常在场。
         let presentFanIDs = Set(fanStates.map { $0.id })
-        let lossNow = hooks.now()
-        for id in 0..<fans.fanCount where !presentFanIDs.contains(id) {
-            let since = invisibleFanSince[id] ?? lossNow
-            invisibleFanSince[id] = since
-            let lostFor = lossNow.timeIntervalSince(since)
-            guard lostFor >= FANLOSS_HANDBACK_SECONDS else { continue }
-            guard !handedBackInvisibleFans.contains(id) else { continue }
-            handedBackInvisibleFans.insert(id)
-            // 过期命令基线一并作废：恢复可见后不能拿旧目标做跟随比较（会挂假故障）
-            lastWrittenRPM.removeValue(forKey: id)
-            // 交还写失败也算"本轮失联已处理"：键整体缺失的风扇从没被本进程强制过（同键
-            // setForcedRPM 必失败），无钉住风险，逐拍重试只会刷日志。失败本身出声，不静默。
-            do {
-                try fans.restoreAuto(fan: id)
-                hooks.log("风扇 \(id) 连续 \(Int(lostFor))s 读不到状态，已交还系统调度")
-            } catch {
-                hooks.log("风扇 \(id) 读不到状态，交还写入亦失败（该键可能整体不存在）: \(error)")
-            }
-        }
-        for id in presentFanIDs {
-            invisibleFanSince.removeValue(forKey: id)
-        }
-        handedBackInvisibleFans = handedBackInvisibleFans.subtracting(presentFanIDs)
+        reapMissingFans(presentFanIDs: presentFanIDs, now: hooks.now())
         // 验证期（probeVerifyLoops > 0）用严格检查（无升速宽限），探测真实故障。
         // fastConfigApply 拍只更新命令基线不计数：快速下拖时限速行程在数百 ms 内走完
         // 而 RPM 物理回落需 1-3s，逐拍计 mismatch 会稳定误判闭环失效（v2.8 审查 P1）
@@ -1013,6 +961,18 @@ public final class ControlEngine {
                 let target = aiTargetEff
                 let saturated = shapedBase >= 98
                 let aboveWindow = temp > target + 4
+                // R77：全力散热判定与上面同拍同源，只是门槛更松、窗口更短——
+                // 它注定先于 targetUnreachable 成立（99≥98、+2<+4、20s<60s），
+                // 命中的时候上面那条还不会命中，故 UI 的"黄提示 → 黄提示+感叹号"次序不变。
+                // 清空条件与上面一致（saturated && aboveWindow 的补集），确保两者同时复位。
+                let highEffort = shapedBase >= 99 && temp > target + 2
+                if highEffort {
+                    if aiHighEffortSince == nil { aiHighEffortSince = hooks.now() }
+                    if hooks.now().timeIntervalSince(aiHighEffortSince!) >= 20 { aiHighEffortState = true }
+                } else {
+                    aiHighEffortSince = nil
+                    aiHighEffortState = false
+                }
                 if saturated && aboveWindow {
                     if targetUnreachableSince == nil { targetUnreachableSince = hooks.now() }
                     if hooks.now().timeIntervalSince(targetUnreachableSince!) >= 60, !targetUnreachableLogged {
@@ -1029,6 +989,11 @@ public final class ControlEngine {
                         hooks.log("AI 目标温度可达成，恢复正常学习")
                     }
                 }
+            } else {
+                // 非 AI 模式/配置快拍：两个状态都必须落地为"不成立"，否则退出 AI 后
+                // 黄提示会一直挂在面板上（fastConfigApply 不推进时间基准，不能用来计时）
+                aiHighEffortSince = nil
+                aiHighEffortState = false
             }
 
             // 闭环故障（SMC 写入连续失败 / 风扇实际转速持续不跟随）：
@@ -1178,6 +1143,10 @@ public final class ControlEngine {
                 targetUnreachableLogged = false
             }
             targetUnreachableSince = nil
+            // R77：全力散热同处清除——它是同一条路径上的弱信号，AI 交还期间不成立；
+            // 漏掉这里会让退出 AI 主动调速后黄提示一直挂在面板上
+            aiHighEffortState = false
+            aiHighEffortSince = nil
         }
 
         // 4. 每日统计累计（用实际循环间隔，自适应后不再固定 3s）
@@ -1275,6 +1244,10 @@ public final class ControlEngine {
             learnedPoints: thermalLearn.learnedBucketCount,
             learnedSamples: thermalLearn.sampleTotal,
             targetUnreachable: (effectiveConfig.mode == .ai && targetUnreachable) ? true : nil,
+            // R77：仅 AI 模式表态（false=AI 在正常工作，App 不显示黄提示）；非 AI 模式 nil，
+            // 与 targetUnreachable 同形。"全力散热"须使用 daemon 的有效目标（环境/夜间/电池
+            // 叠加后）判定——这正是此前 App 侧重算时最容易做错的地方。
+            aiHighEffort: effectiveConfig.mode == .ai ? aiHighEffortState : nil,
             powerWatts: powerWatts,
             // v2.6.2：直接用 decision.nightOverride(此前用 reason == .night,静音封顶在场时
             // reason 变 .quiet 但夜间仍生效,标记会丢失);AI 模式夜间(+4°)同样标记,
@@ -1359,6 +1332,123 @@ public final class ControlEngine {
         //（包含 fastConfigApply 期间变化），被 computeNextInterval 误判为"温度快速变化"，
         // 强制使用 LOOP_INTERVAL_MIN（1s）。更新后 tempChange 只反映两次循环间的真实变化。
         prevRawTemp = rawTemp
+    }
+
+    // MARK: - 单拍阶段抽取（R77 起：把 beat() 里自包含的阶段搬出，见各方法注释）
+
+    /// 应用"重置 AI 热经验"请求（App 写 reset-learn.flag → daemon 消费并删除）。
+    ///
+    /// 从 beat() 抽出（R77）：该阶段不读写任何 beat 局部变量，只动引擎自身状态
+    /// （thermalLearn/calibrationSamples/calibrationTimedOut/learnDirty），
+    /// 是纯自包含阶段，搬出后 beat() 少一层嵌套、语义边界更清楚。
+    /// 关键约束（v3.6.1 事故）：删除标志失败必须**中止**本拍重置——曾用 `try?` 吞掉错误，
+    /// 标志永存 → 每拍重置学习 + 每 60s 落盘空表，学习永久无法积累。
+    private func applyPendingLearnReset() {
+        guard FileManager.default.fileExists(atPath: FanCtlPaths.resetLearnFlag.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: FanCtlPaths.resetLearnFlag)
+            thermalLearn = ThermalLearn()
+            calibrationSamples = 0
+            calibrationTimedOut = false
+            learnDirty = true
+            hooks.log("AI 热经验已重置，将从零重新积累")
+        } catch {
+            // v3.6.1：删除失败必须中止本拍重置——`try?` 吞掉后标志永存，
+            // 每拍重置学习 + 每 60s 落盘空表，学习永久无法积累
+            hooks.log("AI 热经验重置标志删除失败（\(error)），下拍重试")
+        }
+    }
+
+    /// 本机是否"无风扇可管"（passive cooling，如 MacBook Air）。
+    ///
+    /// 从 beat() 抽出（R77）：该阶段只读 fans.fanCount 与 hardwareProfile，
+    /// 只写 hardwareProfile?.fanCount，并返回一个 Bool，不依赖任何 beat 局部量。
+    ///
+    /// 4.0 审查修复：FNum 在 init 只读一次，启动瞬时读取失败会把**有扇机器**永久钉在
+    /// passive 语义（B1 前该故障走 controlFault 响亮路径，B1 后变成安静的错误语义）。
+    /// 故 fanCount==0 期间每 30s 低频重探，恢复即翻正并更正画像；
+    /// 真 passive 机器的代价 = 每 30s 一次单键读。
+    private func detectPassiveMachine() -> Bool {
+        if fans.fanCount == 0 {
+            if fans.rescanFanCountIfNeeded(now: hooks.now()) {
+                hardwareProfile?.fanCount = fans.fanCount
+                hooks.log("FNum 读取恢复：检测到 \(fans.fanCount) 个风扇，退出 passive 语义（硬件画像已更正）")
+            }
+        }
+        return fans.fanCount == 0
+    }
+
+    /// 冷启动校准观察期的状态机（4.0 B2）：决定本拍是否处于"先观察系统散热特性"的观察期，
+    /// 并在**进出边沿**做收口。
+    ///
+    /// 从 beat() 抽出（R77）：该阶段只读 configMode/passiveMachine 与引擎自身状态，
+    /// 只写 calibrationTimedOut / calibrating / calibratingStartedAt（外加退出边沿的
+    /// AI 控制器复位），不依赖任何 beat 局部量。原 `calibrationDue` 局部变量不被本拍
+    /// 后续代码使用，故随本阶段一并内化。
+    ///
+    /// 两条被真实缺陷教训钉住的语义，改动前必读：
+    ///  - 超时 latch（calibrationTimedOut）的解除时机：离开 AI 模式（用户重新选择 =
+    ///    重新给观察窗），或本就无扇可校准（passive 门接管语义）。AI 在选期间 latch 恒保持。
+    ///    原缺陷：超时置 calibrating=false，但下一拍 calibrationDue 仍为真 → 超时永不可达，
+    ///    calibrating 无限期挂起。
+    ///  - 退出边沿必须 aiController.reset()（R23 P2）：观察期 step() 不被调用，lastTemp
+    ///    冻结在进期前；接管首拍会把分钟级温漂当 3s 拍斜率（kD/dtNom=24×，−4°C 冷漂 →
+    ///    D 项 −96% 一拍猛打）。模式切换的 reset 只认 config.mode，calibrating 的语义切换
+    ///    不触它，故必须在此收口（重置项与模式切换对齐，含 aiIdleActive）。
+    private func updateCalibrationState(configMode: FanMode, passiveMachine: Bool) {
+        if configMode != .ai || passiveMachine {
+            calibrationTimedOut = false
+        }
+        let calibrationDue = configMode == .ai && !passiveMachine && !calibrationTimedOut
+            && thermalLearn.learnedBucketCount < CALIBRATION_MATURE_BUCKETS
+            && calibrationSamples < CALIBRATION_MIN_SAMPLES
+        if calibrationDue != calibrating {
+            calibrating = calibrationDue
+            calibratingStartedAt = calibrationDue ? hooks.now() : nil
+            if calibrationDue {
+                hooks.log("AI 校准中：学习表未成熟，先观察系统散热特性（≤45 分钟或采够即接管）")
+            } else {
+                aiController.reset()
+                lastAIOutput = nil
+                lastAIIntent = nil
+                aiIdleActive = false
+            }
+        }
+    }
+
+    /// 处理"风扇状态读不到"的失联风扇：累计失联时长，超过阈值即交还系统调度（去抖）。
+    ///
+    /// 从 beat() 抽出（R77）：该阶段只读 presentFanIDs、只写自己的三份记忆
+    /// （invisibleFanSince / handedBackInvisibleFans / lastWrittenRPM[id]），
+    /// 不碰任何 beat 局部变量，是干净的一拍阶段。
+    ///
+    /// R43：一把风扇连续失联满 FANLOSS_HANDBACK_SECONDS 才交还——去抖，避免单拍读失败
+    /// 就反复交还/夺回。R27：交还写失败也算"本轮失联已处理"（键整体缺失的风扇从没被本
+    /// 进程强制过，无钉住风险，逐拍重试只会刷日志；失败本身出声，不静默）。
+    private func reapMissingFans(presentFanIDs: Set<Int>, now: Date) {
+        for id in 0..<fans.fanCount where !presentFanIDs.contains(id) {
+            let since = invisibleFanSince[id] ?? now
+            invisibleFanSince[id] = since
+            let lostFor = now.timeIntervalSince(since)
+            guard lostFor >= FANLOSS_HANDBACK_SECONDS else { continue }
+            guard !handedBackInvisibleFans.contains(id) else { continue }
+            handedBackInvisibleFans.insert(id)
+            // 过期命令基线一并作废：恢复可见后不能拿旧目标做跟随比较（会挂假故障）
+            lastWrittenRPM.removeValue(forKey: id)
+            // 交还写失败也算"本轮失联已处理"：键整体缺失的风扇从没被本进程强制过（同键
+            // setForcedRPM 必失败），无钉住风险，逐拍重试只会刷日志。失败本身出声，不静默。
+            do {
+                try fans.restoreAuto(fan: id)
+                hooks.log("风扇 \(id) 连续 \(Int(lostFor))s 读不到状态，已交还系统调度")
+            } catch {
+                hooks.log("风扇 \(id) 读不到状态，交还写入亦失败（该键可能整体不存在）: \(error)")
+            }
+        }
+        // 恢复可见的风扇：清掉失联记忆与"已交还"标记，下次真失联重新计时
+        for id in presentFanIDs {
+            invisibleFanSince.removeValue(forKey: id)
+        }
+        handedBackInvisibleFans = handedBackInvisibleFans.subtracting(presentFanIDs)
     }
 
     // MARK: - 自适应循环间隔计算（原 main.swift 顶层函数迁入）

@@ -11,6 +11,32 @@ import Foundation
 // 之所以拆两段：平滑发生在"查曲线"之前，而限速/死区作用在 SSD 托底、高温兜底
 // 等覆盖生效之后的最终目标上，顺序与守护进程一致。
 
+/// R77：单拍时长 dt 的统一钳位区间（秒）。
+///
+/// 为什么必须**一处定义、处处同值**：dt 贯穿 AI 的 P/D 增量、LearningGate 的 °C/s
+/// 阈值、aiMetrics/dtLedger 的按秒加权。三处各写各的常量时它们会静默分叉——本项目
+/// 真实发生过：LearningGate 用 20s（注释还写明"按 15 结算会把 °C/s 阈值放宽 ~25%"），
+/// 而 FanAIController 内部仍钳 15s，于是 idle 长拍（引擎最大 20s）下 AI 的 P/D 增量
+/// 按 15s 结算、与同拍的学习门/统计口径差 25%。这种漂移不报错、只是悄悄让控制与
+/// 度量不同源，故收敛为一个常量。
+///
+/// 上界取 20 = 引擎 idle 最大间隔（LOOP_INTERVAL_IDLE），不是随手取整：
+/// 上界小于真实拍长就等于把长拍截短结算，越大越危险（P 项会一拍冲到 100）。
+/// 下界 0.5 = 引擎快拍下限（LOOP_INTERVAL_MIN 为 1.0，留一倍余量给仿真/时钟抖动）。
+public enum FanDt {
+    public static let minSeconds: Double = 0.5
+    public static let maxSeconds: Double = 20.0
+    /// 标称拍长：参数按 3s 标定（见 docs/architecture.md 时间语义一节），
+    /// 也是 dt 非有限值时的保守降级值。
+    public static let nominalSeconds: Double = 3.0
+
+    /// 把任意（可能非有限、可能来自时钟跳变的）时长钳到统一区间。
+    /// 非有限值退回标称拍长——NaN 会穿透 min/max（比较恒 false）并污染 output 直到 SMC。
+    public static func clamped(_ dt: Double) -> Double {
+        dt.isFinite ? Swift.min(Swift.max(dt, minSeconds), maxSeconds) : nominalSeconds
+    }
+}
+
 public struct FanControlTuning: Equatable {
     public var loopInterval: Double = 3.0     // 主循环周期（秒），仿真用
     public var alphaUp: Double = 0.35         // 升温 EMA 系数（大=响应快）
@@ -188,11 +214,12 @@ public enum LearningGate {
     public static func isSteady(temp: Double, prevTemp: Double,
                                 baseTarget: Double, prevBase: Double,
                                 shapedBase: Double, dt: Double) -> Bool {
-        // dt 防御（NaN 穿透比较；睡眠唤醒超大间隔钳到 [0.5, 20]——20 对齐 idle 最大间隔，
-        // 否则 idle 长拍按 15 结算会把 °C/s 阈值放宽 ~25%）
+        // dt 防御（NaN 穿透比较；睡眠唤醒超大间隔钳到 FanDt 统一区间——上界 20 对齐 idle
+        // 最大间隔，否则 idle 长拍按 15 结算会把 °C/s 阈值放宽 ~25%）。
+        // R77：本处曾是"正确的那一份"，现已收敛为全员共用 FanDt，避免再有人只改一处。
         guard temp.isFinite, prevTemp.isFinite, baseTarget.isFinite,
               prevBase.isFinite, shapedBase.isFinite, dt.isFinite else { return false }
-        let dtn = min(max(dt, 0.5), 20.0)
+        let dtn = FanDt.clamped(dt)
         return abs(temp - prevTemp) / dtn < tempRatePerSec
             && abs(baseTarget - prevBase) / dtn < targetRatePerSec
             && abs(baseTarget - shapedBase) < shapedGapPercent

@@ -36,8 +36,8 @@ jobs:
           swift run -c release --disable-sandbox fanctltests 2>&1 | tee test-output.txt
           N=$(grep -oE '全部通过：[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1)
           echo "断言数: $N"
-          if [ -z "$N" ] || [ "$N" -lt 5230 ]; then
-            echo "::error::断言数 $N 低于契约下限 5230（测试被删/跳过？）"
+          if [ -z "$N" ] || [ "$N" -lt 5319 ]; then
+            echo "::error::断言数 $N 低于契约下限 5319（测试被删/跳过？）"
             exit 1
           fi
           echo "ASSERTIONS=$N" >> "$GITHUB_ENV"
@@ -92,6 +92,8 @@ jobs:
           /usr/local/libexec/fanctld -v | grep -qF "$APP_VERSION ($BUILD_NUMBER)"
           test -d "/Applications/清风.app/Contents/MacOS"
           test -x /usr/local/bin/fanprobe
+          # R84：MCP 服务器与诊断工具同批装卸——zip/install/uninstall 漏掉它时此处红
+          test -x /usr/local/bin/fanmcp
           sleep 5
           launchctl print system/com.fanctl.daemon >/dev/null
           # 诊断包小节数是固定的 19 行（缺数据也必须出声），干净机器首装后必须能整段产出
@@ -100,21 +102,24 @@ jobs:
           test ! -e /usr/local/libexec/fanctld
           test ! -e /Library/LaunchDaemons/com.fanctl.daemon.plist
           test ! -e "/Applications/清风.app"
+          test ! -e /usr/local/bin/fanmcp
           # 第二公里：访客拿到的不是仓库而是 zip —— R33 为 zip 布局改过产物根查找，
           # 但从没有真按"解压 → sudo ./install.sh"走过一遍。这里现造一个与 release job
           # 同形状的 zip，解到仓库外再装再卸。
           STG="$RUNNER_TEMP/StageLayout/FanCtl-${APP_VERSION}"
           mkdir -p "$STG"
-          cp -R dist/FanCtl.app dist/fanctld dist/fanprobe scripts/install.sh scripts/uninstall.sh scripts/upgrade.sh "$STG/"
+          cp -R dist/FanCtl.app dist/fanctld dist/fanprobe dist/fanmcp scripts/install.sh scripts/uninstall.sh scripts/upgrade.sh "$STG/"
           (cd "$RUNNER_TEMP/StageLayout" && zip -qr ../visitor.zip "FanCtl-${APP_VERSION}")
           mkdir -p "$RUNNER_TEMP/visitor" && unzip -q "$RUNNER_TEMP/visitor.zip" -d "$RUNNER_TEMP/visitor"
           (cd "$RUNNER_TEMP/visitor/FanCtl-${APP_VERSION}" && sudo ./install.sh)
           /usr/local/libexec/fanctld -v | grep -qF "$APP_VERSION ($BUILD_NUMBER)"
           test -d "/Applications/清风.app/Contents/MacOS"
+          test -x /usr/local/bin/fanmcp
           [ "$(sudo /usr/local/bin/fanprobe --report | wc -l | tr -d ' ')" = "19" ]
           (cd "$RUNNER_TEMP/visitor/FanCtl-${APP_VERSION}" && sudo ./uninstall.sh)
           test ! -e /usr/local/libexec/fanctld
           test ! -e "/Applications/清风.app"
+          test ! -e /usr/local/bin/fanmcp
           echo "首装→运行→卸载 全链在干净机器上通过（仓库布局 + 访客 zip 布局各一遍）"
 
       - name: Release 构建
@@ -164,6 +169,9 @@ jobs:
           cp -R dist/FanCtl.app "$STAGE/"
           cp dist/fanctld "$STAGE/"
           cp dist/fanprobe "$STAGE/"
+          # R84：MCP 服务器随发行物分发（install.sh 装到 /usr/local/bin/fanmcp；
+          # 访客也可能直接把客户端指到解压目录里的这份——故可执行位必须活着）
+          cp dist/fanmcp "$STAGE/"
           cp scripts/install.sh "$STAGE/"
           cp scripts/uninstall.sh "$STAGE/"
           # 批次 A：root 执行脚本随发行物分发——install.sh 把它装进
@@ -175,6 +183,11 @@ jobs:
           # 即将上传的那份 zip（unzip -Z 第一列就是打包进去的权限），不看工作树。
           for _e in install uninstall upgrade; do
             unzip -Z "FanCtl-v${VERSION}.zip" "${STAGE}/${_e}.sh" | grep -q '^.rwxr-xr-x' || { echo "::error::zip 里的 ${_e}.sh 不可执行，首装会 permission denied"; exit 1; }
+          done
+          # R84：三个二进制同理——MCP 客户端会直接 exec 解压目录里的 fanmcp，
+          # fanprobe 的报告入口也是用户手敲的；mode 掉了全链测试照样绿。
+          for _b in fanctld fanprobe fanmcp; do
+            unzip -Z "FanCtl-v${VERSION}.zip" "${STAGE}/${_b}" | grep -q '^.rwxr-xr-x' || { echo "::error::zip 里的 ${_b} 不可执行（MCP 客户端/用户无法直接运行）"; exit 1; }
           done
           echo "zip 内三个 root 脚本均可执行 ✓"
           echo "ASSET=FanCtl-v${VERSION}.zip" >> "$GITHUB_ENV"

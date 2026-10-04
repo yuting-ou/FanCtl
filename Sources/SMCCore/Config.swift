@@ -374,6 +374,11 @@ public struct DaemonStatus: Codable {
     public var learnedSamples: Int?      // 累计学习样本总数（学习成熟度）
     public var targetUnreachable: Bool?  // AI 目标温度压不住：持续满速(≥98%)且温度高于目标+4°C。
                                          // 此时学习必然停滞（饱和输出+温度离开学习窗口），提示用户目标设得过激进。
+    // R77：AI 全力散热——targetUnreachable 的**前置**弱信号（门槛更松 ≥99%/+2°、判定更早 20s）。
+    // 此前由 App 自己按时长重算：计时器活在 UI 进程里（App 重启/面板重建即归零），阈值还与
+    // daemon 分叉（App ≥99%/+2° vs 这里的 ≥98%/+4°），违反"App 不得重算控制语义"的硬约束。
+    // 现由 daemon 判定下发，App 只读展示。仅 AI 模式非 nil；旧 daemon 无此字段 → 不显示该提示。
+    public var aiHighEffort: Bool?
     public var powerWatts: Double?       // 整机实时功耗（W），daemon 每拍直读 SMC（AI 功耗前馈同源），
                                          // 写入 status 供 App 展示"功耗胶囊"；无功耗键的机型为 nil
     public var nightOverride: Bool?      // 夜间安静档是否正在生效（22:00–8:00 且开启 quietHours）
@@ -421,6 +426,7 @@ public struct DaemonStatus: Codable {
                 learnedPoints: Int? = nil,
                 learnedSamples: Int? = nil,
                 targetUnreachable: Bool? = nil,
+                aiHighEffort: Bool? = nil,
                 powerWatts: Double? = nil,
                 nightOverride: Bool? = nil,
                 envTemp: Double? = nil,
@@ -455,6 +461,9 @@ public struct DaemonStatus: Codable {
         self.learnedPoints = learnedPoints
         self.learnedSamples = learnedSamples
         self.targetUnreachable = targetUnreachable
+        // R77：与 F9（learnEnvelopeGap）/v3.8（hardwareProfile）同一教训——Optional 字段
+        // 同样必须显式赋值，"没赋值"与"值为 nil"语义不同。
+        self.aiHighEffort = aiHighEffort
         self.powerWatts = powerWatts
         self.nightOverride = nightOverride
         self.envTemp = envTemp
@@ -498,6 +507,7 @@ public struct DaemonStatus: Codable {
         self.baseTargetPercent = nil
         self.safetyFloorPercent = nil
         self.targetUnreachable = nil
+        self.aiHighEffort = nil
     }
 
     // 自定义 Codable：兼容旧版 status.json（含 cpuTemp/gpuTemp 字段，无 sensors）
@@ -506,7 +516,7 @@ public struct DaemonStatus: Codable {
         case onBattery, batteryOverride, reason, aiIntent, loopInterval, controlFault, faultReason
         case baseTargetPercent, safetyFloorPercent, curveTargetPercent
         case learningRecently, learnedPoints, learnedSamples
-        case targetUnreachable, powerWatts, nightOverride, envTemp
+        case targetUnreachable, aiHighEffort, powerWatts, nightOverride, envTemp
         case aiTargetEffective
                 case palmComp, learnEnvelopeGap // 旧字段
         case learnMap, decisionTrace
@@ -552,6 +562,8 @@ public struct DaemonStatus: Codable {
         self.learnedPoints = try container.decodeIfPresent(Int.self, forKey: .learnedPoints)
         self.learnedSamples = try container.decodeIfPresent(Int.self, forKey: .learnedSamples)
         self.targetUnreachable = try container.decodeIfPresent(Bool.self, forKey: .targetUnreachable)
+        // R77：旧 daemon 无此字段 → nil（App 不显示"全力散热"提示，退回只有 targetUnreachable 的行为）
+        self.aiHighEffort = try container.decodeIfPresent(Bool.self, forKey: .aiHighEffort)
         self.powerWatts = try container.decodeIfPresent(Double.self, forKey: .powerWatts)
         self.nightOverride = try container.decodeIfPresent(Bool.self, forKey: .nightOverride)
         self.envTemp = try container.decodeIfPresent(Double.self, forKey: .envTemp)
@@ -597,6 +609,7 @@ public struct DaemonStatus: Codable {
         try container.encodeIfPresent(learnedPoints, forKey: .learnedPoints)
         try container.encodeIfPresent(learnedSamples, forKey: .learnedSamples)
         try container.encodeIfPresent(targetUnreachable, forKey: .targetUnreachable)
+        try container.encodeIfPresent(aiHighEffort, forKey: .aiHighEffort)
         try container.encodeIfPresent(powerWatts, forKey: .powerWatts)
         try container.encodeIfPresent(nightOverride, forKey: .nightOverride)
         try container.encodeIfPresent(envTemp, forKey: .envTemp)
@@ -1486,6 +1499,10 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
     let baseStr = s.baseTargetPercent.map { String(r($0 / 5)) } ?? "-"
     let floorStr = s.safetyFloorPercent.map { String(r($0 / 5)) } ?? "-"
     let unreachStr = s.targetUnreachable == true ? "UNREACH" : "ok"
+    // R77：全力散热进摘要——它是 20s 尺度的慢信号（不是每拍量），翻转时若恰好没有别的
+    // 字段同拍变化，那一拍不落盘、App 要到 10s 心跳才更新；而它本身就是"风扇已经尽力了"
+    // 的即时提示，迟到 10s 会与用户听到的风声对不上。开销：只在进出该态时各多写一拍。
+    let effortStr = s.aiHighEffort == true ? "EFF" : "-"
     let learnStr = (s.learningRecently == true ? "L" : "-") + ":\(s.learnedPoints ?? 0)"
     let powerStr = s.powerWatts.map { String(r($0)) } ?? "-"
     let aiTargetStr = s.aiTargetEffective.map { String(r($0)) } ?? "-"
@@ -1521,6 +1538,7 @@ public func statusChangeSummary(_ s: DaemonStatus) -> String {
         baseStr,
         floorStr,
         unreachStr,
+        effortStr,
         learnStr,
         powerStr,
         aiTargetStr,

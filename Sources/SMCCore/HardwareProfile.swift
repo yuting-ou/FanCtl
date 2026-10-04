@@ -43,7 +43,7 @@ public struct HardwareProfile: Codable, Equatable {
 
     /// 真实采集入口。任何单源失败只降级该字段（nil / false / 0），画像整体照常
     /// 产出——诊断价值优先于完备性。时钟由调用方注入（P7：生产传 hooks.now()）。
-    public static func collect(fans: FanController, sensors: TemperatureSensors,
+    public static func collect(fans: FanReading, sensors: TemperatureSensors,
                                now: Date) -> HardwareProfile {
         let counts = sensors.sensorCounts
         return HardwareProfile(

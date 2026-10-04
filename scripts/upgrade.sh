@@ -187,6 +187,11 @@ if [[ -f "$STAGING/fanprobe" ]]; then
     mkdir -p /usr/local/bin
     install -m 755 -o root -g wheel "$STAGING/fanprobe" /usr/local/bin/fanprobe
 fi
+# R84：MCP 服务器与诊断工具同批（暂存包未带 fanmcp 时跳过——旧 zip 升上来的兼容路径）
+if [[ -f "$STAGING/fanmcp" ]]; then
+    mkdir -p /usr/local/bin
+    install -m 755 -o root -g wheel "$STAGING/fanmcp" /usr/local/bin/fanmcp
+fi
 
 echo "==> 配置/日志目录权限对齐..."
 mkdir -p "$SUPPORT" /Library/Logs/FanCtl

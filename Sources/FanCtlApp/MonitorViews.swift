@@ -208,7 +208,9 @@ struct ProcessHogView: View {
         if processes.isEmpty {
             MonitorEmpty(text: "负载较低 · 无高占用进程")
         } else {
-            VStack(spacing: 4) {
+            // R82：3 行 → 5 行。92pt 槽位预算：GPU 行 ≈14 + 头间距 3 + 5×12 行高 + 4×3 行距
+            // = 89 ≤ 92，只收紧行距不缩字号，面板"窗口恒定"不变。
+            VStack(spacing: 3) {
                 // GPU 温度指示行（GPU 按进程占用无公开 API，用温度反映 GPU 忙闲）
                 HStack(spacing: 5) {
                     Image(systemName: "cpu.fill").font(.system(size: 10)).foregroundStyle(.secondary)
@@ -220,10 +222,10 @@ struct ProcessHogView: View {
                     Text("GPU 忙 → 温度高")
                         .font(.system(size: 9)).foregroundStyle(.tertiary)
                 }
-                // CPU 高占用进程榜（取前 3，避免 92pt 高度里拥挤）
+                // CPU 高占用进程榜（前 5；采样端 sampleCPUUsage(limit:5) 已按软件名归并取前 5）
                 // 用 enumerated + \.offset 作 id：多个同名进程（如多个 python）会重名，
                 // 以进程名为 id 时 ForEach 行为未定义/合并显示
-                ForEach(Array(processes.prefix(3).enumerated()), id: \.offset) { _, p in
+                ForEach(Array(processes.prefix(5).enumerated()), id: \.offset) { _, p in
                     HStack(spacing: 6) {
                         Text(p.id)
                             .font(.system(size: 10, weight: .medium, design: .rounded))
@@ -255,7 +257,8 @@ struct TodayStatsView: View {
     }()
     private static func duration(_ s: Double) -> String {
         let m = Int(s) / 60
-        if m >= 60 { return "\(m / 60)h\(m % 60)m" }
+        // R82 续六：中文界面不留 "2h30m" 这种英文字母时长（用户诉求：看得懂中文）
+        if m >= 60 { return "\(m / 60)时\(m % 60)分" }
         if m >= 1 { return "\(m) 分钟" }
         return "\(Int(s)) 秒"
     }

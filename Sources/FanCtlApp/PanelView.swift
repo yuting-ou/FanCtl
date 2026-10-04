@@ -343,6 +343,54 @@ struct ContentView: View {
         FileManager.default.createFile(atPath: FanCtlPaths.resetLearnFlag.path, contents: Data())
     }
 
+    // MARK: - 后台空转（R78，spinwatch 发现 → 清风提醒与操作）
+
+    /// 空转行的悬停说明：把**证据**给全，让用户能自己判断"该不该杀"。
+    /// 只放哨兵判得准的事实（句柄数、二进制在不在、父进程死活），不放推测。
+    private func spinAlertHelp(_ a: SpinAlert) -> String {
+        var lines: [String] = [a.evidenceText, "pid \(a.pid)"]
+        if let exe = a.exe { lines.append(exe) }
+        if model.spinAlerts.count > 1 {
+            lines.append("另有 \(model.spinAlerts.count - 1) 个进程也在空转（本行只显示占用最高的一个）")
+        }
+        lines.append("")
+        lines.append("由 spinwatch（~/bin/spinwatch）发现，每 2 分钟巡检一次。")
+        return lines.joined(separator: "\n")
+    }
+
+    /// 「结束」按钮的提示文案：可点时说明后果，不可点时把**拒绝原因**直接说给用户。
+    private func killSpinHelp(_ spin: SpinAlert) -> String {
+        if let denial = model.killSpinDenial(spin) { return denial.userText }
+        return "强制结束该进程（等同 kill -9）。清风会先复核它还是当初那个进程。"
+    }
+
+    /// 「结束」按钮的二次确认 + 拒绝反馈。**必须确认**：kill -9 会让对方立刻死，
+    /// 未保存的工作直接丢，而"空转"只是哨兵的判断，误杀正当事的代价由用户承担。
+    /// R81：确认之后还要过进程实例核验（SpinKillGuard），核验不过不发信号。
+    private func confirmKillSpin(_ spin: SpinAlert) {
+        NSApp.activate(ignoringOtherApps: true)
+        // R82：确认框给中文辨识名，原始名放正文——杀进程的事，用户该看清"是谁"
+        let spinName = ProcessIdentity.displayName(executable: spin.exe ?? spin.name)
+        let ask = NSAlert()
+        ask.messageText = "强制结束 \(spinName)（pid \(spin.pid)）？"
+        ask.informativeText = """
+        进程：\(spin.exe ?? spin.name)
+        它会立即被强制结束，等同在终端执行 kill -9，未保存的工作会丢失。
+
+        如果你正在用它，请点"取消"。
+        """
+        ask.addButton(withTitle: "强制结束")
+        ask.addButton(withTitle: "取消")
+        guard ask.runModal() == .alertFirstButtonReturn else { return }
+        if case .failure(let denial) = model.killSpin(spin) {
+            let fail = NSAlert()
+            fail.messageText = "结束动作已取消"
+            fail.informativeText = denial.userText
+            fail.addButton(withTitle: "好")
+            fail.runModal()
+        }
+    }
+
     // 卸载说明：命令行一步到位，避免用户手动清理残留
     private static func showUninstallHelp() {
         NSApp.activate(ignoringOtherApps: true)
@@ -565,6 +613,24 @@ struct ContentView: View {
                        name: model.fans.count == 2 ? (fan.id == 0 ? "左风扇" : "右风扇") : "风扇 \(fan.id + 1)",
                        offset: model.offsetForFan(fanIndex: fan.id),
                        onOffsetChange: { model.setFanOffset(fanIndex: fan.id, offset: $0) })
+            }
+            // R82 续十：加速归因行——"风扇为什么在转"的自动答案。15 分钟保鲜，
+            // 过期自动隐藏（负载早变了，旧答案会误导）。判定与格式化有测试。
+            if let attr = model.rampAttribution, let at = model.rampAttributionAt,
+               Date().timeIntervalSince(at) < RampMonitor.freshWindow {
+                let t = Calendar.current.dateComponents([.hour, .minute], from: at)
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(String(format: "%02d:%02d 加速归因：%@", t.hour ?? 0, t.minute ?? 0, attr))
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 2)
+                .transition(.opacity)
             }
         }
         .cardStyle()
@@ -952,10 +1018,44 @@ struct ContentView: View {
                     .transition(.opacity)
             }
             // 单条优先级状态行（200pt 槽位只允许一条事件级提示）：
-            //   压不住（学习停滞，最紧急）> 目标推荐（可点按采纳）> 全力散热（黄色预警）
+            //   后台空转（R78，有可执行动作）> 压不住（学习停滞）> 目标推荐 > 全力散热
             // 此前 4 个条件块可叠加到 2-3 行，最坏 ~249pt 超出 200pt 槽位，
             // 底部学习状态条被裁剪（违反"底部控件可见"约束）
-            if model.targetUnreachable {
+            //
+            // R78：后台空转排在**链首**的理由：某个进程白烧两三个核时，"目标压不住"
+            // 只是它的后果之一；而且这一行带明确可执行动作（一键结束），用户看到就能
+            // 立刻止血。仍只占一行，200pt 约束不变。
+            if let spin = model.spinAlerts.first {
+                HStack(spacing: 5) {
+                    Image(systemName: spin.isHighConfidence ? "exclamationmark.octagon.fill" : "hourglass.circle.fill")
+                        .font(.caption2)
+                    // R82：进程名走中文辨识（exe 缺失时用哨兵给的原始名兜底），
+                    // 原始可执行名仍在悬停说明里，不丢真身
+                    Text("\(ProcessIdentity.displayName(executable: spin.exe ?? spin.name)) 空转 \(Int(spin.cpu ?? spin.peak ?? 0))%")
+                        .font(.caption2.weight(.semibold))
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                    Text("· \(spin.heldText)")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    // R81：核验不过进程实例标识就不给点——按钮留在原位（用户看得见
+                    // "这里本来能处理"），但禁用并说明原因，避免只凭 pid 误杀复用者。
+                    Button(action: { confirmKillSpin(spin) }) {
+                        Text(model.canKillSpin(spin) ? "结束" : "结束不可用")
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .controlSize(.mini)
+                    .disabled(!model.canKillSpin(spin))
+                    .help(killSpinHelp(spin))
+                }
+                .foregroundStyle(spin.isHighConfidence ? .red : .orange)
+                .padding(.horizontal, 7).padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill((spin.isHighConfidence ? Color.red : Color.orange).opacity(0.14)))
+                .help(spinAlertHelp(spin))
+                .transition(.opacity)
+            } else if model.targetUnreachable {
                 Label("目标 \(Int(model.aiTargetTemp))°C 压不住 · 风扇已满速 · 学习暂停", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.orange)

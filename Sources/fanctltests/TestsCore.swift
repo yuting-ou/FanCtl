@@ -1709,3 +1709,43 @@ func testTrendCurvePrepare() {
     expect(viewsSrc.contains("TrendCurve.prepare(rawTemps:"),
            "TrendChart 必须走上屏整理（绕过去即红）")
 }
+
+// R82 续十：风扇加速归因监视器。背景是实战——风扇拉高时用户只能来问"什么东西在
+// 占用"，占用页显示的是当下，元凶可能已退场。本组钉住触发判定与文案的纯逻辑：
+// 持续门/急升门/冷却期/格式化，四条路径各自有牙。
+func testRampMonitor() {
+    group("加速归因监视器(R82)")
+    // ① 拍累计：≥60% 累加、跌破清零（连续性 = "持续高负荷"的本意）
+    expectEqual(RampMonitor.beat(applied: 59, beats: 2), 0, "差 1pp 不算持续高负荷")
+    expectEqual(RampMonitor.beat(applied: 60, beats: 2), 3, "踩线 60% 即累计")
+    expectEqual(RampMonitor.beat(applied: 30, beats: 5), 0, "跌破即清零")
+
+    // ② 急升：单拍 +30pp 且 ≥50%
+    expect(RampMonitor.isSteepRise(applied: 75, prev: 40), "45pp 急升判定")
+    expect(!RampMonitor.isSteepRise(applied: 65, prev: 40), "25pp 缓升不算急升")
+    expect(!RampMonitor.isSteepRise(applied: 45, prev: 10), "涨得快但输出低不算（风扇没在响）")
+
+    // ③ 触发：持续达标 或 急升，且过冷却期
+    let now = Date()
+    expect(RampMonitor.shouldTrigger(beats: 3, steep: false, lastAttributionAt: nil, now: now),
+           "连续 3 拍即触发")
+    expect(!RampMonitor.shouldTrigger(beats: 2, steep: false, lastAttributionAt: nil, now: now),
+           "2 拍不够")
+    expect(RampMonitor.shouldTrigger(beats: 0, steep: true, lastAttributionAt: nil, now: now),
+           "急升绕过持续门")
+    expect(!RampMonitor.shouldTrigger(beats: 3, steep: false,
+                                      lastAttributionAt: now.addingTimeInterval(-300), now: now),
+           "冷却期内（5 分钟前刚归因过）不重复触发")
+    expect(RampMonitor.shouldTrigger(beats: 3, steep: false,
+                                     lastAttributionAt: now.addingTimeInterval(-601), now: now),
+           "冷却期（10 分钟）一过允许再次归因")
+
+    // ④ 文案：前 3 名、整数百分比、空输入不显示
+    expectEqual(RampMonitor.line([("抖音（渲染进程）", 94.4), ("聚焦索引", 48.2), ("ZCode（图形进程）", 37.0)]),
+                "抖音（渲染进程） 94% · 聚焦索引 48% · ZCode（图形进程） 37%",
+                "归因行：中文名 + 整数百分比 + 间隔号")
+    expectEqual(RampMonitor.line([("A", 10), ("B", 20), ("C", 30), ("D", 40)]),
+                "A 10% · B 20% · C 30%", "超过 3 名截断")
+    expect(RampMonitor.line([]) == nil, "空采样不显示空行")
+    expect(RampMonitor.line([("A", 0.4)]) == nil, "全零占用不显示空行")
+}

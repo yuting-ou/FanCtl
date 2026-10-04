@@ -30,7 +30,15 @@ final class PowerCompositionSampler {
     // 主循环调用（主队列）：低频触发后台采样，立即返回当前已知值
     func current() -> (cpu: Double?, gpu: Double?) {
         let now = Date()
-        if now.timeIntervalSince(lastSample) >= interval {
+        // R82 续十一：熄屏地板——系统醒着但屏幕已熄（用户不在/远程工具阻止休眠的
+        // 场景，实测本机 UURemote 整夜阻止休眠），powermetrics 采样瞬间 ~85% 单核
+        // 纯属夜间添火 → 间隔拉到 ≥60s。引擎的自适应间隔（10/20/60s）仍然生效，
+        // 这里只做熄屏下的下限抬升。前馈沿用上次采样值（变陈旧但控制不中断）。
+        let intervalEff: TimeInterval = {
+            if interval >= 60 { return interval }
+            return isDisplayAsleep() ? 60 : interval
+        }()
+        if now.timeIntervalSince(lastSample) >= intervalEff {
             lastSample = now
             lock.lock()
             let inFlight = samplingInFlight

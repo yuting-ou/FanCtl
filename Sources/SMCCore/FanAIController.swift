@@ -214,13 +214,15 @@ public struct AIController {
                               powerWatts: Double? = nil,
                               cpuPower: Double? = nil,
                               gpuPower: Double? = nil,
-                              allowRelease: Bool = true, dt: Double = 3.0) -> Double? {
+                              allowRelease: Bool = true, dt: Double) -> Double? {
         // 防御：非有限值（NaN/Inf，理论上传感器已过滤）不更新状态，避免一个坏值永久污染
         guard temp.isFinite else { lastAppliedDeltas = nil; return idleReleased ? nil : output }
-        // 钳制 dt：系统睡眠唤醒后可能传入超大值，导致 P 项瞬间冲到 100
+        // 钳制 dt：系统睡眠唤醒后可能传入超大值，导致 P 项瞬间冲到 100。
         // NaN dt 穿透 min/max（NaN 比较恒 false），导致 output 变 NaN 传播到 SMC。
-        // 退回标称拍长 3s（保守降级，P/D 项语义不变）
-        let dt = dt.isFinite ? min(max(dt, 0.5), 15.0) : 3.0
+        // 退回标称拍长 3s（保守降级，P/D 项语义不变）。
+        // R77：区间与 LearningGate/引擎收敛到 FanDt 单一定义——此前这里钳 15s 而学习门钳 20s，
+        // 同拍两处口径差 25%（idle 长拍下 AI 增量被截短结算），属静默漂移。
+        let dt = FanDt.clamped(dt)
         let prev = lastTemp
         lastTemp = temp
         // 功耗 EMA 平滑：PSTR/PDTR 传感器有 ±2W 噪声，单拍增量会频繁误触发前馈。

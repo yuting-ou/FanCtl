@@ -2,6 +2,7 @@
 // 断言 harness 见 main.swift，共享构造（MockSMC/FakeClock/makeEngine）见 TestsEngine.swift 头部。
 import Foundation
 import SMCCore
+import SMCDriver   // 被测的 FanController（写实现）现在该 target（导入调整，断言未动）
 
 // MARK: - MockSMC：协议抽象下的硬件编排测试（无需物理 SMC）
 
@@ -555,6 +556,282 @@ func testLearnSaturatedGate() {
         FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
         for d in envDirs { try? FileManager.default.removeItem(at: d) }
     }
+}
+
+// R77：AI 全力散热（targetUnreachable 的前置弱信号）必须由 daemon 判定。
+// 此前由 App 按 Date 计时器自己重算：面板进程一重建就归零（"持续 20s"测不准），
+// 阈值还与 daemon 分叉（App ≥99%/+2° vs daemon ≥98%/+4°）。本门锁住四件事：
+//   ① 20s 窗口到点才置真（不是一拍就亮）；② 严格早于 targetUnreachable（60s、门槛更严）
+//   ③ 条件解除即复位；④ 非 AI 模式为 nil（旧 daemon 无此字段 = nil = 不显示）
+//
+// 拍数预算（实测得出，不是估的）：shape() 升速限速 maxStepUp=8%/拍，从 curve 切回 AI 时
+// clearOutput 把基准打到 0，故 shapedBase 需 ~13 拍才爬满 ≥99，再满 20s（≥7 拍）才置真——
+// 给 22 拍余量。将来若改限速或门槛，这里会先红，正是本门要守的接线。
+func testAIHighEffortEscalation() {
+    group("AI 全力散热判定(R77)")
+    var envDirs: [URL] = []
+    envDirs.append(engineTestEnv())
+    // 目标 70°、温度 88°：差 18° 远高于两个门槛（+4/+2），PD 必然推满。
+    // 用 seedLearnTable 绕过冷启动观察期（校准期 step() 不被调用，不会饱和）。
+    ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 70, envCompensation: false))
+    let smc = makeFanSMC(); smc.set("Tp01", 88); smc.set("PSTR", 45)
+    let clock = FakeClock()
+    let col = EngineCollector()
+    seedLearnTable()
+    let engine = makeEngine(smc: smc, clock: clock, collector: col,
+                            powerComponents: { (40, 15) })
+
+    // 前 6 拍（18s）：shape 还没爬到饱和，20s 窗口也没到 → 不得置真
+    for _ in 0..<6 {
+        engine.beat()
+        if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+        clock.advance(3)
+    }
+    expect(engine.aiController.output >= 99,
+           "前提：PD 已推至饱和（得 \(Int(engine.aiController.output))%）——否则本门测的不是目标路径")
+    expect(ConfigStore.loadStatus()?.aiHighEffort != true, "18s 内不得置真——它是「持续」信号，不是单拍信号")
+    expect(ConfigStore.loadStatus()?.targetUnreachable == nil, "60s 窗口未到，targetUnreachable 仍为 nil")
+
+    // R77 序关系（本门最核心的一条）：yellow「全力散热」必须先于 UNREACH「压不住」出现。
+    // 不写死拍数——记录两者**首次**为真的拍号再比大小，这样即使将来调窗口/门槛，
+    // 只要序关系还成立就绿，序关系被调反就红（比"某拍恰好如何"更稳）。
+    var firstEffort: Int? = nil
+    var firstUnreach: Int? = nil
+    for i in 0..<40 {
+        engine.beat()
+        if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+        let s = ConfigStore.loadStatus()
+        if firstEffort == nil, s?.aiHighEffort == true { firstEffort = i }
+        if firstUnreach == nil, s?.targetUnreachable == true { firstUnreach = i }
+        clock.advance(3)
+    }
+    expect(firstEffort != nil, "~120s 内全力散热必须亮过（否则本门没测到目标路径）")
+    expect(firstUnreach != nil, "~120s 内压不住也必须亮（更严门槛 + 60s 窗口）")
+    if let fe = firstEffort, let fu = firstUnreach {
+        expect(fe < fu, "R77 序关系：全力散热(第 \(fe) 拍) 必须先于压不住(第 \(fu) 拍)——否则 UI 升级链跳级")
+    }
+
+    // 回落到可达成：立即复位（否则黄提示会挂在面板上）
+    smc.set("Tp01", 60)
+    for _ in 0..<6 {
+        engine.beat()
+        if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+        clock.advance(3)
+    }
+    expectEqual(ConfigStore.loadStatus()?.aiHighEffort, false, "温度回落后复位为 false（AI 在正常工作，UI 不显示）")
+
+    // 非 AI 模式：字段必须是 nil（不表态）而非 false——与 targetUnreachable 同形，
+    // 也保证退出 AI 后黄提示不残留
+    ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+    engine.beat()
+    clock.advance(3)
+    expect(ConfigStore.loadStatus()?.aiHighEffort == nil, "非 AI 模式不下发该字段（nil=不表态，UI 不显示）")
+
+    // 唤醒必须清掉「已持续」语义——否则睡一觉醒来黄提示凭空挂着。
+    // 注意断言的是**唤醒后重新起算**，不是"盘上立刻变 false"：enterSleep 走 flushAll()，
+    // 不写 status；lastStatus 保持睡前值直到 wake 后第一拍（schedule(0) 立刻补拍）。
+    // 计时器若未复位，醒来那拍就会带着睡前的秒数直接越过 20s 窗口 → 这里会红。
+    ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 70, envCompensation: false))
+    smc.set("Tp01", 88)
+    for _ in 0..<40 {
+        engine.beat()
+        if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+        clock.advance(3)
+    }
+    expectEqual(ConfigStore.loadStatus()?.aiHighEffort, true, "前提：睡前确实处于全力散热（否则下面的复位断言恒真）")
+    engine.enterSleep()
+    engine.wake()
+    engine.beat()   // 唤醒后第一拍：计时器必须已归零 → 不可能立刻为真
+    if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+    expectEqual(ConfigStore.loadStatus()?.aiHighEffort ?? true, false,
+                "唤醒首拍不得为真——计时器必须随 wake 复位（未复位则带着睡前秒数越窗）")
+    // 再走 5 拍（18s，不足 20s 窗口）：仍未到
+    for _ in 0..<5 {
+        engine.beat()
+        if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+        clock.advance(3)
+    }
+    expectEqual(ConfigStore.loadStatus()?.aiHighEffort ?? true, false,
+                "唤醒后 18s 仍不得为真——证明 20s 窗口是醒来重新起算的")
+
+    FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    for d in envDirs { try? FileManager.default.removeItem(at: d) }
+}
+
+// R77（任务D · 会话复位防护门）：wake() 的手工逐字段复位是"漏一个就出静默缺陷"的形状——
+// aiCyclingGuardActive 就是这么漏掉的：wake 里 aiController.reset() 把 cyclingGuardArmed
+// 清成 false，而"上一次是否武装"留在 true，醒来第一拍跨边沿打出假日志"抑制解除（0 分钟）"。
+//
+// 方法论：**从源码里抠 wake() 实际赋值的字段清单**，而不是靠运行期差分。
+// 先试过 Mirror 前后快照，但"没复位"与"本来就等于复位值"在差分里同形（多数会话字段
+// 在预热门槛下压根没被弄脏），还会把 aiController/controller 这类嵌套对象的状态变化
+// 误记成复位——假绿又假红。源码抠取是精确的，且本项目已有先例
+// （scripts/test-root-scripts.sh 就是按名字从 Config.swift 抠路径常量做跨语言门）。
+//
+// 双向比对：
+//   ① 抠出来的字段 != 声明清单 → 有人加/删了复位却没在语义清单上表态（改字段名也会触发）
+//   ② 清单里明确为 nil 的字段，wake 后必须是 nil（值层面也验一遍，不只看"赋过值"）
+//   ③ 抠取结果本身不能塌成空（wake 被改成空实现时必须红）
+func testWakeSessionResetCoverage() {
+    group("会话复位覆盖门(R77)")
+    var envDirs: [URL] = []
+    envDirs.append(engineTestEnv())
+    ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+    let smc = makeFanSMC(); smc.set("Tp01", 60); smc.set("PSTR", 30)
+    let clock = FakeClock(); let col = EngineCollector()
+    seedLearnTable()
+
+    // ① 源码抠取：wake() 函数体内被赋值的 self 字段
+    guard let src = try? String(contentsOfFile: "Sources/SMCCore/ControlEngine.swift",
+                                encoding: .utf8) else {
+        // 工作目录不是仓库根时（CI 如此）退化为只跑值断言，并显式说明少跑了什么
+        expect(false, "读不到 Sources/SMCCore/ControlEngine.swift——本门的清单比对未执行")
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        for d in envDirs { try? FileManager.default.removeItem(at: d) }
+        return
+    }
+    let lines = src.components(separatedBy: "\n")
+    guard let startIdx = lines.firstIndex(where: { $0.contains("public func wake()") }) else {
+        expect(false, "ControlEngine.swift 里找不到 wake()（函数被改名？）")
+        return
+    }
+    // 函数体到第一个 4 空格缩进的 "}" 为止
+    var body: [String] = []
+    var i = startIdx + 1
+    while i < lines.count, lines[i] != "    }" {
+        body.append(lines[i]); i += 1
+    }
+    let assigned = Set(body.compactMap { line -> String? in
+        let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.hasPrefix("//") || t.hasPrefix("guard") || t.hasPrefix("if")
+            || t.hasPrefix("let") || t.hasPrefix("var") { return nil }
+        // 两种复位形态都要认：`x = …` 与 `x.removeAll()` / `x.reset()` / `x.restoreAutoAll()`
+        let name: String?
+        if let eq = t.firstIndex(of: "=") {
+            name = String(t[t.startIndex..<eq]).trimmingCharacters(in: .whitespaces)
+        } else if let dot = t.firstIndex(of: ".") {
+            name = String(t[t.startIndex..<dot]).trimmingCharacters(in: .whitespaces)
+        } else {
+            name = nil
+        }
+        guard let n = name,
+              n.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil else { return nil }
+        return n
+    })
+    expect(assigned.count >= 20, "wake() 抠出 \(assigned.count) 个赋值字段，不应少于 20（抠取器自身失效要判红）")
+
+    // ② 声明清单：wake() 承诺复位的会话域字段（每条对应"残留会跨睡眠泄漏"的具体后果）
+    let declared: Set<String> = [
+        "forcedModeActive", "lastWrittenRPM",
+        "aiIdleActive", "prevRawTemp", "prevSmoothedTemp", "prevBaseTarget",
+        "currentLoopInterval", "lastLoopStart",
+        "belowAmbientSeconds", "belowAmbientFaulted", "lastPlausibleEnvTemp",
+        "tempFailCount", "probeVerifyLoops", "lastProbeTime",
+        "invisibleFanSince", "handedBackInvisibleFans",
+        "targetUnreachable", "targetUnreachableSince", "targetUnreachableLogged",
+        "aiHighEffortState", "aiHighEffortSince",
+        "aiCyclingGuardActive", "boostExpiredLogged",
+        // 这些是"子对象方法复位"形态（x.reset() / x.invalidate…() / x.rescan…()）：
+        "fans", "aiController", "stuckDetector", "writeHealth",
+        "controller",       // FanCurveController：invalidateTemp + clearOutput（平滑/限速基准清零）
+        "feedbackHealth",   // resetForWake：故障退避 streak 跨会话保留（见该方法注释）
+        "sensors",          // rescanAllSensors：唤醒后重新枚举传感器分类
+        "hooks",            // schedule(0)：唤醒后立刻补一拍
+    ]
+    let missingFromSource = declared.subtracting(assigned).sorted()
+    expect(missingFromSource.isEmpty,
+           "清单声明要复位但这些字段在 wake() 里没被赋值：\(missingFromSource)")
+    let undeclared = assigned.subtracting(declared).sorted()
+    expect(undeclared.isEmpty,
+           "wake() 复位了清单外的字段，请显式表态并补进清单：\(undeclared)")
+
+    // ③ 值层面复核：这些字段 wake 后必须归 nil（"赋过值"不等于"赋对了值"）
+    let engine = makeEngine(smc: smc, clock: clock, collector: col)
+    engine.enterSleep()
+    engine.wake()
+    let fields = Dictionary(uniqueKeysWithValues: Mirror(reflecting: engine).children.compactMap {
+        child -> (String, Any)? in
+        guard let l = child.label else { return nil }
+        return (l, child.value)
+    })
+    func isNil(_ name: String) -> Bool {
+        guard let v = fields[name] else { return false }
+        return String(describing: v) == "nil"
+    }
+    // 这几个是 Optional 日期：wake 必须显式置 nil（漏掉会让"上一次会话"的时间戳残留）
+    for name in ["targetUnreachableSince", "aiHighEffortSince", "lastLoopStart"] {
+        expect(isNil(name), "\(name) 在 wake() 后应为 nil（残留会让睡眠前的计时跨会话生效）")
+    }
+    // lastProbeTime 是**非 Optional** Date，复位成 .distantPast 而非 nil（探测节流基准清零）
+    expect(String(describing: fields["lastProbeTime"] ?? "?") != "nil",
+           "lastProbeTime 是非 Optional Date，不该是 nil")
+    expect(String(describing: fields["lastProbeTime"] ?? "?") == String(describing: Date.distantPast),
+           "lastProbeTime 在 wake() 后应为 .distantPast（得 \(String(describing: fields["lastProbeTime"] ?? "?"))）")
+    // 这几个是布尔闸门：wake 必须显式置 false
+    for name in ["targetUnreachable", "targetUnreachableLogged", "aiHighEffortState",
+                 "aiCyclingGuardActive", "belowAmbientFaulted", "forcedModeActive",
+                 "aiIdleActive", "boostExpiredLogged"] {
+        expect(String(describing: fields[name] ?? "?") == "false",
+               "\(name) 在 wake() 后应为 false（得 \(String(describing: fields[name] ?? "?"))）")
+    }
+    // 注意：lastStatus 刻意**不**在 wake 里复位——保留最后一帧供 App 做陈旧判定（>30s 即离线），
+    // 故它不在上面的清单里。若将来有人给它加了复位，② 会要求显式表态。
+
+    FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    for d in envDirs { try? FileManager.default.removeItem(at: d) }
+}
+
+// R77：唤醒必须同步复位"启停抑制边沿记忆"。
+// 场景：睡前抑制已武装（面板上看过"检测到停转-启转循环…"），wake() 里 aiController.reset()
+// 把 cyclingGuardArmed 清成 false。若"上一次是否武装"仍留在 true，醒来第一拍就跨过边沿，
+// 打出一条假日志"抑制解除，恢复空闲交还评估"——而 currentGuardSeconds 已被清零，
+// 文案会退化成"解除 0 分钟"。用户看到的是醒来瞬间一条自相矛盾的提示。
+func testWakeResetsCyclingGuardEdge() {
+    group("唤醒复位启停抑制边沿(R77)")
+    var envDirs: [URL] = []
+    envDirs.append(engineTestEnv())
+    ConfigStore.saveConfig(FanConfig(mode: .ai, preset: .balanced, envCompensation: false))
+    let smc = makeFanSMC(); smc.set("Tp01", 60); smc.set("PSTR", 30)
+    let clock = FakeClock()
+    let col = EngineCollector()
+    seedLearnTable()
+    let engine = makeEngine(smc: smc, clock: clock, collector: col)
+
+    // 先深凉到交还
+    var released = false
+    for _ in 0..<15 {
+        engine.beat()
+        if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+        if engine.aiController.idleReleased { released = true; break }
+        clock.advance(3)
+    }
+    expect(released, "前提：AI 深凉交还（否则武装边沿跑不到）")
+
+    // 浸泡破目标 → 夺回并武装（与场景 11 同路径）
+    smc.set("Tp01", 77)
+    for _ in 0..<12 {
+        clock.advance(3); engine.beat()
+        if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+    }
+    expect(engine.aiController.cyclingGuardArmed, "前提：睡前抑制已武装")
+    expect(col.logs.contains { $0.contains("停转-启转循环") }, "武装边沿日志在场（边沿机制本身有效）")
+
+    // 睡一觉：enterSleep 不写 status，wake 复位控制器与边沿记忆
+    engine.enterSleep()
+    engine.wake()
+    let logsBeforeWakeBeat = col.logs.count
+    engine.beat()
+    if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+    let newLogs = Array(col.logs.dropFirst(logsBeforeWakeBeat))
+    expect(!newLogs.contains { $0.contains("抑制解除") },
+           "唤醒首拍不得打假「抑制解除」边沿日志（得：\(newLogs.filter { $0.contains("抑制") })）")
+    expect(!newLogs.contains { $0.contains("解除 0 分钟") },
+           "更不能出现「解除 0 分钟」这种自相矛盾的文案（时长来自已清零的 currentGuardSeconds）")
+    expect(!engine.aiController.cyclingGuardArmed,
+           "唤醒后抑制状态为未武装——醒后重新判定，而不是继承上一次清醒会话")
+
+    FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    for d in envDirs { try? FileManager.default.removeItem(at: d) }
 }
 
 // v3.4.1 DoD-8：周期重扫后台化——旧分类在后台扫描完成前保持可用（控制不中断），
@@ -2007,6 +2284,366 @@ func testAliveDebouncer() {
 // 造一份"字段尽量填满"的 A 与一份"取值全都不同"的 B，对每个 JSON 键单独把 A 换成 B 的值，
 // 重新解码后**摘要必须变**；不该变的键必须写进 summaryFree 并给理由。
 // 新增字段若忘了进摘要 → 这里直接红；B 与 A 某键取值相同 → 判"未真正差分"（防空跑）。
+// R78：后台空转告警的**双端 schema 同源门** + 垃圾 Codable 池回归。
+//
+// 背景：spinwatch 是独立的 Python 哨兵（~/bin/spinwatch），清风读它写的
+// ~/.spinwatch/alerts.json。两侧唯一契约就是 JSON 键名 —— 这种跨语言契约最容易
+// R79：「占用」页的进程中文辨识门。此前该页直接显示进程可执行名（WindowServer /
+// swift-frontend / 抖音 Helper (Renderer)），日常用户看不出"哪个软件在吃机器"。
+// 本门钉住四件事：helper → 归属 App 的中文名、系统进程经对照表翻中文、
+// 角色词说明"是哪个部分"、**认不出绝不猜**（回落原英文名，不编造）。
+func testProcessIdentity() {
+    group("进程中文辨识(R79)")
+
+    // —— helper → 归属 App：Electron/Chromium 系的真实布局 ——
+    // /Applications/抖音.app/Contents/Frameworks/抖音 Helper (Renderer).app/Contents/MacOS/<exe>
+    // 用户要看到的是"抖音"，不是"抖音 Helper (Renderer)"这种内部构件名
+    let douyinHelper = "/Applications/抖音.app/Contents/Frameworks/抖音 Helper (Renderer).app/Contents/MacOS/抖音 Helper (Renderer)"
+    let d1 = ProcessIdentity.detail(executable: douyinHelper)
+    expectEqual(d1.app, "抖音", "Electron helper → 归属 App 中文名")
+    expectEqual(d1.role, "渲染进程", "并说明它是这个软件的哪个部分")
+    expectEqual(ProcessIdentity.displayName(executable: douyinHelper), "抖音",
+                "displayName 走同一辨识（过热通知也用它）")
+
+    // 主程序路径（Contents/MacOS/<exe>）同样归属 App
+    let dMain = ProcessIdentity.detail(executable: "/Applications/抖音.app/Contents/MacOS/抖音")
+    expectEqual(dMain.app, "抖音", "App 主程序 → 同名")
+    expectEqual(dMain.role, nil, "主程序没有角色词（不硬造）")
+
+    // 无中文 DisplayName 的通用 App：回落 bundle 名
+    let en = ProcessIdentity.detail(executable: "/Applications/TextEdit.app/Contents/MacOS/TextEdit")
+    expectEqual(en.app, "TextEdit", "无中文 DisplayName 时回落 bundle 名")
+
+    // —— 系统进程走对照表（这些没有 Info.plist 可读）——
+    expectEqual(ProcessIdentity.displayName(executable: "/usr/sbin/WindowServer"), "窗口服务器（屏幕合成）",
+                "WindowServer → 对照表中文")
+    expectEqual(ProcessIdentity.displayName(executable: "/usr/sbin/coreaudiod"), "音频服务",
+                "coreaudiod → 对照表中文")
+    expectEqual(ProcessIdentity.detail(executable: "/usr/sbin/coreaudiod").role, nil,
+                "系统进程无角色词")
+    expectEqual(ProcessIdentity.displayName(executable: "/usr/sbin/locationd"), "定位服务",
+                "守护进程也在表内")
+
+    // —— 认不出绝不猜：回落原英文名，不编中文 ——
+    let weird = "/usr/local/bin/some-obscure-tool-9x"
+    expectEqual(ProcessIdentity.displayName(executable: weird), "some-obscure-tool-9x",
+                "查不到就回落原名（用户可读 > 编造）")
+    expectEqual(ProcessIdentity.detail(executable: weird).role, nil, "无名角色词不硬造")
+
+    // —— 边界 ——
+    expectEqual(ProcessIdentity.displayName(executable: ""), "系统进程", "空路径不给空串")
+    expectEqual(ProcessIdentity.displayName(executable: "   "), "系统进程", "全空白同")
+    // 非 / 开头（相对名）：对不上路径形态就走对照表/原名，不得崩
+    expectEqual(ProcessIdentity.detail(executable: "locationd").app, "定位服务",
+                "相对名也能命中对照表")
+    // 角色词表覆盖 Electron 常见构件
+    let gpu = ProcessIdentity.detail(executable: "/Applications/Hermes.app/Contents/Frameworks/Hermes Helper (GPU).app/Contents/MacOS/Hermes Helper (GPU)")
+    expectEqual(gpu.app, "Hermes", "任意外层 App 名如实取（无中文就用原名）")
+    expectEqual(gpu.role, "图形进程", "GPU helper → 图形进程")
+    let crash = ProcessIdentity.detail(executable: "/Applications/X.app/Contents/Frameworks/crashpad_handler.app/Contents/MacOS/crashpad_handler")
+    expectEqual(crash.role, "崩溃上报进程", "crashpad → 崩溃上报进程（空转哨兵同源辨识）")
+
+    // 真机在场才核的端到端一条：本机确实装了抖音，读真 plist
+    // （不在场只降级、不判红——CI 上没有抖音）
+    if FileManager.default.fileExists(atPath: "/Applications/抖音.app/Contents/Info.plist") {
+        expectEqual(ProcessIdentity.detail(executable: douyinHelper).app, "抖音",
+                    "真机 plist 实读验证（安装位置有效）")
+    }
+
+    // —— R82 占用榜汉化扩充：高频系统后台/工具链/WebKit XPC ——
+    // kernel_task 是占用榜头号常客，也是此前最吓人的英文（用户问"这是啥"）
+    expectEqual(ProcessIdentity.displayName(executable: "kernel_task"), "内核任务（系统核心）",
+                "kernel_task → 中文（相对名也命中对照表）")
+    expectEqual(ProcessIdentity.displayName(executable: "/usr/sbin/mds_stores"), "聚焦索引（存储）",
+                "Spotlight 索引 → 中文")
+    expectEqual(ProcessIdentity.displayName(executable: "/usr/sbin/bluetoothd"), "蓝牙服务",
+                "系统守护 → 中文")
+    // WebKit 内容进程路径是 .xpc 不是 .app，归不了 App bundle，只能靠对照表
+    expectEqual(ProcessIdentity.displayName(executable:
+        "/System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/WebKit.framework"
+        + "/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent"),
+        "Safari 网页内容", "WebKit XPC（.xpc 非 .app）→ 对照表中文")
+    expectEqual(ProcessIdentity.displayName(executable: "/usr/local/opt/llvm/bin/clang"), "C 编译器",
+                "工具链 → 中文（编译时霸榜主力）")
+
+    // —— R82：App 内 zh_CN 本地化表的官方中文名（主 plist 是英文的场景）——
+    // 现场造一个假 .app：Info.plist 写英文名 + zh_CN.lproj/InfoPlist.strings 写中文名，
+    // 钉住"本地化中文 > plist 英文名"的优先级（Safari 的真实形态）
+    do {
+        let app = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("FanCtlZhTest-\(UUID().uuidString).app")
+        let macos = app.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        let lproj = app.appendingPathComponent("Contents/Resources/zh_CN.lproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: macos, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: lproj, withIntermediateDirectories: true)
+        let exe = macos.appendingPathComponent("FakeApp")
+        FileManager.default.createFile(atPath: exe.path, contents: nil)   // 只读 plist，无需真二进制
+        try (["CFBundleName": "FakeApp"] as NSDictionary)
+            .write(to: app.appendingPathComponent("Contents/Info.plist"))
+        let zh = try PropertyListSerialization.data(fromPropertyList:
+            ["CFBundleDisplayName": "假应用"], format: .xml, options: 0)
+        try zh.write(to: lproj.appendingPathComponent("InfoPlist.strings"))
+        expectEqual(ProcessIdentity.displayName(executable: exe.path), "假应用",
+                    "zh_CN InfoPlist.strings 中文名优先于英文 plist")
+        expectEqual(ProcessIdentity.detail(executable: exe.path).app, "假应用",
+                    "detail 走同一辨识（归并键一致，通知/占用榜同名）")
+        try? FileManager.default.removeItem(at: app)
+    } catch { expect(false, "假 bundle 构造抛错: \(error)") }
+    // 无本地化表时仍回落 plist 原名（上面 TextEdit 断言同族，行为不得被 zh 查找改变）
+    expectEqual(ProcessIdentity.displayName(executable: "locationd"), "定位服务",
+                "旧词条不因词表扩充受影响")
+
+    // —— R82 续（用户点名"清风为什么是英文"）：本产品构件裸名 + 国民 App 构件 + 逆向 DNS 可读化 ——
+    expectEqual(ProcessIdentity.displayName(executable: "FanCtl"), "清风",
+                "清风自己不得显示英文名（exe 缺失只剩裸名的场合）")
+    expectEqual(ProcessIdentity.displayName(executable: "/usr/local/libexec/fanctld"), "清风守护进程",
+                "daemon 裸路径 → 中文（无 bundle 可归属）")
+    expectEqual(ProcessIdentity.displayName(executable: "spinwatch"), "清风空转哨兵",
+                "哨兵裸名 → 中文")
+    expectEqual(ProcessIdentity.displayName(executable: "wechatwebencodingservice"), "微信 内置浏览器",
+                "微信构件裸名 → 中文（plist 英文名也兜得住）")
+    expectEqual(ProcessIdentity.displayName(executable: "/usr/libexec/com.apple.audio.SystemSoundServer"),
+                "Apple 系统组件（audio.SystemSoundServer）",
+                "未知逆向 DNS 名可读化：不砍残名、不编中文、括号留原文可检索")
+
+    // —— R82 续四（本机占用榜实测）：ps 裸名 helper 的通用解析 ——
+    // Electron 系 helper 在 ps comm 里常没有路径，此前 "Helper (Renderer)" 英文残留直达界面
+    expectEqual(ProcessIdentity.displayName(executable: "抖音 Helper (Renderer)"), "抖音（渲染进程）",
+                "裸名 helper → 软件名（中文角色）——用户点名的样式")
+    expectEqual(ProcessIdentity.displayName(executable: "ZCode Helper (GPU)"), "ZCode（图形进程）",
+                "无中文名的软件：品牌保留 + 中文角色")
+    expectEqual(ProcessIdentity.displayName(executable: "Google Chrome Helper"), "谷歌浏览器（辅助进程）",
+                "helper 主名过词表")
+    expectEqual(ProcessIdentity.displayName(executable: "NeteaseMusic Helper (Renderer)"), "网易云音乐（渲染进程）",
+                "旧空格样式词条已被通用规则取代（样式统一为括号式）")
+    // 归并键一致性：同一软件的不同 helper 必须归并为同一个 app 名（sampleCPUUsage 按它归并）
+    expectEqual(ProcessIdentity.detail(executable: "抖音 Helper (Renderer)").app,
+                ProcessIdentity.detail(executable: "抖音 Helper (GPU)").app,
+                "不同角色的裸名 helper 归并键一致")
+    expectEqual(ProcessIdentity.detail(executable: "抖音 Helper (Renderer)").app, "抖音",
+                "归并键就是软件名本身")
+
+    // —— R82 续二（fanprobe --zh-scan 实测驱动的补词）：hasChinese 判定 + 系统官方中文名 ——
+    expect(ProcessIdentity.hasChinese("预览"), "中文判定：汉字为真")
+    expect(!ProcessIdentity.hasChinese("TextEdit"), "中文判定：纯英文名为假（品牌名保持原样的依据）")
+    expectEqual(ProcessIdentity.displayName(executable: "/System/Applications/Calendar.app/Contents/MacOS/Calendar"),
+                "日历", "系统 App → 苹果官方中文名")
+    expectEqual(ProcessIdentity.displayName(executable: "/System/Applications/System Settings.app/Contents/MacOS/System Settings"),
+                "系统设置", "系统设置 → 中文（无 InfoPlist.strings 也兜得住）")
+}
+
+// R82 续五：词表完整性静态门。
+// 4.2.41 实测事故：systemGlossary 字典字面量键重复 = **运行时 trap（exit 133）**，
+// 构建期毫无症状、崩溃发生在"第一次访问词表"的瞬间，stdout 还被缓冲吞掉——
+// 这类手滑靠人眼根本守不住。本门按源码静态查重，把整类事故在测试期拦死；
+// 同时钉住词条规模下限，防整段汉化投入被静默清空。
+func testProcessIdentityGlossaryIntegrity() {
+    group("进程词表完整性(R82)")
+    let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let sourceURL = root.appendingPathComponent("Sources/SMCCore/ProcessIdentity.swift")
+    guard let source = try? String(contentsOf: sourceURL, encoding: .utf8) else {
+        expect(false, "读不到 ProcessIdentity.swift（词表门失效）")
+        return
+    }
+    guard let declRange = source.range(of: "systemGlossary: [String: String] = [") else {
+        expect(false, "词表声明不见了（结构改动后必须同步本门）")
+        return
+    }
+    let tail = source[declRange.upperBound...]
+    guard let closeRange = tail.range(of: "\n    ]") else {
+        expect(false, "词表闭合括号不见了（结构改动后必须同步本门）")
+        return
+    }
+    var keys: [String] = []
+    for rawLine in tail[..<closeRange.lowerBound].split(separator: "\n") {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        // 词条行形如 `"键": "值",`——取第一个 `":` 之前、首个引号之后的部分为键
+        guard line.hasPrefix("\""), let colon = line.range(of: "\":") else { continue }
+        keys.append(String(line[line.index(after: line.startIndex)..<colon.lowerBound]))
+    }
+    expect(!keys.isEmpty, "词表一个键都没解析到（解析逻辑失效，本门变空气）")
+    expect(keys.count >= 200, "词表规模 \(keys.count) 异常缩水（整段汉化被清？）")
+    var seen = Set<String>()
+    var duplicates: [String] = []
+    for k in keys where !seen.insert(k).inserted { duplicates.append(k) }
+    expect(duplicates.isEmpty,
+           "词表键重复：\(duplicates)——字典字面量重复键会在运行时 trap（4.2.41 事故）")
+}
+
+// R82 续八：散热片展示值的物理不可能值剔除。本机实测 46 个散热片键中有卡死键
+// 恒 79.421875，核心常态 50~55° 时被顶到最热页第一名——散热片物理上不可能比
+// 发热核心热 10° 以上。判据是**物理**而非"读数冻结"：时间基判据被本组第一版
+// 测试推翻（怠速下真实传感器也会位级冻结，误剔真实读数/环境代理的风险不可接受）。
+// 门钉四件事：常态（核心凉）剔物理不可能键、核心高热时不再误剔（值变为物理可能）、
+// 展示与控制面分离（环境路径 heatsinkTemperature 零变化）、全剔时归零不虚造。
+func testHeatsinkDeadKeyExclusion() {
+    group("散热片死键剔除(R82)")
+    let smc = MockSMC()
+    smc.set("Th0p", 79.421875)   // 卡死键（本机实测形态，永不变化）
+    smc.set("Th1p", 42)          // 真实散热片键
+    smc.set("Tp01", 55)          // 核心常态 55° → 阈值 65°
+    let clock = FakeClock()
+    let ts = try! makeTemperatureSensors(smc: smc, clock: { clock.time() })
+
+    // 常态：79.42 > 55+10 → 物理不可能，剔除后展示值回落到真实散热片键
+    clock.advance(11)   // 越过 10s 全扫缓存（模拟真实节拍）
+    expectEqual(ts.sensorReadings().heatsink, 42, "常态下物理不可能键被剔除")
+    // **控制面钉死**：环境谷值路径 heatsinkTemperature 语义零变化（仍含卡死键原值）
+    expectEqual(ts.heatsinkTemperature, 79.421875, "环境路径不受影响（控制语义零变化）")
+
+    // 核心高热 75° → 阈值 85°：79.42 变为物理可能 → 如实展示（不误剔）
+    smc.set("Tp01", 75); clock.advance(11)
+    expectEqual(ts.sensorReadings().heatsink, 79.421875, "核心高热时不误剔（物理可能即展示）")
+
+    // 核心回落 → 再次剔除
+    smc.set("Tp01", 55); clock.advance(11)
+    expectEqual(ts.sensorReadings().heatsink, 42, "核心回落后恢复剔除")
+
+    // 真实键也失效（≤1 不入 scan）→ 剔无可剔 → 归零（行隐藏），不拿卡死键充数
+    smc.set("Th1p", 0.5); clock.advance(11)
+    expect(ts.sensorReadings().heatsink == nil, "唯一可见键失效时归零（行隐藏），不拿卡死键充数")
+    // 控制面照旧（maxTemp 原语义与展示剔除无关）
+    expectEqual(ts.heatsinkTemperature, 79.421875, "控制面仍如实取 max")
+}
+
+
+// 悄悄腐烂：Python 侧改个键名，Swift 侧解码不报错（JSONDecoder 静默忽略未知键），
+// 于是「句柄数永远读不到」这类问题能安静跑几个月。
+//
+// 因此本门做两层：
+//   ① **CI 必跑**：仓库里提交的夹具 ↔ SpinAlert.CodingKeys 键集合必须完全相等；
+//   ② **开发机加严**：若本机装了 spinwatch，直接跑 `--emit-fixture` 同场比对。
+// 另附垃圾 Codable 池回归：坏元素不得拖垮整包、pid 缺失必须跳过、超长截断、越界归零。
+func testSpinAlertSchemaAndHostileInput() {
+    group("后台空转 schema 同源(R78)")
+
+    let isoDecoder: JSONDecoder = {
+        let d = JSONDecoder(); d.dateDecodingStrategy = .iso8601; return d
+    }()
+
+    // —— ① CI 必跑：提交的夹具与编码侧完全同源 ——
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let fixture = repoRoot.appendingPathComponent("Sources/fanctltests/Fixtures/spin-alerts.sample.json")
+    guard let data = FileManager.default.contents(atPath: fixture.path) else {
+        expect(false, "夹具必须在场：\(fixture.path)（缺席=门自己变空气）")
+        return
+    }
+    guard let top = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        expect(false, "夹具必须是合法 JSON 对象")
+        return
+    }
+    guard let report = try? isoDecoder.decode(SpinReport.self, from: data) else {
+        expect(false, "夹具必须能被 SpinReport 解出来（键名漂移？）")
+        return
+    }
+    expectEqual(Set(top.keys), Set(["schema", "updatedAt", "alerts"]),
+                "顶层键集合必须是 schema/updatedAt/alerts")
+    expectEqual(report.alerts.count, 2, "夹具两条告警都该解出来（高置信 + 低置信各一）")
+
+    // 反推 Swift 侧真实键集合：encode 回去再取键名（不手写字符串清单 —— 手写清单
+    // 与 CodingKeys 漂移，正是本门要防的那类谎）
+    let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+    guard let reData = try? enc.encode(report),
+          let reTop = (try? JSONSerialization.jsonObject(with: reData)) as? [String: Any],
+          let reAlerts = reTop["alerts"] as? [[String: Any]],
+          let firstRe = reAlerts.first else {
+        expect(false, "SpinReport 必须能编码回等价 JSON")
+        return
+    }
+    let fixtureAlertKeys = Set(((top["alerts"] as? [[String: Any]])?.first ?? [:]).keys)
+    expectEqual(Set(firstRe.keys), fixtureAlertKeys,
+                "encode 出的键集合必须与夹具一致（CodingKeys 与 Python 侧漂移即红）")
+
+    // —— ② 开发机加严：真跑 spinwatch --emit-fixture 同场比对 ——
+    let script = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("bin/spinwatch").path
+    if FileManager.default.fileExists(atPath: script) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        proc.arguments = [script, "--emit-fixture"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe; proc.standardError = pipe
+        do { try proc.run() } catch {
+            expect(false, "本机有 spinwatch 却跑不起来：\(error)")
+            return
+        }
+        proc.waitUntilExit()
+        let live = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let liveTop = (try? JSONSerialization.jsonObject(with: live)) as? [String: Any],
+              let liveFirst = (liveTop["alerts"] as? [[String: Any]])?.first else {
+            expect(false, "spinwatch 实跑输出必须能被 SpinReport 解出来（脚本 schema 漂移？）")
+            return
+        }
+        expectEqual(Set(liveFirst.keys), fixtureAlertKeys,
+                    "spinwatch 实跑输出的键集合必须与 Swift 侧一致（脚本改键名而 Swift 没跟上=静默失效）")
+    }
+    // else：CI 上没有 ~/bin/spinwatch —— 由①的提交夹具兜底，不算空气门
+
+    // —— ③ 语义回归：夹具里两条的展示口径 ——
+    let high = report.alerts.first { $0.confidence == "高" }
+    let low = report.alerts.first { $0.confidence == "低" }
+    expectEqual(high?.isHighConfidence, true, "高置信 → isHighConfidence")
+    expectEqual(low?.isHighConfidence, false, "低置信 ≠ isHighConfidence")
+    expectEqual(low?.heldSeconds, 600, "夹具低置信那条持续 600s")
+    expectEqual(low?.heldText, "10 分钟", "600s → 10 分钟")
+    expect(high?.evidenceText.contains("没打开任何文件") == true,
+           "证据文本要含「没打开任何文件」（0 句柄是最强信号）")
+    expect(high?.evidenceText.contains("程序已不在磁盘上") == true,
+           "证据文本要含「程序已不在磁盘上」（DMG 被弹出的典型形态）")
+    expect(high?.orphan == true, "高置信那条是孤儿进程")
+    expectEqual(high?.pid, 24053, "pid 正常解出")
+
+    // —— ④ 垃圾 Codable 池：坏输入不得拖垮整包 ——
+    func decode(_ json: String) -> SpinReport? {
+        try? isoDecoder.decode(SpinReport.self, from: Data(json.utf8))
+    }
+    // 一条坏元素（pid 缺失）夹在两条好元素之间：坏的被跳过，好的必须活下来
+    let mixed = """
+    {"schema":"spinwatch/1","alerts":[
+      {"pid":11,"name":"好的A","cpu":300},
+      {"name":"坏的无pid","cpu":100},
+      {"pid":12,"name":"好的B","cpu":120}]}
+    """
+    guard let m = decode(mixed) else {
+        expect(false, "含坏元素的数组整体必须还能解出（单条坏不该拖垮整包）")
+        return
+    }
+    expectEqual(m.alerts.count, 2, "坏元素被跳过，好元素两条都活下来")
+    expectEqual(m.alerts.map(\.pid).sorted(), [11, 12], "活下来的正是那两条好的")
+    // pid 负值：整条无意义，跳过
+    expectEqual(decode("{\"alerts\":[{\"pid\":-5,\"name\":\"x\"}]}")?.alerts.count ?? -1, 0,
+                "pid 为负 → 该条被跳过")
+    // alerts 键整个缺失 → 空数组（语义是"扫过了，没事"，不是 nil）
+    expectEqual(decode("{\"schema\":\"spinwatch/1\"}")?.alerts.isEmpty, true,
+                "没有 alerts 键 → 空数组")
+    // 超长字符串截断，不让 UI 被撑爆
+    let long = String(repeating: "x", count: 5000)
+    expectEqual(decode("{\"alerts\":[{\"pid\":9,\"name\":\"\(long)\"}]}")?.alerts.first?.name.count ?? -1,
+                64, "超长 name 截到 64")
+    // 越界/非有限数值 → 该字段 nil（不是 0，也不是崩）
+    let wild = decode("{\"alerts\":[{\"pid\":9,\"name\":\"w\",\"cpu\":1e308,\"fdCount\":-3}]}")
+    expectEqual(wild?.alerts.first?.cpu, nil, "1e308 越界 → cpu 置 nil")
+    expectEqual(wild?.alerts.first?.fdCount, nil, "负数句柄 → nil")
+    // 类型错配（cpu 是字符串）→ 该字段 nil，同条其他字段照常
+    let typo = decode("{\"alerts\":[{\"pid\":9,\"name\":\"w\",\"cpu\":\"很高\"}]}")
+    expectEqual(typo?.alerts.first?.name, "w", "类型错配的字段被丢，同条其他字段照常解出")
+    expectEqual(typo?.alerts.first?.cpu, nil, "cpu 类型错配 → nil")
+    // 整个文件是垃圾 → nil（"读不到"与"读到了但没告警"由 alerts 空否区分）
+    expectEqual(decode("这不是 JSON"), nil, "纯垃圾 → nil")
+
+    // —— ⑤ heldText 各档 ——
+    func held(_ s: Double) -> String {
+        SpinAlert(pid: 1, name: "t", heldSeconds: s).heldText
+    }
+    expectEqual(held(0), "刚刚", "0 秒 → 刚刚")
+    expectEqual(held(45), "45 秒", "45 秒")
+    expectEqual(held(600), "10 分钟", "10 分钟")
+    expectEqual(held(7200), "2 小时", "2 小时")
+    expectEqual(held(93600), "1 天", "26 小时 → 1 天")
+}
+
 func testStatusSummaryCoverage() {
     group("变化感知字段覆盖(R46)")
     var a = DaemonStatus(cpuTemp: 70, gpuTemp: 55, mode: .ai, appliedPercent: 40,
@@ -2023,6 +2660,7 @@ func testStatusSummaryCoverage() {
     a.learnedPoints = 7
     a.learnedSamples = 210
     a.targetUnreachable = true
+    a.aiHighEffort = true      // R77：与 targetUnreachable 同门差分（B 留 nil → 键缺席即差异）
     a.powerWatts = 33
     a.nightOverride = true
     a.envTemp = 27.5
@@ -2094,8 +2732,8 @@ func testStatusSummaryCoverage() {
         tested += 1
         if statusChangeSummary(decoded) == baseSummary { missed.append(key) }
     }
-    expectEqual(keys.count, 34, "status.json 顶层键数=34（新增字段必须在本门或 summaryFree 里表态）")
-    expectEqual(tested, 23, "实际被差分的键数=23（= 34 键 − 11 条有理由的豁免；对不上即有人改名单）")
+    expectEqual(keys.count, 35, "status.json 顶层键数=35（新增字段必须在本门或 summaryFree 里表态）")
+    expectEqual(tested, 24, "实际被差分的键数=24（= 35 键 − 11 条有理由的豁免；对不上即有人改名单）")
     // R46 审查修正（门的关键盲区）：JSON 键来自夹具，A/B 都留 nil 的键会被 encodeIfPresent
     // 省略、根本不进差分——"新增字段必须表态"因此有洞。改成用 Mirror 枚举**存储属性**：
     // 每个存储属性要么被差分过、要么在豁免名单、要么显式列进下面的"夹具未填"名单。

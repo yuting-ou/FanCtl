@@ -61,6 +61,7 @@ rm -f /usr/local/libexec/fanctl-upgrade.sh /usr/local/libexec/fanctl-uninstall.s
 rm -f "/Applications/清风.app/Contents/Resources/uninstall.sh" \
       "/Applications/清风.app/Contents/Resources/upgrade.sh"
 rm -f /usr/local/bin/fanprobe   # R33：install/upgrade 会装上，卸载必须一并清
+rm -f /usr/local/bin/fanmcp     # R84：MCP 服务器与诊断工具同批装卸（残留=指向已删数据的死二进制）
 rm -rf "/Library/Application Support/FanCtl"
 rm -rf /Applications/FanCtl.app "/Applications/清风.app"
 rm -f /var/log/fanctld.log

@@ -92,6 +92,7 @@ echo "==> 编译 release（非 UI 目标：默认系统 SDK）..."
 #      不把默认落点交给环境或未来的 SwiftPM 默认值。
 swift build -c release --disable-sandbox --scratch-path "$ROOT/.build" --product fanctld
 swift build -c release --disable-sandbox --scratch-path "$ROOT/.build" --product fanprobe
+swift build -c release --disable-sandbox --scratch-path "$ROOT/.build" --product fanmcp
 
 # ---------------------------------------------------------------------------
 # 产物定位（R35 发版链，两次翻车后定的纪律）：必须与构建问**同一组 flags**。
@@ -159,6 +160,8 @@ FANCTLD_BIN=$(artifact fanctld fanctld "$ROOT/.build" "") \
     || { echo "ERROR: cannot locate fanctld under $ROOT/.build" >&2; exit 1; }
 FANPROBE_BIN=$(artifact fanprobe fanprobe "$ROOT/.build" "") \
     || { echo "ERROR: cannot locate fanprobe under $ROOT/.build" >&2; exit 1; }
+FANMCP_BIN=$(artifact fanmcp fanmcp "$ROOT/.build" "") \
+    || { echo "ERROR: cannot locate fanmcp under $ROOT/.build" >&2; exit 1; }
 APP_EXEC_BIN=$(artifact FanCtlApp FanCtlApp "$APP_SCRATCH" "$APP_SDKROOT") \
     || { echo "ERROR: cannot locate FanCtlApp under $APP_SCRATCH" >&2; exit 1; }
 echo "==> 产物 $FANCTLD_BIN"
@@ -167,6 +170,10 @@ echo "==> 产物 $APP_EXEC_BIN"
 
 cp "$FANCTLD_BIN" "$DIST/fanctld"
 cp "$FANPROBE_BIN" "$DIST/fanprobe"
+# MCP 服务器（R83）：本地 AI 客户端（Hermes 等）经 stdio 查询/控制清风。
+# 只碰 status/config 文件、不碰 SMC，不需要 root；装机落点由用户自行选择
+# （常见：Hermes mcp_servers 直接指 dist/fanmcp，或手动 install 到 ~/bin）。
+cp "$FANMCP_BIN" "$DIST/fanmcp"
 
 # 组装菜单栏 App bundle
 APP="$DIST/FanCtl.app"
@@ -253,10 +260,12 @@ fi
 codesign --force --sign - "$APP"
 codesign --force --sign - "$DIST/fanctld"
 codesign --force --sign - "$DIST/fanprobe"
+codesign --force --sign - "$DIST/fanmcp"
 
 echo "==> 构建完成:"
 echo "    $DIST/fanctld"
 echo "    $DIST/fanprobe"
+echo "    $DIST/fanmcp"
 echo "    $APP"
 echo ""
 echo "下一步执行安装: sudo ./scripts/install.sh"

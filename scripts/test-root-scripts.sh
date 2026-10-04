@@ -319,6 +319,44 @@ else
     bad "App 落点常量（${SW_APP:-读空}）与 install/upgrade 字面量不一致"
 fi
 
+echo "== fanmcp 发行链闭合（R84：BLOCKED 3a 收口，防回潮）=="
+# 4.2.50 发布了 fanmcp 但发行链不认识它：zip 不收集、install/upgrade 不装、uninstall
+# 不清——Release 用户装不到 MCP 服务器，且全链测试照样绿。此处把每一环钉成静态门。
+if grep -q -- '--product fanmcp' "$ROOT/scripts/build.sh" \
+   && grep -qF 'cp "$FANMCP_BIN" "$DIST/fanmcp"' "$ROOT/scripts/build.sh"; then
+    ok "build.sh 编译并组装 dist/fanmcp（产物缺它 = 后面全链白搭）"
+else
+    bad "build.sh 不再编译/组装 dist/fanmcp（Release 用户拿不到 MCP 服务器）"
+fi
+if grep -qF 'install -m 755 -o root -g wheel "$DIST/fanmcp" /usr/local/bin/fanmcp' "$INSTALL"; then
+    ok "install.sh 把 fanmcp 装到 /usr/local/bin（AI 客户端可执行路径，与 fanprobe 同层）"
+else
+    bad "install.sh 缺 fanmcp 安装行（Release 用户装不到 MCP 服务器）"
+fi
+if grep -qF '"$STAGING/fanmcp"' "$UPGRADE" && grep -qF '/usr/local/bin/fanmcp' "$UPGRADE"; then
+    ok "upgrade.sh 随一键升级自我刷新 fanmcp（暂存包缺它时跳过，不阻断升级）"
+else
+    bad "upgrade.sh 缺 fanmcp 升级行（一键升级后 MCP 服务器停在旧版或消失）"
+fi
+if grep -qF 'rm -f /usr/local/bin/fanmcp' "$ROOT/scripts/uninstall.sh"; then
+    ok "uninstall.sh 清理 /usr/local/bin/fanmcp（与 fanprobe 同批装卸）"
+else
+    bad "uninstall.sh 缺 fanmcp 清理行（卸载残留指向已删数据的死二进制）"
+fi
+if grep -qF 'cp dist/fanmcp "$STAGE/"' "$ROOT/.github/workflows/ci.yml" \
+   && grep -qF 'dist/fanprobe dist/fanmcp scripts/install.sh' "$ROOT/.github/workflows/ci.yml"; then
+    ok "ci.yml 两处 zip 布局都带 fanmcp（发行收集 + 冒烟访客包）"
+else
+    bad "ci.yml 的 zip 布局缺 fanmcp（发行收集或冒烟访客包脱节）"
+fi
+if grep -qE 'for _b in fanctld fanprobe fanmcp' "$ROOT/.github/workflows/ci.yml" \
+   && grep -qF 'test -x /usr/local/bin/fanmcp' "$ROOT/.github/workflows/ci.yml" \
+   && grep -qF 'test ! -e /usr/local/bin/fanmcp' "$ROOT/.github/workflows/ci.yml"; then
+    ok "ci.yml 自证门覆盖二进制可执行位 + 冒烟断言装上/卸净 fanmcp"
+else
+    bad "ci.yml 缺 fanmcp 可执行位自证或装/卸冒烟断言（mode 掉了全链照样绿——R40 同族）"
+fi
+
 echo "== 发行脚本可执行位（R40 事故：变异工具自己剥掉了它）=="
 # 本轮写在 /tmp 的 python 变异脚本用 shutil.copyfile 备份、shutil.move 还原——copyfile **不保留
 # mode**，于是 install/uninstall/upgrade 三个脚本在提交里从 100755 静默掉到 100644。后果不在本地

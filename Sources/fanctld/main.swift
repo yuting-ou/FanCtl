@@ -3,6 +3,7 @@ import IOKit
 import IOKit.ps
 import IOKit.pwr_mgt
 import SMCCore
+import SMCDriver   // 唯一被允许依赖 SMC 写驱动的产品目标（root 守护进程）
 
 // fanctld — 风扇调速守护进程（LaunchDaemon，root 运行）
 //

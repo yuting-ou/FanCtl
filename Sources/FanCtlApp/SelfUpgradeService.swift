@@ -12,6 +12,35 @@ import SMCCore
 @MainActor
 final class SelfUpgradeService: ObservableObject {
 
+    /// ditto 解压 + 60s 超时防护（4.2.42）。**必须同步 + nonisolated**：DispatchSemaphore.wait
+    /// 在 async 上下文被标记不可用（Swift 6 起为错误）；detached 任务里同步阻塞
+    /// 钉死的是专用线程，不占协作池——与 fanctld 的 powermetrics 采样同一模式。
+    /// 本地解压正常 <2s；磁盘/挂载异常时 waitUntilExit 会永久阻塞，升级永远停在
+    /// validating，故 60s 无进展先 SIGTERM、2s 不退再 SIGKILL，报可重试的失败。
+    nonisolated static func runDitto(zip: URL, staging: URL)
+        -> (status: Int32, stderr: String, timedOut: Bool) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        p.arguments = ["-x", "-k", zip.path, staging.path]
+        let pipe = Pipe()
+        p.standardError = pipe
+        let sema = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in sema.signal() }
+        do { try p.run() } catch { return (-1, "无法启动 ditto: \(error.localizedDescription)", false) }
+        if sema.wait(timeout: .now() + 60) == .timedOut {
+            p.terminate()
+            if sema.wait(timeout: .now() + 2) == .timedOut {
+                kill(p.processIdentifier, SIGKILL)
+            }
+            p.waitUntilExit()
+            return (p.terminationStatus, "解压超时", true)
+        }
+        p.waitUntilExit()
+        let msg = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                         encoding: .utf8) ?? ""
+        return (p.terminationStatus, msg, false)
+    }
+
     enum Phase: Equatable {
         case idle
         case downloading(tag: String)
@@ -83,17 +112,16 @@ final class SelfUpgradeService: ObservableObject {
                 let fm = FileManager.default
                 try? fm.removeItem(at: staging)
                 try fm.createDirectory(at: staging, withIntermediateDirectories: true)
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-                p.arguments = ["-x", "-k", zipURL.path, staging.path]
-                let pipe = Pipe()
-                p.standardError = pipe
-                try p.run()
-                p.waitUntilExit()
-                guard p.terminationStatus == 0 else {
-                    let msg = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
-                                     encoding: .utf8) ?? ""
-                    throw Failure("解压失败: \(msg.suffix(120))")
+                // 4.2.42：解压走同步辅助函数（含 60s 超时 + SIGKILL 升级，教训同
+                // powermetrics v3.6.1）——同步是刻意的：DispatchSemaphore.wait 在
+                // async 上下文不可用（Swift 6 起为错误），而 detached 任务里用同步
+                // 阻塞恰好钉死的是专用线程，不占协作池。
+                let r = SelfUpgradeService.runDitto(zip: zipURL, staging: staging)
+                if r.timedOut {
+                    throw Failure("解压超时（60s 无进展），已中止——可直接重试升级")
+                }
+                guard r.status == 0 else {
+                    throw Failure("解压失败: \(String(r.stderr.prefix(120)))")
                 }
                 let entries = try fm.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil)
                 guard let inner = entries.first(where: {

@@ -26,13 +26,18 @@ public struct FanState {
     }
 }
 
-public final class FanController {
-    private let smc: SMCIO
+/// 只读风扇视图：读 FNum/Ac/Tg/Mn/Mx，**不含任何写方法**。
+/// 写实现在 target SMCDriver 的 `FanController: FanReadout`——只有依赖那个 target 的
+/// 程序（root 守护进程 fanctld、逻辑测试 fanctltests）才构造得出"会写风扇"的对象；
+/// FanCtlApp 与 fanprobe 的依赖图里没有它。
+open class FanReadout {
+    private let smc: SMCIORead
     // 4.0 审查修复：可重探——init 只读一次的 let 在 FNum 瞬时读取失败时会把有扇
     // 机器永久钉在 fanCount=0（B1 后触发 passive 语义，从"响亮的 controlFault"
     // 变成"安静的错误语义"）。rescanFanCountIfNeeded 低频翻正（见该函数注释）。
     public private(set) var fanCount: Int
-    private var hasModeKey: Bool  // F0Md 存在 → Apple Silicon 风格
+    /// F0Md 存在 → Apple Silicon 风格（否则用 FS! 位掩码）。写侧（SMCDriver）按它选路径。
+    public private(set) var hasModeKey: Bool
     // 重探节流基准（进程内状态，不持久化；时钟由调用方注入 hooks.now()，P7 单一来源）
     private var lastFanCountProbe = Date.distantPast
     // v3.4.1 Mn/Mx 静态缓存（硬件常量；唤醒时由 ControlEngine.wake 调 invalidateFanLimits，
@@ -64,7 +69,7 @@ public final class FanController {
         return true
     }
 
-    public init(smc: SMCIO) throws {
+    public init(smc: SMCIORead) throws {
         self.smc = smc
         let fnum = (try? smc.readDouble("FNum")) ?? 0
         // 防御 NaN/Inf/超大值导致 Int() trap：
@@ -118,64 +123,8 @@ public final class FanController {
         }
     }
 
-    // 强制指定转速（需要 root）
-    public func setForcedRPM(fan: Int, rpm: Double) throws {
-        try setForcedRPM(state: try state(of: fan), rpm: rpm)
-    }
-
-    // 用已读取的 FanState 写入目标转速（不再重读 SMC，给主循环复用）
-    public func setForcedRPM(state st: FanState, rpm: Double) throws {
-        // 防御：min/max 无效（读失败返回 0）时禁止写入——否则任意百分比映射为 0，
-        // 会把 92°C 兜底的 100% 也写成 Tg=0（风扇停转），安全红线被静默击穿。
-        // 调用方（daemon 写入循环）捕获此错误后走 writeHealth 故障路径。
-        guard st.maxRPM > st.minRPM, st.maxRPM > 0, st.minRPM >= 0 else {
-            throw SMCError.smcResult("F\(st.id)Mx", 0xFD)
-        }
-        let clamped = max(st.minRPM, min(st.maxRPM, rpm))
-        if hasModeKey {
-            try smc.writeDouble("F\(st.id)Md", value: 1)
-            try smc.writeDouble("F\(st.id)Tg", value: clamped)
-        } else {
-            // Intel: 置 FS! 对应位后写 F{n}Tg
-            // 读取失败时不能默认 0，否则会清除其他风扇的强制位
-            // v3.6.1：id ≥ 16 时 1 << id 溢出 UInt16——强制位静默写丢（set）或
-            // UInt16(65536) runtime trap（restore，root 崩溃循环）。SMC FS! 只有 16 位
-            guard st.id < 16 else {
-                throw SMCError.smcResult("FS! ", 0xFE)
-            }
-            guard let raw = try? smc.readDouble("FS! ") else {
-                throw SMCError.keyNotFound("FS! ")
-            }
-            // 防御：SMC 损坏/异常固件可能返回负值或 ≥65536，UInt16() 对越界值
-            // precondition trap 会使 root daemon 崩溃（其余 SMC 数值路径都有显式钳位）
-            let mask = raw.isFinite ? max(0, min(65535, raw)) : 0
-            try smc.writeDouble("FS! ", value: Double(UInt16(mask) | (1 << st.id)))
-            try smc.writeDouble("F\(st.id)Tg", value: clamped)
-        }
-    }
-
-    // 交还系统自动调度（需要 root）
-    public func restoreAuto(fan: Int) throws {
-        if hasModeKey {
-            try smc.writeDouble("F\(fan)Md", value: 0)
-        } else {
-            // v3.6.1：同 setForcedRPM——fan ≥ 16 时 UInt16(1 << fan) runtime trap
-            guard fan < 16 else {
-                throw SMCError.smcResult("FS! ", 0xFE)
-            }
-            guard let raw = try? smc.readDouble("FS! ") else {
-                throw SMCError.keyNotFound("FS! ")
-            }
-            let mask = raw.isFinite ? max(0, min(65535, raw)) : 0
-            try smc.writeDouble("FS! ", value: Double(UInt16(mask) & ~UInt16(1 << fan)))
-        }
-    }
-
-    public func restoreAutoAll() {
-        for i in 0..<fanCount {
-            try? restoreAuto(fan: i)
-        }
-    }
+    // 写方法（setForcedRPM / restoreAuto / restoreAutoAll / setForcedPercentsAll）
+    // 已迁至 target SMCDriver 的 `FanController: FanReadout`——本类型只读。
 
     // 百分比 → RPM（0% = 最低转速，100% = 最高转速）
     public func rpm(forPercent pct: Double, fan: Int) throws -> Double {
@@ -188,17 +137,7 @@ public final class FanController {
         return st.minRPM + p * (st.maxRPM - st.minRPM)
     }
 
-    // 批量设置所有风扇的强制百分比（支持独立偏移后每个风扇百分比不同）
-    // percents 数组按风扇索引对应，数量不足时用第一个值填充
-    public func setForcedPercentsAll(_ percents: [Double], states: [FanState]) throws {
-        for (i, st) in states.enumerated() {
-            let pct = i < percents.count ? percents[i] : (percents.first ?? 50)
-            let rpm = self.rpm(forPercent: pct, state: st)
-            try setForcedRPM(state: st, rpm: rpm)
-        }
-    }
-
-    // 计算所有风扇的 RPM（给 setForcedPercentsAll 复用，避免重复读状态）
+    // 计算所有风扇的 RPM（写侧 setForcedPercentsAll 复用，本身纯计算不读不写）
     public func rpms(forPercents percents: [Double], states: [FanState]) -> [Double] {
         states.enumerated().map { i, st in
             let pct = i < percents.count ? percents[i] : (percents.first ?? 50)
@@ -206,6 +145,34 @@ public final class FanController {
         }
     }
 }
+
+// MARK: - 风扇操作面协议（引擎只认这两个面）
+
+/// 只读面：ControlEngine 的观察侧与 fanprobe 都用它。
+public protocol FanReading: AnyObject {
+    var fanCount: Int { get }
+    var hasModeKey: Bool { get }
+    func state(of fan: Int) throws -> FanState
+    func allStates() -> [FanState]
+    func rpm(forPercent pct: Double, fan: Int) throws -> Double
+    func rpm(forPercent pct: Double, state st: FanState) -> Double
+    func rpms(forPercents percents: [Double], states: [FanState]) -> [Double]
+    func rescanFanCountIfNeeded(now: Date) -> Bool
+    func invalidateFanLimits()
+}
+
+/// 写面：**声明在本模块，实现只在 target SMCDriver**。
+/// 因此 FanCtlApp / fanprobe 的依赖图里既没有实现、也构造不出符合本协议的对象
+/// （唯一的实体 FanController 在 SMCDriver 里）——写硬件是依赖图事实，不是约定。
+public protocol FanActuating: FanReading {
+    func setForcedRPM(fan: Int, rpm: Double) throws
+    func setForcedRPM(state st: FanState, rpm: Double) throws
+    func restoreAuto(fan: Int) throws
+    func restoreAutoAll()
+    func setForcedPercentsAll(_ percents: [Double], states: [FanState]) throws
+}
+
+extension FanReadout: FanReading {}
 
 // MARK: - 写入健康（控制闭环执行链可观测性）
 
@@ -411,7 +378,7 @@ public struct FanFeedbackHealth: Equatable {
 // 取有效范围内 (1~120°C) 的最大值作为热点温度。
 
 public final class TemperatureSensors {
-    private let smc: SMCIO
+    private let smc: SMCIORead
     /// SMC 读计数（非原子、仅供测试在单线程下观测缓存效果；生产无读者零成本）
     public private(set) var smcReadCount = 0
     // 测试注入时钟：TTL 缓存（电池控制缓存/展示缓存）基于真实时间在快节奏测试里
@@ -455,6 +422,9 @@ public final class TemperatureSensors {
     // 避免每拍遍历所有非关键传感器
     private var cachedPalmRest: (value: Double, time: Date) = (0, .distantPast)
     private var cachedHeatsink: (value: Double, time: Date) = (0, .distantPast)
+    // R82 续八：散热片展示值的逐键记录（物理不可能值剔除用，见 heatsinkDisplay）。
+    // 搭 heatsinkTemperature 既有 10s 全扫的便车，零额外 SMC 读。
+    private var lastHeatsinkScan: [String: Double] = [:]
     private var cachedOtherHotspots: ([String: Double], Date) = ([:], .distantPast)
     private var cachedOtherMax: (value: Double, time: Date) = (0, .distantPast)   // v3.4.1 otherHotspotMax 缓存
     /// otherHotKeys 全量读轮次计数（测试观测缓存效果；生产无读者）
@@ -473,7 +443,7 @@ public final class TemperatureSensors {
     private var lastAmbientCandidateAt: Date = .distantPast   // 最近一次有效候选（长时间无候选才重置）
     private let ambientRisePerSec = 0.5 / 3600.0
 
-    public init(smc: SMCIO) throws {
+    public init(smc: SMCIORead) throws {
         self.smc = smc
         self.cpuKeys = []
         self.gpuKeys = []
@@ -589,6 +559,7 @@ public final class TemperatureSensors {
             // 展示缓存也失效
             cachedPalmRest = (0, .distantPast)
             cachedHeatsink = (0, .distantPast)
+            lastHeatsinkScan = [:]
             cachedOtherHotspots = ([:], .distantPast)
             cachedOtherMax = (0, .distantPast)
             cachedBattery = (0, .distantPast)
@@ -672,26 +643,29 @@ public final class TemperatureSensors {
 
     // 无追踪的全量读取（电池等低频分类，键通常很少）
     // 注意：调用方必须在 inout 激活前调用 checkRescan()
-    private func maxTemp(_ keys: [String]) -> Double {
+    private func maxTemp(_ keys: [String], recording: Bool = false) -> Double {
         smcReadCount += keys.count
         var m = 0.0
+        var scan: [String: Double] = [:]
         for k in keys {
             if let v = try? smc.readDouble(k), v > 1, v < 120 {
                 m = max(m, v)
+                if recording { scan[k] = v }
             }
         }
+        if recording { lastHeatsinkScan = scan }
         return m
     }
 
     // 带 TTL 缓存的读取（TTL 可选：控制输入用短缓存，展示类用长缓存）
     private func cachedMax(_ keys: [String], cache: inout (value: Double, time: Date),
-                           ttl: TimeInterval? = nil) -> Double {
+                           ttl: TimeInterval? = nil, recording: Bool = false) -> Double {
         let interval = ttl ?? displayCacheTTL
         let now = clock()
         if now.timeIntervalSince(cache.time) < interval, cache.time != .distantPast {
             return cache.value
         }
-        let v = maxTemp(keys)
+        let v = maxTemp(keys, recording: recording)
         cache = (v, now)
         return v
     }
@@ -706,7 +680,23 @@ public final class TemperatureSensors {
     // （电池热质量大，秒级温度变化远小于托底滞回带宽，短缓存不引入控制风险）
     public var batteryTemperature: Double { checkRescan(); return cachedMax(battKeys, cache: &cachedBattery, ttl: controlCacheTTL) }
     public var palmRestTemperature: Double { checkRescan(); return cachedMax(palmRestKeys, cache: &cachedPalmRest) }
-    public var heatsinkTemperature: Double { checkRescan(); return cachedMax(heatsinkKeys, cache: &cachedHeatsink) }
+    // heatsink 侧开启 recording：maxTemp 顺带记录逐键值，供展示侧物理剔除零成本取用
+    public var heatsinkTemperature: Double { checkRescan(); return cachedMax(heatsinkKeys, cache: &cachedHeatsink, recording: true) }
+    /// R82 续八：散热片**展示** max = 剔除物理不可能值后的逐键最大。
+    /// 本机实测 46 个散热片键中存在卡死键（恒 79.421875），在核心 50~55° 的常态下
+    /// 被顶到最热页第一名——散热片是被动散热体，物理上不可能比发热核心热 10° 以上。
+    /// 判据因此是**物理**而非"读数冻结"：位级冻结分不清死传感器与真怠速恒温
+    /// （第一版时间基判据被自己的测试推翻——怠速误剔真实读数、乃至推广到环境
+    /// 候选会误删真实环境代理，风险不可接受）；超出 implausibleAbove（调用方传
+    /// max(核心,GPU)+10）的散热片键只可能是坏读数。
+    /// **只用于展示**（SensorReadings → status.json → 最热页/fanprobe 报告）；
+    /// 环境谷值估计继续走 heatsinkTemperature 原语义（控制面零变化）。
+    /// 零额外 SMC 读：逐键值复用既有全扫的顺带记录。全被剔时归 0（行隐藏），
+    /// 绝不虚造——调用方须先读核心温度再传参（sensorReadings 的顺序已保证）。
+    public func heatsinkDisplayTemperature(implausibleAbove: Double) -> Double {
+        let alive = lastHeatsinkScan.filter { $0.value <= implausibleAbove }.values
+        return alive.max() ?? 0
+    }
     // v3.4.1：走展示缓存——otherHotKeys 可达 ~110 个键，此前每拍全量读是
     // 全项目最大的 IOKit 乘数浪费（3150 万拍/年 × 110 ≈ 35 亿次调用）。
     // otherHotspotReadings()（明细展示）本来就缓存 10s；max 用于环境谷值候选与
@@ -804,7 +794,11 @@ public final class TemperatureSensors {
         let gpuT = gpuTemperature
         let gpu = gpuT > 1 ? gpuT : cpuMax
         let palm = palmRestTemperature > 1 ? palmRestTemperature : nil
-        let hs = heatsinkTemperature > 1 ? heatsinkTemperature : nil
+        // R82 续八：展示值剔除物理不可能键（阈值 = 发热核心 + 10°）。先走一遍
+        // heatsinkTemperature（10s 全扫 + 逐键记录，读取预算与旧版完全一致）
+        _ = heatsinkTemperature
+        let hsRaw = heatsinkDisplayTemperature(implausibleAbove: max(cpuMax, gpuT) + 10)
+        let hs = hsRaw > 1 ? hsRaw : nil
         // nandTemperature 同为无 TTL 的 trackedMax：先落本地防同拍双读
         let nandT = nandTemperature
         return SensorReadings(

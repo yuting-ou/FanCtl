@@ -101,7 +101,10 @@ func testDiagnosticReport() {
     let emptyText = emptyLines.joined(separator: "\n")
     expect(emptyText.contains("未运行（无 status.json）"), "空输入报 daemon 未运行")
     expect(emptyText.contains("硬件画像: 未知"), "空输入报硬件画像未知")
-    expect(emptyText.contains("controlFault=未落盘"), "空输入把 controlFault 报成未落盘而非 false")
+    // R82 续七：controlFault 缺席 = 健康态（daemon encodeIfPresent），措辞从"未落盘"
+    // 改为"无记录(健康)"——意图不变：缺席不得谎报成 false
+    expect(emptyText.contains("controlFault=无记录(健康)"), "空输入把 controlFault 报成无记录而非 false")
+    expect(!emptyText.contains("controlFault=false"), "缺席仍不得谎报成 false")
     expect(emptyText.contains("上次异常退出: 无记录"), "空输入的退出原因=无记录")
     expect(emptyText.contains("SMC 可打开: 是（未取读数）"),
            "probeError 缺省只报可打开，不冒充取到了读数")

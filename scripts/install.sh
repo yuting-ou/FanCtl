@@ -132,6 +132,14 @@ if [[ -f "$DIST/fanprobe" ]]; then
 else
     echo "⚠️ dist/fanprobe 缺失——跳过诊断工具安装（请用 ./scripts/build.sh 重新构建）" >&2
 fi
+# R84：MCP 服务器上 PATH（只碰 status/config 文件、无 root 需求；AI 客户端以登录
+# 用户身份 exec——装到 /usr/local/bin 给一个稳定路径，FanMCP 的诊断工具也按同一
+# 目录找 fanprobe。缺失警告跳过与 fanprobe 同语义：旧布局兼容，build.sh 组装门管住新包）
+if [[ -f "$DIST/fanmcp" ]]; then
+    install -m 755 -o root -g wheel "$DIST/fanmcp" /usr/local/bin/fanmcp
+else
+    echo "⚠️ dist/fanmcp 缺失——跳过 MCP 服务器安装（AI 助手接入不可用；请用 ./scripts/build.sh 重新构建）" >&2
+fi
 
 echo "==> 创建配置与日志目录..."
 mkdir -p "$SUPPORT"

@@ -15,6 +15,7 @@
 
 import Foundation
 import SMCCore
+import SMCDriver   // 被测的 FanController（写实现）现在该 target（导入调整，断言未动）
 
 struct FamilyMember {
     let name: String

@@ -1,5 +1,6 @@
 import Foundation
 import SMCCore
+import SMCDriver   // 仅因被测对象 FanController 的写实现在该 target（导入调整，断言未动）
 
 // 轻量测试 harness（无需 Xcode/XCTest）：swift run fanctltests
 // 任一断言失败则进程退出码非 0。各模块用例见 Tests*.swift。
@@ -13,7 +14,7 @@ func group(_ name: String) { currentGroup = name; seenGroups.insert(name) }
 
 func expect(_ cond: Bool, _ msg: String) {
     checks += 1
-    if !cond { failures += 1; print("  ❌ [\(currentGroup)] \(msg)") }
+    if !cond { failures += 1; print("  ❌ [\(currentGroup)] \(msg)"); fflush(stdout) }
 }
 func expectEqual<T: Equatable>(_ a: T, _ b: T, _ msg: String) {
     expect(a == b, "\(msg) — got \(a), want \(b)")
@@ -731,6 +732,9 @@ func testColdStartHIL() {
 }
 
 print("== FanCtl 纯逻辑测试 ==")
+// 静态门放最前：只读源码文件、不触碰被测代码——即使后面的词表真的有重复键
+// （运行时 trap），本门的可读诊断也已输出并 flush（4.2.41 事故的教训）。
+testProcessIdentityGlossaryIntegrity()
 testInterpolation()
 testHistogram()
 testOptimizer()
@@ -750,6 +754,7 @@ testOffsetsAndReadings()
 testThermalLearn()
 testFanControllerMock()
 testSensorsMock()
+testHeatsinkDeadKeyExclusion()   // R82 续七：散热片死键剔除（展示路径，控制面钉死）
 testAmbientValley()
 testStatsSampler()
 testAIController()
@@ -790,6 +795,10 @@ testFanLimitsCache()
 testSMCBytes()
 testEngineWiring()
 testLearnSaturatedGate()
+testAIHighEffortEscalation()
+testWakeSessionResetCoverage()
+testWakeResetsCyclingGuardEdge()
+testDtClampSingleSource()
 testRescanAsync()
 testRescanEmptyScanDefense()
 testAdversarialFixes()
@@ -808,11 +817,15 @@ testSelfUpgradeFuzz()
 testRootScriptGates()
 testPassiveMachine()
 testPartialFanLoss()
+testSpinAlertSchemaAndHostileInput()
+testProcessIdentity()
+testProcessIdentityGlossaryIntegrity()   // R82 续五：词表静态门（重复键=运行时 trap 的回归；主序列尾部再跑一次防漏）
 testStatusSummaryCoverage()
 testUIAnimationGuards()
 testTickBenchSafety()
 testWallClockWearRate()
 testZeroTempDayStillCounts()
+testRampMonitor()
 testHistoryRetentionByCalendarDays()
 testUnusableHistoryRows()
 testTickBenchPerTickSeries()
@@ -827,19 +840,21 @@ testPersistenceFailureRetries()
 testDiagnosticReport()
 testProbeReadOnlyLoads()
 testDaemonVersionField()
+testSpinKillGuardRefusals()   // R81：结束进程必须绑定进程实例（新增回归，下限未动）
+testFanMCP()                  // R83：清风 MCP 服务器（协议帧/工具面/参数防御/版本同源）
 print("——")
 // 契约下限（与 ci.yml 的徽章门槛一致）：低于此值 = 有测试被删/跳过
-// 两源同值由 scripts/test-root-scripts.sh 钉住（R54）。抬升记录：4995=R53 实测 5006/91 组；5005=R54 实测 5016/91 组；5025=R55 实测 5040/92 组；5045=R56 实测 5076/93 组；5070=R57 实测 5098/94 组；5080=R60 实测 5102/95 组；5090=R61 实测 5106/95 组；5100=R62 实测 5110/95 组；5105=R63 实测 5111/95 组；5110=R64 实测 5114/95 组；5115=R65 实测 5116/95 组；5125=R68 实测 5132/96 组；5115=R69 实测 5121/96 组；5120=R70 实测 5127/97 组；5140=R71 实测 5148/99 组；5150=R72 实测 5157/100 组；5170=R73 实测 5179/101 组；5195=R74 实测 5207/102 组；5210=R75 实测 5220/103 组；5230=R76 实测 5236/104 组（R69 删掉 11 条重复/无牙断言，故意低于历史峰值——见 EVOLUTION R69）
+// 两源同值由 scripts/test-root-scripts.sh 钉住（R54）。抬升记录：4995=R53 实测 5006/91 组；5005=R54 实测 5016/91 组；5025=R55 实测 5040/92 组；5045=R56 实测 5076/93 组；5070=R57 实测 5098/94 组；5080=R60 实测 5102/95 组；5090=R61 实测 5106/95 组；5100=R62 实测 5110/95 组；5105=R63 实测 5111/95 组；5110=R64 实测 5114/95 组；5115=R65 实测 5116/95 组；5125=R68 实测 5132/96 组；5115=R69 实测 5121/96 组；5120=R70 实测 5127/97 组；5140=R71 实测 5148/99 组；5150=R72 实测 5157/100 组；5170=R73 实测 5179/101 组；5195=R74 实测 5207/102 组；5210=R75 实测 5220/103 组；5230=R76 实测 5236/104 组；5292=R77 实测 5298/108 组（架构轮：AI 全力散热下发/唤醒复位/dt 钳位同源/会话复位覆盖门/beat 阶段抽取；留 6 条漂移余量沿用 R76 惯例，组数留 8）；5319=R78 实测 5344/110 组（后台空转哨兵：spinwatch 下发 + schema 双端同源门 + 垃圾 Codable 池回归 + 进程中文辨识）（R69 删掉 11 条重复/无牙断言，故意低于历史峰值——见 EVOLUTION R69）
 // R33：CI 曾为 4400、源码 4550 双源漂移——已统一；改数值必须两处同时改
 // R35/R36：4.2.1 实测 4736 断言 / 82 组；R37：4.2.2 实测 4836 / 84（诊断包结构与口径、
 // 只读零副作用两组）；R38：4.2.3 实测 4860 / 85（daemon 版本自报的 JSON 契约组，含
 // "init 参数漏赋值"与"接线计数"两条 F9 同族守卫）；R43：4.2.8 实测 4915 / 86；R44：实测 4926 / 87（双风扇不对称量程形状扫描）；R46：实测 4937 / 88（变化感知字段覆盖门）
 // （R43 组：交还、边沿不重复写、恢复后再失联、去抖、交还写失败、唤醒补交还）
-let minAssertions = 5230
+let minAssertions = 5319
 // R23 测试基建：第二道门槛——distinct group 数。断言总数可被循环刷量虚高
 // （如 expectPersonalityOrdered 单次产 ~816 条），删掉整段测试但保留循环类断言时
 // 总数不降、覆盖却净损；group 数是粗粒度结构量，删函数即少一个 group，刷不出来。
-let minGroups = 96
+let minGroups = 101
 if failures == 0 {
     if checks < minAssertions {
         print("❌ 断言数 \(checks) 低于契约下限 \(minAssertions)（测试被删/跳过？）")

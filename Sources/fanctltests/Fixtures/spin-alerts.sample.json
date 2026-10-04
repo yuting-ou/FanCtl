@@ -1,0 +1,42 @@
+{
+  "schema": "spinwatch/1",
+  "updatedAt": "2026-10-01T08:30:00Z",
+  "alerts": [
+    {
+      "pid": 24053,
+      "ppid": 1,
+      "name": "crashpad_handler",
+      "command": "/Volumes/已弹出-DMG/pixcake.app/Contents/MacOS/pix-worker.app/Contents/MacOS/crashpad_handler",
+      "cpu": 277.0,
+      "peak": 279.4,
+      "heldSeconds": 93600.0,
+      "fdCount": 0,
+      "threads": 5,
+      "exe": "/Volumes/已弹出-DMG/pixcake.app/Contents/MacOS/pix-worker.app/Contents/MacOS/crashpad_handler",
+      "exeKnown": true,
+      "exeOnDisk": false,
+      "orphan": true,
+      "confidence": "高",
+      "startSeconds": 1759400476.0,
+      "uid": 501
+    },
+    {
+      "pid": 99232,
+      "ppid": 99227,
+      "name": "抖音 Helper (Renderer)",
+      "command": "/Applications/抖音.app/Contents/Frameworks/抖音 Helper (Renderer).app/Contents/MacOS/抖音 Helper (Renderer)",
+      "cpu": 42.9,
+      "peak": 46.0,
+      "heldSeconds": 600.0,
+      "fdCount": 87,
+      "threads": 24,
+      "exe": "/Applications/抖音.app/Contents/Frameworks/抖音 Helper (Renderer).app/Contents/MacOS/抖音 Helper (Renderer)",
+      "exeKnown": true,
+      "exeOnDisk": true,
+      "orphan": false,
+      "confidence": "低",
+      "startSeconds": 1759404130.0,
+      "uid": 501
+    }
+  ]
+}

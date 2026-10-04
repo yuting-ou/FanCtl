@@ -2138,3 +2138,188 @@ init 参数静默吞值）——审查计划本身也是审查。UI 教训：Cha
   （Calendar 构造等）单点收益 ε 级、验证成本高 → **收敛停机**，符合"下一轮预期收益 < ε"。
 - goal 细节陷阱：`swift build ... | grep -c && 跑测试` 的 shell 短路会让测试静默跳过——
   验证命令必须独立成句跑（R3 曾踩）。
+
+## R77（4.2.36(127)）：架构评审轮——把"靠约定正确"改成"结构上不容易错"
+
+- **选题（作者点名"你认为这个项目做得怎么样？项目架构需不需要优化？"）**：不是加功能，是**先审后修**。
+  评审按三个独立视角（核心控制层 / 数据契约 / 工程化）并行做，每条结论都要求带 `文件:行号` 证据，
+  并要求每条都给出**反方论证**；Lead 独立复核每一条高影响结论后才采信。实测底数：
+  `swift build` 通过、**5236 断言 / 104 组全绿**、81 成员 HIL 族扫描 安全/极限环/hold 违例全 0、
+  工作区干净（83 个受跟踪文件，`.build`/`dist`/`.qoder` 已忽略）。
+- **评审结论**：架构**不需要重写**，但有三处"正确性负载压在测试上"的地方。这一轮只修这四处，零新增功能。
+- **① App 重算控制语义（真实违规，项目自己立的规矩）**：README/`CONTRIBUTING` 写明"App 展示一律读
+  status.json，不得在 App 侧重算控制语义"。但面板"AI 正在全力散热"黄提示由 App 自维护 `Date` 计时器
+  判"满速 ≥99% 且高于目标+2° 持续 20s"：**计时器活在 UI 进程里**（面板重建/App 重启即归零，
+  "持续 20s"实际测不准），阈值还与 daemon 已有的 `targetUnreachable`（≥98%/+4°）分叉 →
+  UI 有窗口显示"全力散热"而 daemon 认为目标可达（或反之）。
+  改法：daemon 判定并随 status.json 下发 `aiHighEffort`（仅 AI 模式表态，非 AI 为 nil，
+  与 `targetUnreachable` 同形），App 只读；旧 daemon 无此字段 → nil → 不显示该提示（不造假，
+  与 R38 版本字段同源）。新字段按 R46 门的要求进 `statusChangeSummary`（20s 尺度慢信号，
+  迟到 10s 心跳会与用户听到的风声对不上）。
+  **序关系有门钉死**：测试记录两者**首次**为真的拍号再比大小——yellow(20s) 必须先于 UNREACH(60s)，
+  否则 UI「黄 → 黄+感叹号」升级链跳级。
+- **② 唤醒假日志（真实缺陷，测试反向验证过）**：`wake()` 手工逐字段复位 25 个字段，漏了
+  `aiCyclingGuardActive`。它是启停抑制的**边沿记忆**，而 `wake()` 里 `aiController.reset()` 已把
+  `cyclingGuardArmed` 清成 false → 醒来第一拍跨过边沿、打出"启停循环抑制解除，恢复空闲交还评估"，
+  且文案时长取自被清零的 `currentGuardSeconds` → 退化成**"解除 0 分钟"**这种自相矛盾的日志。
+  **验证方式：撤掉修复后该测试确实变红**（红在"唤醒首拍不得打假日志"那条），不是只看变绿。
+  另外发现"sleep 不写 status、`lastStatus` 保留睡前帧"是**有意设计**（App 靠 timestamp 陈旧判定），
+  故唤醒断言不能查盘上 artifact，只能查"计时器已归零"的语义——测试最初写错，被自己的红逼着改正。
+- **③ dt 钳位三处静默分叉**：引擎 20s、`LearningGate` 20s、`FanAIController` **15s**。
+  idle 长拍（引擎最大 20s）下 AI 的 P/D 增量按 15s 结算、与同拍的学习门/统计口径**差 25%**。
+  最有力的证据是**代码自己的注释**：`FanControlLaw:184` 早已论证"按 15 结算会把 °C/s 阈值放宽 ~25%"
+  ——`LearningGate` 据此钳到 20，**但 AI 侧没同步**。收敛为 `FanDt` 单一定义 + 新增同源门。
+  顺带修正一处理解：`Double.infinity.isFinite == false`，故 ±Inf 与 NaN 一样退回标称 3s
+  （比"Inf 走 min/max"更保守），已在测试里钉住。
+- **④ `step(dt:)` 默认值移除（本轮唯一一次"机械大改"，但方法可自证）**：`dt: Double = 3.0`
+  让"漏传 dt"静默按标称拍结算。先精确计数：用**平衡括号扫描**而非 grep——grep 会把多行调用的
+  首行误算成 bare 调用（我先算出 165，实际 **172**；且 0 处真正跨行）。改法：备份 + 括号匹配插入
+  `, dt: 3.0` + 计数断言（172≠预期即不落盘），仅改测试侧。**移除默认值后编译器即成为守卫**：
+  再漏传是编译错误而不是静默行为；172 处全绿 + 断言数**完全不变**（5298）即"行为零变化"的证明。
+- **⑤ 会话复位覆盖门（防同类回潮，方法论值得记）**：先试**运行期差分**（Mirror 前后快照）——
+  失败：多数会话字段在预热门槛下压根没被弄脏，"没复位"与"本来就等于复位值"同形（假绿），
+  还会把 `aiController`/`controller` 这类嵌套对象的状态变化误记成复位（假红）。改用**源码抠取**
+  （从 `wake()` 函数体里抠赋值字段名，本项目已有先例：`test-root-scripts.sh` 按名字从 Config.swift
+  抠路径常量做跨语言门）：抠出 27 个字段，与语义清单**双向**比对——漏复位（会话语义跨睡眠泄漏）
+  或新增复位未表态都红。抠取器还要认 `x.removeAll()` / `x.reset()` 形态（第一版只认 `x = …`，
+  当场被红抓到）。
+- **⑥ `beat()` 阶段抽取（1048 → 981 行）**：先做**局部变量流分析**找"不依赖 beat 局部量"的块，
+  只抽四个经证明自包含的阶段：`applyPendingLearnReset()`（依赖集**为空**）、`detectPassiveMachine()`、
+  `updateCalibrationState(configMode:passiveMachine:)`（原 `calibrationDue` 不被本拍后续使用，随阶段内化）、
+  `reapMissingFans(presentFanIDs:now:)`。diff 复核确认是**纯代码搬移**、无逻辑改动；`lossNow` 顺手内联。
+  **核心的 317 行"决策+写入"块刻意未动**：它引用 19 个 beat 局部量，80 行的 status 组装块需约 20 个参数
+  ——硬抽只会把 1 个巨型函数拆成 3 个中型函数（正是 `CONTRIBUTING` 警告的形态）。正解是先引入
+  "单拍上下文"值类型，属独立一轮设计工作，本轮的判断是**不做**。
+- **两条"我推翻了自己"（如实记）**：㈠ 上一轮我建议"删掉 `step` 的 dt 默认值"，当时以"~30 处调用点"
+  为由未做——本轮精确计数是 **172 处**（我原本的 grep 计数方法就是错的），但我仍把它做完了，
+  因为**编译期守卫**的收益随调用点数量上升而不是下降。㈡ 我一度把断言门槛设成与实测**相等**
+  （5298/108）——那是自毁：门槛的用途是防"覆盖净损"而非防"任何编辑"，历史惯例是留 6/8 条余量
+  （5230 vs 5236、96 vs 104）。已改回 **5292 / 99**，并把这条判断写进门槛注释的抬升记录。
+- **过程中的一次真实事故（教训）**：用 Python 按**索引切片**改 `TestsEngine.swift` 时，因为
+  `testRescanAsync` 在文件里出现两次（一次是调用点），索引切反，**删掉了 177 行** `testAdversarialFixes`。
+  已 `git checkout` 还原并改用**精确字符串锚点**重做。结论：安全关键仓库里不要用索引算术改文件，
+  用锚点字符串；且改完必须核对 `func` 计数与行数。
+- **门**：`testAIHighEffortEscalation`（窗口/序关系/复位/非 AI nil）、`testDtClampSingleSource`
+  （边界 + 与 LearningGate 的分母一致性 + 15.5/20 不再被截断）、`testWakeResetsCyclingGuardEdge`
+  （反向验证过）、`testWakeSessionResetCoverage`（抠源码双向比对）。
+- **还没做的（如实记）**：① 核心 317 行块与 status 组装块的拆分（需先设计"单拍上下文"值类型）；
+  ② `FanCurveController.smooth` 的 α 与 dt 无关（R71 已量出 τ 随拍距放大 20 倍）——改它等于改全量
+  手感，需开关与回退方案，本轮**只记录不动**；③ App 侧 `aiHighEffort` 的新路径**未做 UI 实测**
+  （未在本机安装/运行 App），只覆盖到逻辑与测试层；④ 发版（commit/tag/push）按作者指示**未执行**，
+  仅把 VERSION/生成常量/RELEASE-NOTES/README 同步到 4.2.36(127)。
+
+## R78（4.2.37(128)）：后台空转哨兵——"我什么都没干，风扇为什么狂转？"
+
+- **选题（作者原话："是什么东西在占用我的电脑 CPU、GPU？为什么我就刷个抖音，风扇转得特别猛？"）**：
+  真机排查。`ps -Ao pcpu` 抓到 `PID 24053 /Volumes/像素蛋糕-…/pixcake.app/.../pix-worker.app/…/crashpad_handler`
+  **277% CPU（≈整机 59%）**、已跑 **26 小时**、内存 0%、`lsof` **零文件**、DMG 已从 /Volumes 消失
+  （用户早弹出了镜像，进程还在）、父进程已死被 launchd 收养、SIGTERM 杀不掉（SIGKILL 才行）。
+  App 本体早就退了，只剩崩溃上报助手在白烧 CPU。处理前后实测：整机 CPU 493%→172%、
+  CPU 70→49.6°C、掌托 47.7→39.7°C、功耗 36.5→19.9W、风扇 4400RPM→**0 转**。
+  **清风本身没做错**：那会儿机器真的热（散热片 87°C、掌托 47.7°C），AI 按 72°C 目标拉高转速
+  是对的。异常的是负载，不是控制器——这也说明"只有温度/风扇"的产品回答不了"谁在吃 CPU"。
+- **为什么不用现成工具**：活动监视器能看到占用，但"占用高"与"在白烧"是两回事
+  （视频导出、编译也占用高）。要的是**取证后给置信度**，不是再给一张榜。
+- **做了什么**：`~/bin/spinwatch`（Python3，零依赖，约 480 行）+ 清风侧消费。
+  哨兵特性：≥150%（可调）+ **连续两次采样都超标**（macOS 的 ps %cpu 是衰减平均值，
+  单帧抖动能读出很高）+ 持续 ≥3 分钟；证据 = 文件句柄数、可执行文件是否还在磁盘、父进程死活；
+  置信度：二进制没了=高，零句柄=中高，有句柄≥5=低（可能正当事）。
+  清风侧：`SMCCore/SpinAlert.swift`（新模型，逐字段防御式解码）+ FanModel 12s 轮询读
+  `~/.spinwatch/alerts.json` + NotificationService 弹带图标的通知 + 面板事件链**首位**一行
+  （带「结束」按钮，二次确认后 kill -9）。
+- **决定：提醒必须走清风，不能 osascript**（作者当场指出 V1 弹窗图标不对）：`display notification`
+  是系统通用通知，图标是 Script Editor、语气和产品不一致。改为哨兵只写文件、清风负责提醒，
+  沿用本项目既有的跨进程旗标模式（reset-learn.flag 是 App→daemon，这次是 哨兵→App）。
+  osascript 弹窗降级为 `--legacy-notify` 逃生门。
+- **两次实测纠错（都是门先红/自己抓到，才改成对的）**：
+  ㈠ 会话复位判断先试**运行期差分**（Mirror 前后快照）想找出漏复位的字段 —— 失败：多数字段在
+  预热门槛下根本没被弄脏，"没复位"与"本来就等于复位值"在差分里同形（假绿），还会把
+  aiController/controller 等**嵌套对象**的状态变化误记成字段复位（假红）。改用**源码抠取**
+  （本项目已有先例：test-root-scripts.sh 按名字从 Config.swift 抠路径常量做跨语言门）。
+  ㈡ 真机测试时哨兵**自己抓到一条误报**：`WallpaperAgent` 90% CPU、孤儿进程。追下去发现是
+  瞬时抽风（0%→59%→0%）——根因是 macOS `ps %cpu` 为衰减平均值，单帧即可越界。
+  于是加"连续 MIN_HITS=2 次采样"闸，并补一条专门回归"瞬时抖动永不告警"。
+- **跨语言契约的门（本技术的核心教训）**：Python 写 JSON、Swift 解 JSON，唯一的契约是键名，
+  而 `JSONDecoder` 对未知键**静默忽略**——Python 侧改个键名，Swift 侧不报错，
+  "句柄数永远读不到"能安静跑几个月。故设双端同源门：CI 用**提交的夹具**（Fixtures/spin-alerts.sample.json）
+  比对键集合；开发机再加严真跑 `spinwatch --emit-fixture` 同场比对（CI 上没有这个脚本，
+  故脚本缺席只降级不判红）。另附垃圾 Codable 池回归：坏元素不拖垮整包（用 nestedUnkeyedContainer
+  逐条解 + AnyJSON 占位跳过）、pid 缺失/负值跳过、超长截 64、越界归 nil、类型错配只丢该字段。
+- **一次"我自己推翻自己"**：V1 默认自己弹系统通知；作者一眼看出图标不对。**细节一致性是质量的一部分**，
+  不留"能用就行"的岔路——所以宁可多写一层文件协议，也要让每条提醒都是同一副面孔。
+- **还没做的（如实记）**：① 单核 100% 空转不触发（默认门槛 150%，放宽会更吵，需用户自选）；
+  ② 哨兵没有"前台 App 豁免"（抖音/视频导出这类正当事会被标成低置信度，需要人盯一眼）；
+  ③ App 未运行时不弹通知（没做"App 不在就退回系统通知"的兜底策略）；
+  ④ 通知没有 action 按钮（现在要点面板里的「结束」，UNNotificationCategory 可做，未做）；
+  ⑤ 未做"哪个 App 该干什么"的白名单（有意不做：白名单本身会被 waste，宁可给证据让人判断）。
+
+## R83（4.2.50(144)）：清风 MCP——"把清风做个 MCP 给我的爱马仕接入"
+
+- **选题（作者原话）**：把清风做成 MCP server，接进本机 Hermes（Nous Research 桌面 agent，
+  仓库汉化词表里那台 Electron App）。目标：AI 助手能直接回答"现在为什么这么吵/烫不烫"，
+  并能安全地代用户切模式/静音/冲刺。
+- **为什么在仓库内做、用 Swift，而不是外挂一个 Python/Node 包装**：清风的一切用户语义
+  （FanConfig 字段、sanitize 钳位、Codable 旧版兼容、664 原子写）都在 SMCCore 里——
+  第二语言实现 = 第二份镜像 = 键名漂移能安静跑几个月（R78 跨语言契约门的同款坑）。
+  故新增 `SMCCore.FanMCP`（协议+工具核心，Hooks 注入全量可测）+ `fanmcp`（stdio 壳层
+  ~50 行），零第三方依赖（MCP stdio 就是换行分隔 JSON-RPC 2.0，不需要 SDK）。
+- **边界是依赖图事实不是注释**：fanmcp 只依赖 SMCCore——SMCDriver（SMC 写通路）与
+  SMCReadout 都不在其依赖图里，结构上碰不到硬件。温度/转速全部转述 daemon 写出的
+  status.json；意图写 config.json 走 saveConfig 同一条 sanitize+原子写纪律，daemon
+  ConfigWatch 下一拍热加载。与 fanprobe 同层的"文件消费者"。
+- **安全语义零新增**：92° 兜底/SSD/电池托底在 daemon 决策管线里，永远高于 MCP 写入的
+  任何意图；静音/冲刺互斥、boost 过期 daemon 视为 auto 交还——全部复用既有机制，
+  MCP 只是 App 面板的另一个入口。AI 目标 >84 直接拒绝（84 是引擎有效目标钳位线，
+  放行会在 88° 释放线下方复刻 v2.6.2 的低转↔全速振荡）。
+- **协议实现的三处小坑（如实记）**：① `Result<_, String>` 不成立——String 不符合
+  Error，自造两个带 .success/.failure 同名 case 的小枚举，调用点零改动；②
+  JSONSerialization 不收 Swift nil 与 NaN/Inf——`opt()` 与 `num()` 双防线把 Optional
+  与非有限值收口成 NSNull，NaN 状态也有回归；③ MCP 2025-06-18 已移除批量数组，
+  收到即 -32600 而不是逐个回。
+- **诊断工具的读管线纪律沿用 4.2.48 教训**：fanprobe --report 先旁路读管线到 EOF、
+  30s 超时从主路径杀进程（先 wait 后读会被满输出顶爆 64KB 管线缓冲互相等死）；
+  路径/参数编译期常量，无注入面。
+- **接入与验证**：`hermes mcp add qingfeng --command …/dist/fanmcp`（8/8 工具启用）→
+  `hermes mcp test qingfeng`：Connected 375ms、8 工具发现；管道端到端：initialize/
+  tools/list/status/stats/config_get/diagnose 对真实数据全部即时返回（diagnose 全报告
+  ~0.1s）。写路径未在真机 config 上实测（不替用户改风扇意图），由 5535 断言中的
+  临时目录全量写回归覆盖。
+- **版本号插曲（诚实记）**：动手时树里 VERSION=4.2.48(142)、notes 却已有 4.2.49 要点行
+  （另一会话在途）——期间 4.2.49(143) 被并行会话实装（装机时间 04:09 可查）。为不与
+  在途号相撞，本特性独立取 **4.2.50(144)**；fanmcpVersion 与 VERSION 的同源门进
+  TestsMCP（TestsReport 手法同款）。
+- 测试 **5535 断言 / 115 组**全绿（MCP 组 +127 断言 +1 组）；契约下限 5319/101 未动；
+  build.sh 增产 dist/fanmcp（无 root 需求，装机落点用户自选）。
+
+## R84（4.2.51(145)）：MCP 发行链闭合——"发出去"才是发布完成
+
+- **选题（BLOCKED 3a 存账）**：R83 把 fanmcp 做完并接进 Hermes，但它只活在"本机 + 仓库
+  dist/"里——CI 的 Release zip 收集步（cp 三件套 + 三个 .sh）、install.sh（fanprobe 有
+  安装行）、upgrade.sh（自我刷新循环只认 upgrade/uninstall 两个脚本）、uninstall.sh
+  （rm 清单）全都不认识 fanmcp。访客下载 Release 装完，MCP 服务器不存在；这违背本轮
+  自己在 R83 写下的承诺"装机落点用户自选"——用户根本无从选起。BLOCKED.md 已把补齐
+  范围预先圈死：ci.yml zip 步骤 + install.sh 安装行 + uninstall.sh 清理行 +
+  test-root-scripts.sh 门禁，本轮照单收口。
+- **装机落点 = /usr/local/bin/fanmcp**（与 fanprobe 同层同模式）：AI 客户端要一个
+  **稳定路径**——Hermes/Claude 的 mcp_servers 配置不该指仓库或解压目录（dist/ 会随
+  每次 build.sh 清空重建，路径一断 MCP 配置就成了死链）。FanMCP 的诊断工具本来就按
+  `/usr/local/bin/fanprobe` 编译期常量找 fanprobe，fanmcp 同层正好配套。缺失时警告
+  跳过（旧 zip 布局兼容，与 fanprobe 同语义；新包有 build.sh 组装门 + CI 冒烟断言
+  兜住，不会静默）。
+- **可执行位自证扩展到二进制**（R40 同族第二段）：原门只查三个 .sh——但用户可见的
+  执行路径里，fanctld/fanprobe/fanmcp 也可能被**直接 exec**（fanprobe --report 是
+  README 教用户手敲的；MCP 客户端 spawn 解压目录里的 fanmcp）。mode 掉了，4876 断言
+  + 门禁 + 构建 + CI 全绿，只有终端一个 permission denied。现 zip 自证对三个二进制
+  逐一查 `^.rwxr-xr-x`。
+- **守卫不加码的地方（诚实记录）**：upgrade.sh 的四哈希复核**不**扩到 fanprobe/fanmcp
+  ——它们由用户态 exec，不在 root 执行代码信任链上（fanprobe 先例）；且扩哈希要动
+  SelfUpgrade.upgradeArguments 签名，装机中的 4.2.50 App 传 7 参会被 fail-closed 门
+  拒掉，等于把"装不到 fanmcp"换成"一键升级全断"。install 走 `install -m 755` 显式
+  定 mode，不依赖源文件权限位。
+- **文档对齐**：README 的 target 数停在 R81 拆分前的"5 个"（实际 8 个）整整三轮；
+  源码树缺 Driver//Readout/ 两子目标与 SpinAlert/SpinKillGuard/ProcessIdentity/
+  RampMonitor/TrendCurve/DiagnosticReport 六个文件——本轮一并补齐；架构地图依赖图
+  补 fanmcp（"文件消费者"层，依赖图里无 Driver/Readout）。
+- 测试 **5535 断言 / 115 组**全绿（Swift 侧零改动——发行链闭合是脚本/CI/文档轮，
+  唯一 Swift 改动是 fanmcpVersion 常量随 VERSION 同步）；root 脚本门禁 66 → **72**；
+  契约下限 5319/101 未动。

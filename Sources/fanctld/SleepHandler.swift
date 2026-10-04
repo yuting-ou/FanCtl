@@ -30,6 +30,30 @@ func makeSleepCallback() -> IOServiceInterestCallback {
     }
 }
 
+
+// MARK: - 熄屏判定（R82 续十一：夜间自添火治理）
+//
+// powerd 在屏幕亮着时持有 "Prevent sleep while display is on" 断言；该断言消失 =
+// 熄屏（或合盖）。系统醒着但熄屏（远程工具阻止休眠/挂机）时，我们的分项功耗
+// 采样（powermetrics，采样瞬间 ~85% 单核）纯属夜间添火 → 采样间隔拉到 60s 地板。
+// 读不到断言时按亮屏处理（宁多采样不少采样，行为保守）。
+func isDisplayAsleep() -> Bool {
+    var unmanaged: Unmanaged<CFDictionary>? = nil
+    guard IOPMCopyAssertionsByProcess(&unmanaged) == kIOReturnSuccess,
+          let dict = unmanaged?.takeRetainedValue() as? [AnyHashable: Any] else {
+        return false
+    }
+    for (_, value) in dict {
+        guard let arr = value as? [[String: Any]] else { continue }
+        for d in arr where (d["AssertType"] as? String ?? "").contains("Prevent") {
+            if (d["AssertName"] as? String ?? "").contains("display is on") {
+                return false   // powerd 的亮屏断言在场 = 屏幕亮着
+            }
+        }
+    }
+    return true
+}
+
 func registerSleepNotification() {
     rootPowerPort = IORegisterForSystemPower(nil, &powerNotifyPort, makeSleepCallback(), &powerNotifier)
     if rootPowerPort != 0, let port = powerNotifyPort {

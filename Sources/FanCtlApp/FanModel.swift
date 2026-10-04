@@ -89,6 +89,13 @@ final class FanModel: ObservableObject {
     @Published var components: [ComponentTempDisplay] = []
     @Published var currentLoopInterval: Double? = nil
     @Published var topProcesses: [ProcessUsage] = []   // 高占用进程榜（"占用" tab，仅面板可见时采样）
+    // R82 续十：风扇加速归因——AI 输出持续高位/急升时自动采样"当时谁在吃机器"，
+    // 面板风扇卡显示一行答案，用户不必再来问"什么东西在占用"。触发判定在
+    // SMCCore.RampMonitor（纯逻辑有测试）；这里只做接线与采样。
+    @Published var rampAttribution: String? = nil
+    @Published var rampAttributionAt: Date? = nil
+    private var rampBeats = 0
+    private var rampSamplingInFlight = false
     // daemon 实际执行模式（status.json 单一数据源）与 App 写入意图的对账：
     // 配置写入失败/权限异常时 UI 显示的模式与实际执行不一致，据此展示警示
     @Published var daemonMode: FanMode? = nil
@@ -103,10 +110,17 @@ final class FanModel: ObservableObject {
     @Published var envTemp: Double? = nil      // 环境温度代理（status 下发，展示用）
     @Published var envTempOverride: Double? = nil  // 环境温度手动覆盖（nil=自动代理）
     @Published var aiTargetEffective: Double? = nil  // daemon 实际生效的 AI 目标（环境/夜间/电池叠加后）
-    @Published var aiHighEffort: Bool = false      // AI 正在全力散热（满速 ≥20s 且高于目标+2°）
+    @Published var aiHighEffort: Bool = false      // R77：AI 正在全力散热（daemon 判定下发，App 只读展示）
     @Published var aiRecommendedTarget: Double? = nil  // AI 首次进入时基于基线温度推荐的目标
     @Published var hardwareProfile: HardwareProfile? = nil  // 4.0 B1：冷却能力分级展示（fanCount=0 → passive 提示）
     @Published var calibrating = false        // 4.0 B2：AI 校准观察期（status 下发，AI 卡提示行）
+    // R78：后台空转告警。由独立哨兵脚本 spinwatch（~/bin/spinwatch）发现并写
+    // ~/.spinwatch/alerts.json，清风读它、用**自己的图标**弹通知 —— 不让脚本用
+    // osascript 弹系统通用通知（那图标是 Script Editor，与产品不一致）。
+    @Published var spinAlerts: [SpinAlert] = []
+
+    private var notifiedSpinPids: Set<Int> = []   // 已就此 pid 发过通知（进程消失才允许再发）
+    private var lastSpinReportAt: Date? = nil     // 哨兵最近一次成功写文件的时间（诊断"哨兵还在跑吗"）
 
     // 4.1.2（R21）：菜单栏标签单独订阅的量化状态（MenuBarState.swift）——本对象每次
     // status 拍都全对象 objectWillChange，标签若继续观察整模型就仍每拍重渲。
@@ -166,6 +180,30 @@ final class FanModel: ObservableObject {
     @MainActor private var psSamplingInFlight = false
     @MainActor private var psSamplingSince = Date.distantPast
 
+    /// R82 续十：每拍拍驱动——AI/曲线输出持续 ≥60% 或单拍急升时，触发一次
+    /// "加速归因"采样（冷却 10 分钟防刷屏）。判定在 SMCCore.RampMonitor（有测试）；
+    /// 采样复用 sampleCPUUsage（ps 子进程，utility 队列，不占协作池）。
+    @MainActor private func noteAppliedBeat(applied: Double, prev: Double) {
+        let steep = RampMonitor.isSteepRise(applied: applied, prev: prev)
+        rampBeats = RampMonitor.beat(applied: applied, beats: rampBeats)
+        guard RampMonitor.shouldTrigger(beats: rampBeats, steep: steep,
+                                        lastAttributionAt: rampAttributionAt, now: Date()) else { return }
+        rampBeats = 0
+        rampAttributionAt = Date()
+        guard !rampSamplingInFlight else { return }
+        rampSamplingInFlight = true
+        let owner = self
+        DispatchQueue.global(qos: .utility).async {
+            let top = NotificationService.sampleCPUUsage(limit: 3, minCPU: 5)
+            DispatchQueue.main.async {
+                owner.rampSamplingInFlight = false
+                if let line = RampMonitor.line(top.map { (app: $0.id, cpu: $0.cpu) }) {
+                    owner.rampAttribution = line
+                }
+            }
+        }
+    }
+
     @MainActor private func sampleTopProcesses() {
         if psSamplingInFlight,
            Date().timeIntervalSince(psSamplingSince) < 4 {
@@ -184,7 +222,6 @@ final class FanModel: ObservableObject {
         }
     }
     private var historyBuffer = RingBuffer<TempSample>(capacity: 200)
-    private var aiHighEffortSince: Date? = nil    // AI 满速开始时间（#12 预提示）
     private var aiBaselineTemps: [Double] = []    // AI 模式进入后前 30s 温度采样（#4 推荐）
     private var aiModeEnteredAt: Date? = nil      // 进入 AI 模式的时间
     @Published var stats: DailyStats? = nil
@@ -422,6 +459,7 @@ final class FanModel: ObservableObject {
         let fallback = Timer.scheduledTimer(withTimeInterval: 12.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.checkStatusFreshness()
+                self?.refreshSpinAlerts()
             }
         }
         fallback.tolerance = 3.0
@@ -592,6 +630,7 @@ final class FanModel: ObservableObject {
                 controlFault = false
                 faultReason = nil
                 targetUnreachable = false
+                aiHighEffort = false
                 curveTargetPercent = nil
                 components = []
                 learnedNow = nil
@@ -616,6 +655,7 @@ final class FanModel: ObservableObject {
                     controlFault = false
                     faultReason = nil
                     targetUnreachable = false
+                    aiHighEffort = false
                     curveTargetPercent = nil
                     components = []
                     learnedNow = nil
@@ -650,6 +690,7 @@ final class FanModel: ObservableObject {
                 controlFault = false
                 faultReason = nil
                 targetUnreachable = false
+                aiHighEffort = false
                 curveTargetPercent = nil
                 daemonMode = nil
                 configMismatch = false
@@ -666,6 +707,7 @@ final class FanModel: ObservableObject {
             controlFault = false
             faultReason = nil
             targetUnreachable = false
+            aiHighEffort = false
             curveTargetPercent = nil
             daemonMode = nil
             configMismatch = false
@@ -688,6 +730,7 @@ final class FanModel: ObservableObject {
                               glitchHold: &glitchHoldGPU, zeroHold: &zeroHoldGPU)
 
         let changed = Int(max(newCpu, newGpu)) != Int(max(cpuTemp, gpuTemp))
+        let prevApplied = self.appliedPercent   // R82 续十：急升判定要用旧值
         let assign = {
             self.cpuTemp = newCpu
             self.cpuAverageTemp = sensors.cpuAverage.flatMap { $0.isFinite && $0 > 0 && $0 < 150 ? $0 : nil }
@@ -697,6 +740,7 @@ final class FanModel: ObservableObject {
             self.appliedPercent = (status.appliedPercent.isFinite
                 ? max(0, min(100, status.appliedPercent)) : 0)   // 钳位防 Int() trap
             self.appliedPercents = status.appliedPercents?.map { $0.isFinite ? $0 : 0 } ?? [self.appliedPercent]
+            self.noteAppliedBeat(applied: self.appliedPercent, prev: prevApplied)
             self.onBattery = status.onBattery ?? false
             self.batteryOverride = status.batteryOverride ?? false
             self.nightOverride = status.nightOverride ?? false
@@ -720,6 +764,11 @@ final class FanModel: ObservableObject {
             }
             self.decisionTrace = status.decisionTrace?.sanitized()
             self.targetUnreachable = status.targetUnreachable ?? false
+            // R77：#12「AI 全力散热」由 daemon 判定下发（status.aiHighEffort），App 不再
+            // 自己按时长重算——此前计时器活在 UI 进程里，面板重建即归零，"持续 20s"测不准，
+            // 且阈值与 daemon 分叉，违反"App 展示一律读 status.json、不得重算控制语义"。
+            // 旧 daemon 无此字段 → nil → false（不显示该提示，退回只有 targetUnreachable 的行为）
+            self.aiHighEffort = status.aiHighEffort ?? false
             if let pts = status.learnedPoints { self.learnedPoints = pts }
             self.currentLoopInterval = status.loopInterval
             self.controlFault = status.controlFault ?? false
@@ -734,19 +783,6 @@ final class FanModel: ObservableObject {
             withAnimation(.snappy(duration: 0.25)) { assign() }
         } else {
             assign()
-        }
-
-        // #12: AI 全力散热预提示：满速 ≥20s 且温度高于目标+2°C。
-        // 判据用 daemon 下发的有效目标（环境/夜间/电池叠加后）——用用户原始目标会在
-        // 夏天/夜间/电池场景产生假阳性（实际 AI 在其有效目标附近从容工作）
-        let effAITarget = aiTargetEffective ?? aiTargetTemp
-        if mode == .ai && appliedPercent >= 99 && max(cpuTemp, gpuTemp) > effAITarget + 2
-           && !targetUnreachable {
-            if aiHighEffortSince == nil { aiHighEffortSince = Date() }
-            if Date().timeIntervalSince(aiHighEffortSince!) >= 20 { aiHighEffort = true }
-        } else {
-            aiHighEffortSince = nil
-            aiHighEffort = false
         }
 
         // #4: AI 目标推荐：首次进入 AI 且无学习数据时采样 30s 基线温度
@@ -884,20 +920,86 @@ final class FanModel: ObservableObject {
         refreshThermalHealth()
     }
 
+    // 部件行的坏读数防御（R82 续七）：与主卡同源的 deglitch——status.json 原子写瞬间
+    // 个别读会截断（实测 cpuDie 8.4° vs 环境 30.5° 的坏读曾连发 45 拍），主卡有防、
+    // 最热列表没有 → 同份数据两个视图两种防线。逐部件独立计数（deglitchTemperature
+    // 的参数化惯例），复用 SMCCore 同一份纯函数。状态在行消失时清零。
+    private var hotspotHolds: [String: (glitch: Int, zero: Int, prev: Double)] = [:]
+
     private func syncPanelDataFromSensors(_ sensors: SensorReadings) {
-        // 组装部件温度列表（无效读数 ≤1 不显示，传感器失效时不展示 0° 行）
+        // 组装部件温度列表：坏读数经 deglitch（≤1 或骤降>30° 挡 3 拍），仍无效则该行
+        // 消失（原语义：传感器失效时不展示 0° 行）
         var comps: [ComponentTempDisplay] = []
-        if sensors.cpuDie > 1 { comps.append(ComponentTempDisplay(id: "CPU", temp: sanitizeTemp(sensors.cpuDie))) }
-        if sensors.gpuDie > 1 { comps.append(ComponentTempDisplay(id: "GPU", temp: sanitizeTemp(sensors.gpuDie))) }
-        if let ssd = sensors.ssd, ssd > 1 { comps.append(ComponentTempDisplay(id: "SSD", temp: sanitizeTemp(ssd))) }
-        if let palm = sensors.palmRest, palm > 1 { comps.append(ComponentTempDisplay(id: "掌托", temp: sanitizeTemp(palm))) }
-        if let hs = sensors.heatsink, hs > 1 { comps.append(ComponentTempDisplay(id: "散热片", temp: sanitizeTemp(hs))) }
+        func add(_ id: String, _ raw: Double?) {
+            guard let raw, raw.isFinite else { hotspotHolds[id] = nil; return }
+            var g = hotspotHolds[id] ?? (0, 0, raw)
+            let shown = deglitchTemperature(sanitizeTemp(raw), prev: g.prev,
+                                            glitchHold: &g.glitch, zeroHold: &g.zero)
+            guard shown > 1 else { hotspotHolds[id] = nil; return }
+            hotspotHolds[id] = (g.glitch, g.zero, shown)
+            comps.append(ComponentTempDisplay(id: id, temp: shown))
+        }
+        add("CPU", sensors.cpuDie)
+        add("GPU", sensors.gpuDie)
+        add("SSD", sensors.ssd)
+        add("掌托", sensors.palmRest)
+        add("散热片", sensors.heatsink)
         components = comps.sorted { $0.temp > $1.temp }
     }
 
+    // MARK: - 后台空转哨兵（R78，spinwatch → alerts.json → 清风通知）
+
+    /// 读 spinwatch 写的告警文件：更新面板数据 + 对**新出现**的 pid 发一次清风通知。
+    ///
+    /// 为什么轮询而不是DispatchSource：告警文件是"哨兵觉得有事才写、没事就写空数组"的
+    /// 低频文件，哨兵本身 2 分钟才扫一次；为它单独引入 fd 监控（还要处理文件被 rename/
+    /// 原子写替换后的重建）性价比极低。复用已有的 12s 兜底轮询即可，代价是一次小 JSON 读。
+    @MainActor func refreshSpinAlerts() {
+        guard let report = SpinAlertsPath.load() else {
+            // 文件读不到：可能是哨兵从未跑过（没装/没启动），也可能是瞬时读失败。
+            // 保留上一次的告警不清空 —— 正有事时因为一次读失败让面板上的证据消失更糟。
+            return
+        }
+        lastSpinReportAt = report.updatedAt ?? Date()
+        spinAlerts = report.alerts
+
+        guard !report.alerts.isEmpty else {
+            // 哨兵明确说"这会儿没事"：清掉已通知记忆，下次同一 pid 再现要重新提醒
+            notifiedSpinPids.removeAll()
+            return
+        }
+
+        let fresh = report.alerts.filter { !notifiedSpinPids.contains($0.pid) }
+        if !fresh.isEmpty {
+            notifiedSpinPids.formUnion(fresh.map(\.pid))
+            for a in fresh { notifications.notifySpinner(a) }
+        }
+    }
+
+    /// 这条告警现在是否可安全结束（决定面板「结束」按钮可用性与提示）。
+    /// R81：判据是"告警带的进程实例标识能否与内核当前事实对上"，不是"有没有 pid"。
+    @MainActor func canKillSpin(_ alert: SpinAlert) -> Bool { SpinKillGuard.canKill(alert) }
+
+    /// 不可结束时的原因（可结束则 nil）。UI 用它写提示，不自己猜判据。
+    @MainActor func killSpinDenial(_ alert: SpinAlert) -> KillDenial? {
+        if case .failure(let d) = SpinKillGuard.verify(alert: alert) { return d }
+        return nil
+    }
+
+    /// 结束某个空转进程。**发信号前必须过 SpinKillGuard 的进程实例核验**：
+    /// 告警缺标识、进程已退出、pid 被复用、uid/可执行路径对不上 → 一律不发信号，
+    /// 把拒绝原因原样交回 UI 说给用户。只对用户自己的进程有效（无需特权）。
+    @MainActor func killSpin(_ alert: SpinAlert) -> Result<ProcessInstance, KillDenial> {
+        let outcome = SpinKillGuard.execute(alert: alert)
+        if case .success = outcome {
+            spinAlerts.removeAll { $0.pid == alert.pid }
+            notifiedSpinPids.remove(alert.pid)
+        }
+        return outcome
+    }
+
     // 从磁盘同步配置（外部修改时）
-    private func syncConfigFromDisk() {
-        guard let mtime = ConfigStore.configModificationDate(), mtime != lastSeenConfigMTime else { return }
+    private func syncConfigFromDisk() {        guard let mtime = ConfigStore.configModificationDate(), mtime != lastSeenConfigMTime else { return }
         lastSeenConfigMTime = mtime
         // 自己写入的回声直接忽略（App 是唯一写入方，外部修改立即可见）
         if mtime == lastOwnConfigMTime { return }

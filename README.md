@@ -40,6 +40,26 @@ sudo ./uninstall.sh
 sudo /usr/local/libexec/fanctl-uninstall.sh
 ```
 
+## AI 助手接入（MCP，可选）
+
+`dist/fanmcp` 是一个本地 MCP（Model Context Protocol）stdio 服务器：AI 客户端可直接查询
+清风状态（温度/转速/"转速由谁决定"）并代用户切模式、设 AI 目标、开会议静音、冲刺全速、
+查战报、出诊断报告——共 8 个工具。**只碰 status/config 文件，不碰 SMC**；安全红线
+（92° 兜底 / SSD·电池托底）在 daemon 里，永远高于 AI 写入的任何意图。
+
+```bash
+# Hermes：官方 CLI 一条命令（自动发现 8 个工具）
+hermes mcp add qingfeng --command /path/to/风扇管理/dist/fanmcp
+hermes mcp test qingfeng
+
+# 通用 MCP 客户端（Claude Desktop 等）：stdio 命令指向同一二进制即可
+# { "command": "/path/to/风扇管理/dist/fanmcp" }
+```
+
+`sudo ./install.sh` 会把 fanmcp 一并装到 **`/usr/local/bin/fanmcp`**（4.2.51 起，与
+fanprobe 同批装卸、卸载一并清理）——装过的机器客户端直接指这个稳定路径即可，不必指
+仓库或解压目录。
+
 ---
 
 ## 1. 项目是什么
@@ -90,11 +110,11 @@ sudo /usr/local/libexec/fanctl-uninstall.sh
 ## 3. 源码结构
 
 ```
-Package.swift           5 个 target(无第三方依赖)
+Package.swift           8 个 target(无第三方依赖)
 Sources/
-├── SMCCore/            核心库(纯逻辑,无 UI,可测试)
-│   ├── SMC.swift           AppleSMC IOKit 通信层(SMCIO 协议抽象,测试用 MockSMC 注入)
-│   ├── Fans.swift          FanController(读写/强制/交还) + TemperatureSensors(热点追踪/分类) + 健康检测
+├── SMCCore/            核心库(纯逻辑,无 UI,可测试;**不含 IOKit**)
+│   ├── SMC.swift           SMC 通信抽象(SMCIO 协议与值类型——读写连接分居 Driver/Readout 子目标,测试用 MockSMC 注入)
+│   ├── Fans.swift          FanReadout(只读)与 FanReading/FanActuating 读写协议 + TemperatureSensors(热点追踪/分类) + 健康检测
 │   ├── ControlEngine.swift 控制主循环编排(读温→决策→写扇→持久化→校准/故障/唤醒状态机)
 │   ├── Config.swift        数据模型:FanConfig/CurvePreset/DaemonStatus/DailyStats/ControlReason/DecisionTrace + ConfigStore 持久化
 │   ├── ControlMetrics.swift AI 控制质量评测 + D 项 dt 账本(DTLedgerState)
@@ -110,7 +130,16 @@ Sources/
 │   ├── HardwareProfile.swift 机型/传感器画像采集与分级
 │   ├── SelfUpgrade.swift   一键升级纯决策(tag 消毒/暂存包校验门/sha256,可单测)
 │   ├── VersionCheck.swift  版本比较(tag vs 本地)
+│   ├── FanMCP.swift        MCP 服务器核心(8 工具:状态/配置/模式/AI目标/静音/冲刺/战报/诊断;Hooks 注入可测)
+│   ├── DiagnosticReport.swift 诊断包渲染纯函数(fanprobe --report 的 19 小节,缺数据出声不省略)
+│   ├── ProcessIdentity.swift  进程中文辨识(词表+bundle 本地化表,占用榜/通知/面板用)
+│   ├── SpinAlert.swift        空转告警数据模型(spinwatch alerts.json 跨语言契约,R78 同源门)
+│   ├── SpinKillGuard.swift    结束空转进程的实例核验守卫(pid 复用/uid/路径,核验不过不触碰信号)
+│   ├── RampMonitor.swift      风扇加速归因(输出急升监视→采前 3 名占用,旁路观察不反作用控制)
+│   ├── TrendCurve.swift       趋势图上屏前整理(剔不可信读数+轻度平滑)
 │   └── AliveDebouncer.swift 守护进程存活去抖(App 侧判 daemon 在线)
+├── SMCCore/Driver/     SMCDriver 子目标(R81 依赖边界):IOKit 读写连接 + FanController 写实现——依赖图里只有 fanctld 与测试
+├── SMCCore/Readout/    SMCReadout 子目标(R81 依赖边界):IOKit 只读连接,整个模块无写原语——只有 fanprobe 依赖它
 ├── fanctld/            root 守护进程
 │   ├── main.swift          启动/主循环/信号处理/看门狗/故障恢复
 │   ├── ConfigWatch.swift   config.json 文件监控(DispatchSource)
@@ -121,9 +150,10 @@ Sources/
 │                       GaugeViews/MonitorViews/MenuBarState/FanControlActions/
 │                       NotificationService/SelfUpgradeService)
 ├── fanprobe/main.swift 只读诊断工具(无需 root;--report 出可粘贴诊断包)
+├── fanmcp/main.swift   MCP 服务器入口(stdio;协议核心在 SMCCore.FanMCP,接 AI 助手用)
 └── fanctltests/        纯逻辑测试(自带断言 harness;断言数见顶部 tests 徽章)
 scripts/                 build.sh / install.sh / deploy.sh / uninstall.sh / upgrade.sh
-dist/                    构建产物(FanCtl.app + fanctld)
+dist/                    构建产物(FanCtl.app + fanctld + fanprobe + fanmcp)
 ```
 
 ## 4. 控制逻辑(核心)
@@ -198,6 +228,7 @@ sudo /usr/local/libexec/fanctl-uninstall.sh
 # 诊断(只读)
 swift run -c release --disable-sandbox fanprobe
 swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行数诊断包,issue 直接粘
+swift run -c release --disable-sandbox fanprobe --zh-scan  # 进程名汉化覆盖度体检,列出翻不出中文的进程/App(4.2.40+)
 ```
 
 日志:`/Library/Logs/FanCtl/fanctld.log`(512KB 轮转)。UI 快照验证:`FanCtlApp --snapshot [curve|auto|manual|ai|hotspots|today|custom|label] [dark] [warn|lens|boost|dead]` 渲染 PNG 到 /tmp（模式取 FanMode 原值 + 附加视图；dark 深色、warn/lens/boost/dead 为排版/状态开关）。
@@ -224,6 +255,38 @@ swift run -c release --disable-sandbox fanprobe --report   # 19 小节固定行�
 > 里面的代码不是信任根；从 4.1.x 升上来的机器需要**先手动装一次**
 > `sudo ./install.sh`（或下载 Release 包后 `sudo ./install.sh`），此后 App 内一键升级自动刷新该脚本。
 
+- **后台空转哨兵 spinwatch（4.2.37）—— App 退了、助手还在白烧 CPU，现在有人告诉我了**：
+  起因是真事：用户刷抖音风扇狂转，查下来是「像素蛋糕」的 `crashpad_handler` 死循环空转
+  **26 小时、277% CPU（整机 59%）**，不写文件、DMG 已卸载、SIGTERM 杀不掉，而用户毫无察觉。
+  新增 `~/bin/spinwatch`（Python3 零依赖）：每 2 分钟巡检"持续高 CPU **且**无工作迹象"
+  （≥150%、连续两次超标、≥3 分钟），并取证（句柄数/二进制在不在/父进程死活）给置信度。
+  **提醒走清风不走 osascript**——后者的图标是 Script Editor，与产品不一致；故哨兵只写
+  `alerts.json`，清风用 UNUserNotification 弹**带 App 图标**的通知，面板事件链首位加一行
+  带「结束」按钮（二次确认后 kill -9）。跨语言 JSON 契约有**双端同源门**守着
+  （JSONDecoder 静默忽略未知键，键名漂移能安静跑几个月）。
+  实测纠错两处已回归：WallpaperAgent 单帧 59%CPU 的误报（ps %cpu 是衰减平均）→ 加"连续两次"闸。
+  测试 **5325 断言 / 109 组**；契约门槛双源 5319。
+  - **架构轮 R77（4.2.36）——把"靠约定正确"改成"结构上不容易错"，零新增功能**：
+  ① **App 不再重算控制语义**（真实违规）：面板"AI 正在全力散热"黄提示原由 App 自维护 `Date` 计时器
+  判"满速 ≥99%/+2° 持续 20s"——计时器活在 UI 进程里（面板重建即归零，"持续 20s"测不准），阈值还与
+  daemon 的 `targetUnreachable`（≥98%/+4°）分叉。现由 daemon 判定并随 status.json 下发 `aiHighEffort`，
+  App 只读；旧 daemon 无此字段 → nil → 不显示（不造假）。**序关系有测试钉死**：20s 必须先于 60s 的
+  UNREACH 出现，否则 UI「黄 → 黄+感叹号」升级链跳级。
+  ② **唤醒假日志（真实缺陷）**：`wake()` 手工复位 25 个字段时漏了 `aiCyclingGuardActive`
+  ——它是启停抑制的**边沿记忆**，而 `aiController.reset()` 已把 `cyclingGuardArmed` 清成 false，
+  于是醒来第一拍打出"抑制解除"假日志、时长取自被清零的 `currentGuardSeconds` → "解除 0 分钟"。
+  **验证方式是撤掉修复看它变红**，不是只看变绿。
+  ③ **dt 钳位三处静默分叉**：引擎 20s、`LearningGate` 20s、`FanAIController` **15s**——idle 长拍下
+  AI 的 P/D 增量与同拍学习门/统计口径差 25%（`FanControlLaw` 注释早论证过 15 的害处，只是没同步到
+  AI 侧）。现收敛为 `FanDt` 单一定义 + 同源门。
+  ④ **`step(dt:)` 默认值移除**：`dt: Double = 3.0` 让"漏传"静默按标称拍结算。全仓 172 处显式化
+  （全在测试侧；生产唯一调用点早已传 `actualInterval`）。移除后**编译器就是守卫**——再漏传是编译错误。
+  ⑤ **会话复位覆盖门**：从源码抠出 `wake()` 实际赋值清单，与语义清单**双向**比对——漏复位或新增
+  复位未表态都会红，防同类回潮。
+  ⑥ **`beat()` 阶段抽取 1048 → 981 行**：只抽经局部变量流分析证明*自包含*的四个阶段；核心的 317 行
+  "决策+写入"块**刻意未动**（引用 19 个 beat 局部量，硬抽只会拆成 3 个中型函数，正解是先引入
+  "单拍上下文"值类型）。
+  测试 **5236 → 5298 断言 / 104 → 108 组**；契约门槛双源 5230 → 5292（沿用 6 条漂移余量）。
 - **特权信任根（批次 A）**：App 只 exec 经校验的 root 路径脚本——exec 前 `lstat` 判定
   "常规文件 + 属主 root + 组/其他无写位"，不合规即拒绝提权（**不回退**包内副本或内嵌正文）。
   `install.sh`/`upgrade.sh` 各自装目录信任门：`/usr/local` 与 `libexec` 若为用户可写

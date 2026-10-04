@@ -15,7 +15,10 @@ nonisolated(unsafe) var snapshotPlainCards = false
 
 @main
 struct FanCtlApp: App {
-    @StateObject private var model = FanModel()
+    @StateObject private var model: FanModel
+    // R80：系统对 UNUserNotificationCenter.delegate 是**弱引用**。不在这儿持强的话
+    // delegate 出 init 即释放，表现为"分类注册了、按钮也在，点了永远不回调"。
+    private let spinDelegate: SpinActionDelegate?
 
     init() {
         // v3.4.5（4D）：卸载入口——SMAppService 登录项在 App 被删除后无法反注册
@@ -45,13 +48,16 @@ struct FanCtlApp: App {
                 return FanModel.TempSample(id: now.addingTimeInterval(offset), cpu: cpu, gpu: gpu)
             }
             model.systemPower = 38          // 预览功耗胶囊
+            // R82 续十：风扇卡「加速归因」行预览（真数据快照验证用）
+            model.rampAttribution = "抖音（渲染进程） 94% · 聚焦索引 48% · ZCode（图形进程） 37%"
+            model.rampAttributionAt = Date()
             model.controlReason = .curve    // 预览决策可解释行
             model.daemonAlive = true        // 快照下无真实 daemon，手动置真以渲染决策行
             // 预览今日战报磁贴
             var demoStats = DailyStats(date: DailyStats.today())
             demoStats.maxTemp = 91; demoStats.maxTempAt = now
             demoStats.tempSum = 62 * 1200; demoStats.tempCount = 1200
-            demoStats.highTempSeconds = 540; demoStats.revolutions = 128000
+            demoStats.highTempSeconds = 4500; demoStats.revolutions = 128000
             model.stats = demoStats
             // 可选指定模式预览：--snapshot auto|curve|manual（仅渲染，不写配置）
             // v2.6.2：先处理子视图快照分支（custom 会被 FanMode(rawValue:) 劫持成 .custom 模式，
@@ -73,7 +79,7 @@ struct FanCtlApp: App {
             if CommandLine.arguments.contains("boost") { model.boostEndDate = now.addingTimeInterval(900) }
             // 排版实测用：--snapshot dead <mode> 预览 daemon 挂态（双标签同现最坏情况）
             if CommandLine.arguments.contains("dead") { model.daemonAlive = false }
-            if lastArg == "hotspots" || lastArg == "today" || lastArg == "custom" || lastArg == "label" {
+            if lastArg == "hotspots" || lastArg == "today" || lastArg == "usage" || lastArg == "custom" || lastArg == "label" {
                 renderStandaloneViews(lastArg)
                 exit(0)
             }
@@ -113,6 +119,21 @@ struct FanCtlApp: App {
                     renderStandalone(TodayStatsView(stats: model.stats)
                                         .frame(height: MonitorStyle.height, alignment: .top),
                                      to: "/tmp/fanctl-snapshot-today.png")
+                case "usage":
+                    // R82 续六：占用页此前是唯一没有独立快照的监控 tab——5 行紧凑排版 +
+                    // 中文进程名 + 满格能量条只能靠真机肉眼验收。补上演示数据
+                    // （混合长名/短名/高占用饱和，覆盖排版最坏情况）。
+                    model.topProcesses = [
+                        FanModel.ProcessUsage(id: "抖音（渲染进程）", app: "抖音", cpu: 94.6),
+                        FanModel.ProcessUsage(id: "功耗度量工具", app: "功耗度量工具", cpu: 48.7),
+                        FanModel.ProcessUsage(id: "ZCode（图形进程）", app: "ZCode", cpu: 37.0),
+                        FanModel.ProcessUsage(id: "网易云音乐（渲染进程）", app: "网易云音乐", cpu: 25.1),
+                        FanModel.ProcessUsage(id: "谷歌浏览器", app: "谷歌浏览器", cpu: 17.7),
+                    ]
+                    model.gpuTemp = 63
+                    renderStandalone(ProcessHogView(processes: model.topProcesses, gpuTemp: model.gpuTemp)
+                                        .frame(height: MonitorStyle.height, alignment: .top),
+                                     to: "/tmp/fanctl-snapshot-usage.png")
                 case "custom":
                     renderStandalone(EditableCurveChart(points: model.customPoints,
                                                         currentTemp: max(model.cpuTemp, model.gpuTemp),
@@ -168,6 +189,20 @@ struct FanCtlApp: App {
             }
             exit(0)
         }
+
+        // R80：常驻启动路径才建模型并接通知动作。显式赋值 _model（不在 init 里读
+        // @StateObject 的 wrappedValue——那里可能拿到另一个实例，杀进程会打到空模型上）。
+        let m = FanModel()
+        _model = StateObject(wrappedValue: m)
+        if NotificationService.canNotifyBundled {
+            let d = SpinActionDelegate(model: m)
+            spinDelegate = d
+            // 系统对 delegate 是弱引用：不存进 self 就当场释放，按钮点了没回调
+            UNUserNotificationCenter.current().delegate = d
+            NotificationService.registerCategories()   // 幂等，重复启动不会堆分类
+        } else {
+            spinDelegate = nil   // 非 bundle 环境（swift run）发不出通知，也不碰 UNUserNotificationCenter
+        }
     }
 
     var body: some Scene {
@@ -177,6 +212,59 @@ struct FanCtlApp: App {
             MenuBarLabel(state: model.menuBar)
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+// MARK: - R80 通知动作回调（立即结束 / 忽略）
+
+/// 空转告警通知的按钮回调。通知侧**只有这条路径**会杀进程：action 带
+/// `.authenticationRequired`，系统先要 Touch ID/密码才把 response 交下来，
+/// 等价于面板侧 `confirmKillSpin` 的二次确认；除此以外任何地方都不自动杀。
+final class SpinActionDelegate: NSObject, UNUserNotificationCenterDelegate {
+    private let model: FanModel
+
+    init(model: FanModel) {
+        self.model = model
+    }
+
+    /// 挂上 delegate 后，App 处于活跃态时系统不再自行展示通知。这里显式给回
+    /// 挂接前的可见行为（横幅+声音），否则过热/风扇健康通知会静默回归。
+    /// 参数类型照 SDK 头 `willPresentNotification:(UNNotification *)` 写；写成
+    /// `UNNotificationRequest` 会"近似匹配"而根本不成为实现（编译器只给 warning）。
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    /// 分支用的三个字符串（分类 id / 动作 id / userInfo 键）全部取
+    /// `NotificationService` 的常量，与注册处同源，不在这里重打一遍。
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        defer { completionHandler() }
+        let content = response.notification.request.content
+        guard content.categoryIdentifier == NotificationService.spinCategory else { return }
+        switch response.actionIdentifier {
+        case NotificationService.spinKillAction:
+            // R81：新注册的分类里已经没有这个动作，但通知中心会保留旧版分类，
+            // 所以仍可能收到。**一律交守卫复核**：核不过就不发信号，并把原因说给用户。
+            guard let pid = content.userInfo[NotificationService.spinPidKey] as? Int else { return }
+            let alert = SpinAlert(
+                pid: pid, name: "pid \(pid)",
+                exe: content.userInfo[NotificationService.spinExeKey] as? String,
+                startSeconds: content.userInfo[NotificationService.spinStartKey] as? Double,
+                uid: content.userInfo[NotificationService.spinUidKey] as? Int)
+            Task { @MainActor in
+                if case .failure(let denial) = model.killSpin(alert) {
+                    NotificationService.explainKillDenied(pid: pid, denial: denial)
+                }
+            }
+        case NotificationService.spinIgnoreAction:
+            break   // 忽略=什么都不做，进程继续跑
+        default:
+            break   // 点通知本体/关闭（default、dismiss）一律不动进程
+        }
     }
 }
 

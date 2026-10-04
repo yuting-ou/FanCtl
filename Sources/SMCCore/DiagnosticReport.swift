@@ -195,16 +195,18 @@ public enum DiagnosticReport {
             + " · 曲线期望 " + n(s?.curveTargetPercent, "%.0f") + "%"
             + " · 体感补偿 " + n(s?.palmComp) + "°"
             + " · 冷启动校准 " + b(s?.calibrating, yes: "是", no: "否")
-            + "（— = 该字段未落盘，daemon 版本偏旧）"
+            + "（— = 未处于冷启动校准期，或 daemon 版本早于该字段）"
         out.append(powerLine + stale)
 
-        let faultLine: String = "故障: controlFault="
-            + (s?.controlFault.map { $0 ? "true" : "false" } ?? "未落盘")
+        // R82 续七：controlFault 缺席 = 未曾故障（daemon 用 encodeIfPresent，健康态
+        // 不写键）——此前显示"未落盘"，读起来像缺了数据，实际是健康态
+        let faultText = s?.controlFault.map { $0 ? "true（写故障锁存）" : "false" } ?? "无记录(健康)"
+        let faultLine: String = "故障: controlFault=" + faultText
             + " 原因 " + one(s?.faultReason?.rawValue)
             + " · 压不住目标 " + b(s?.targetUnreachable, yes: "是", no: "否")
             + " · 安全托底 " + n(s?.safetyFloorPercent, "%.0f") + "%"
             + " · 基础目标 " + n(s?.baseTargetPercent, "%.0f") + "%"
-            + "（未落盘/— = daemon 版本早于该字段）"
+            + "（— = 未触发；旧版 daemon 字段缺席亦显示 —；controlFault 无记录 = 未曾故障）"
         out.append(faultLine + stale)
 
         let tempLine: String = "温度: CPU " + t(s?.cpuTemp)

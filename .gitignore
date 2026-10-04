@@ -5,3 +5,7 @@ dist/
 *.log
 .zcode/
 .build-app-sdk/
+
+# ZCode 本机会话产物（代码索引/工具配置），不入库
+.codebase-memory/
+.zcodeignore

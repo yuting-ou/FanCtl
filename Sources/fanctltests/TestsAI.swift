@@ -325,6 +325,51 @@ func testBatteryGuard() {
 
 // MARK: - AI 自动接管控制器（目标温度 + 趋势预判的增量式控制）
 
+// R77：dt 钳位必须全仓同源。此前三处各写各的：引擎 20s、LearningGate 20s、
+// FanAIController **15s**——idle 长拍下 AI 的 P/D 增量按 15s 结算而学习门/统计按 20s，
+// 同拍两处口径差 25%，不报错、只是控制与度量悄悄不同源。本门用"同一输入喂两处、
+// 结果必须一致"来钉死这个不变量：将来谁再改回局部常量，这里先红。
+func testDtClampSingleSource() {
+    group("dt 钳位同源(R77)")
+
+    // ① FanDt.clamped 的边界语义（它是三处共用的那一个定义）
+    expectEqual(FanDt.clamped(3.0), 3.0, "标称拍长原样通过")
+    expectEqual(FanDt.clamped(20.0), 20.0, "上界 20s 原样通过（= idle 最大间隔）")
+    expectEqual(FanDt.clamped(1e9), 20.0, "睡眠唤醒的超大 elapsed 钳到 20s")
+    expectEqual(FanDt.clamped(0.0), 0.5, "下界 0.5s")
+    expectEqual(FanDt.clamped(-5), 0.5, "负值钳到下界")
+    expectEqual(FanDt.clamped(.nan), 3.0, "NaN 退回标称 3s（NaN 会穿透 min/max 并污染 output）")
+    // ±Inf 也是 isFinite == false → 一并退回标称 3s。会话时钟跳变理论上只产生有限大值，
+    // 故"非有限一律退回标称"比"Inf 走 min/max"更保守：宁可当 3s 拍，也不让 P 项按 20s 冲。
+    expectEqual(FanDt.clamped(.infinity), 3.0, "+Inf（非有限）退回标称 3s")
+    expectEqual(FanDt.clamped(-.infinity), 3.0, "-Inf（非有限）退回标称 3s")
+    expectEqual(FanDt.clamped(1e300), 20.0, "有限超大值（时钟跳变常见形态）钳到上界 20s")
+
+    // ② 关键不变量：LearningGate 与 FanAIController 必须给出**同一个** dtn。
+    // LearningGate 是以 °C/s 判稳态，dt 非有限直接 false（它要区分"不可判"），
+    // 故这里只比有限值区间——正是分叉发生的那一段（15 vs 20）。
+    for dt in [0.3, 0.5, 1.0, 3.0, 15.0, 15.5, 20.0, 60.0, 1e9] {
+        let a = FanDt.clamped(dt)
+        // 稳态判据用同一 dtn：取"恰好在阈值上/下"的温升反推，确认两边算的是同一个分母。
+        // 0.12°C/s × dtn 是 LearningGate 的判据线。
+        let line = LearningGate.tempRatePerSec * a
+        let justUnder = line * 0.9
+        let justOver = line * 1.1
+        expect(LearningGate.isSteady(temp: 70 + justUnder, prevTemp: 70,
+                                     baseTarget: 50, prevBase: 50,
+                                     shapedBase: 50, dt: dt),
+               "dt=\(dt)s：阈值 90% 的温升判稳态（分母按 FanDt=\(a)s）")
+        expect(!LearningGate.isSteady(temp: 70 + justOver, prevTemp: 70,
+                                      baseTarget: 50, prevBase: 50,
+                                      shapedBase: 50, dt: dt),
+               "dt=\(dt)s：阈值 110% 的温升判非稳态")
+    }
+
+    // ③ 回归本体：15.5s 这个输入在修复前会被 AI 侧截成 15s（口径差 3.3%），
+    // 在 20s 这个输入上差 25%。现在两处都返回 15.5/20.0。
+    expectEqual(FanDt.clamped(15.5), 15.5, "15.5s 不再被截成 15s（旧 AIController 内部上界）")
+    expectEqual(FanDt.clamped(20.0), 20.0, "20s 不再被截成 15s（旧分叉点：20 vs 15 = 25%）")
+}
 
 func testAIController() {
     group("AI控制器")
@@ -334,7 +379,7 @@ func testAIController() {
     do {
         var c = AIController()
         for t in [40.0, 55, 70, 85, 95, 100, 60, 45] {
-            let o = c.step(temp: t)!
+            let o = c.step(temp: t, dt: 3.0)!
             expect(o >= 0 && o <= 100, "输出越界 @\(t): \(o)")
         }
     }
@@ -342,7 +387,7 @@ func testAIController() {
     // v6: NaN dt 防御——NaN 穿透 min(max(dt, 0.5), 15.0) 导致 output 变 NaN
     do {
         var c = AIController()
-        _ = c.step(temp: target + 5)  // 建立非零 output
+        _ = c.step(temp: target + 5, dt: 3.0)  // 建立非零 output
         let prevOutput = c.output
         let o = c.step(temp: target + 5, dt: .nan)!
         expect(o.isFinite, "NaN dt 不传播到 output")
@@ -355,14 +400,14 @@ func testAIController() {
     do {
         // 温和偏热 +3°（不会瞬时饱和）：验证输出逐拍单调爬升
         var c = AIController()
-        _ = c.step(temp: target)
-        let o0 = c.step(temp: target + 3)!
-        let o1 = c.step(temp: target + 3)!
-        let o2 = c.step(temp: target + 3)!
+        _ = c.step(temp: target, dt: 3.0)
+        let o0 = c.step(temp: target + 3, dt: 3.0)!
+        let o1 = c.step(temp: target + 3, dt: 3.0)!
+        let o2 = c.step(temp: target + 3, dt: 3.0)!
         expect(o0 < o1 && o1 < o2, "温和持续偏热输出应逐拍爬升 (\(Int(o0))->\(Int(o1))->\(Int(o2)))")
         // 大幅持续偏热 +10°：应快速冲到高输出
-        var h = AIController(); _ = h.step(temp: target)
-        _ = h.step(temp: target + 10); let hi = h.step(temp: target + 10)!
+        var h = AIController(); _ = h.step(temp: target, dt: 3.0)
+        _ = h.step(temp: target + 10, dt: 3.0); let hi = h.step(temp: target + 10, dt: 3.0)!
         expect(hi >= 90, "大幅偏热应冲到高输出 (\(Int(hi)))")
     }
 
@@ -370,18 +415,18 @@ func testAIController() {
     do {
         var rising = AIController(); var steady = AIController()
         // rising: 从低温快速升到 74；temp 序列斜率大
-        _ = rising.step(temp: 60); _ = rising.step(temp: 67); let orise = rising.step(temp: 74)!
+        _ = rising.step(temp: 60, dt: 3.0); _ = rising.step(temp: 67, dt: 3.0); let orise = rising.step(temp: 74, dt: 3.0)!
         // steady: 一直稳在 74，斜率≈0
-        _ = steady.step(temp: 74); _ = steady.step(temp: 74); let ostead = steady.step(temp: 74)!
+        _ = steady.step(temp: 74, dt: 3.0); _ = steady.step(temp: 74, dt: 3.0); let ostead = steady.step(temp: 74, dt: 3.0)!
         expect(orise > ostead, "升温趋势应比稳态输出更高 (升\(Int(orise)) vs 稳\(Int(ostead)))")
     }
 
     // 回落收敛：从高输出状态降温，输出应下降
     do {
         var c = AIController()
-        for _ in 0..<6 { _ = c.step(temp: target + 10) }  // 推高输出
+        for _ in 0..<6 { _ = c.step(temp: target + 10, dt: 3.0) }  // 推高输出
         let hi = c.output
-        for _ in 0..<4 { _ = c.step(temp: target - 15) }  // 降温
+        for _ in 0..<4 { _ = c.step(temp: target - 15, dt: 3.0) }  // 降温
         expect(c.output < hi, "降温后输出应回落 (\(Int(hi))->\(Int(c.output)))")
         expect(!c.idleReleased, "短暂降温不误触发交还")
     }
@@ -389,15 +434,15 @@ func testAIController() {
     // 目标收敛：固定温度长时间运行，输出应稳定下来（不发散、不震荡）
     do {
         var c = AIController()
-        for _ in 0..<40 { _ = c.step(temp: target) }  // 恰好在目标
-        let a = c.step(temp: target); let b = c.step(temp: target)
+        for _ in 0..<40 { _ = c.step(temp: target, dt: 3.0) }  // 恰好在目标
+        let a = c.step(temp: target, dt: 3.0); let b = c.step(temp: target, dt: 3.0)
         expect(a == b, "目标温度下输出应稳定不变 (\(String(describing: a)),\(String(describing: b)))")
     }
 
     // reset 后重新起步（首拍重新播种，空闲状态清零）
     do {
         var c = AIController()
-        for _ in 0..<5 { _ = c.step(temp: 90) }
+        for _ in 0..<5 { _ = c.step(temp: 90, dt: 3.0) }
         c.reset()
         expect(c.output == 0 && !c.idleReleased, "reset 后积分与空闲状态清零")
     }
@@ -405,9 +450,9 @@ func testAIController() {
     // 唤醒场景：reset 后用悬殊温度起步，不应因“睡前→唤醒”斜率产生巨大前馈尖峰
     do {
         var c = AIController()
-        for _ in 0..<8 { _ = c.step(temp: 45) }   // 睡前长期低温，输出稳在低位
+        for _ in 0..<8 { _ = c.step(temp: 45, dt: 3.0) }   // 睡前长期低温，输出稳在低位
         c.reset()                                 // 唤醒重置
-        let woke = c.step(temp: 70)!              // 唤醒后温度已不同（首拍播种路径）
+        let woke = c.step(temp: 70, dt: 3.0)!              // 唤醒后温度已不同（首拍播种路径）
         // 首拍走“播种”路径（不算斜率），不会因 (70-45) 的假斜率被 kD 放大成 100
         expect(woke < 60, "唤醒首拍不应有斜率尖峰 (得 \(Int(woke)))")
     }
@@ -415,10 +460,10 @@ func testAIController() {
     // NaN/Inf 守卫：坏值不污染状态，后续正常值仍得有限输出
     do {
         var c = AIController()
-        _ = c.step(temp: 76)
-        _ = c.step(temp: .nan)
-        _ = c.step(temp: .infinity)
-        if let o = c.step(temp: 80) {
+        _ = c.step(temp: 76, dt: 3.0)
+        _ = c.step(temp: .nan, dt: 3.0)
+        _ = c.step(temp: .infinity, dt: 3.0)
+        if let o = c.step(temp: 80, dt: 3.0) {
             expect(o.isFinite && o >= 0 && o <= 100, "NaN/Inf 后输出仍有限且合法 (\(o))")
         } else { expect(false, "NaN 后不应进入交还") }
     }
@@ -428,7 +473,7 @@ func testAIController() {
         func out(target: Double) -> Double {
             var t = AITuning(); t.targetTemp = target
             var c = AIController(tuning: t)
-            for _ in 0..<20 { _ = c.step(temp: 78) }  // 固定 78°
+            for _ in 0..<20 { _ = c.step(temp: 78, dt: 3.0) }  // 固定 78°
             return c.output
         }
         let perf = out(target: 72)   // 性能：78 超目标多→输出高
@@ -451,11 +496,11 @@ func testAIController() {
         var t = AITuning(); t.slopeDeadband = 0  // 禁用死区作对照
         var withDeadband = AIController()
         var noDeadband = AIController(tuning: t)
-        _ = withDeadband.step(temp: target + 3)   // error=3 > 1, P 项活跃
-        _ = noDeadband.step(temp: target + 3)
+        _ = withDeadband.step(temp: target + 3, dt: 3.0)   // error=3 > 1, P 项活跃
+        _ = noDeadband.step(temp: target + 3, dt: 3.0)
         // 0.3°C/3s = 0.1°C/s < 0.15 死区 → withDeadband 的 D 项归零
-        let o1 = withDeadband.step(temp: target + 3.3)!
-        let o2 = noDeadband.step(temp: target + 3.3)!
+        let o1 = withDeadband.step(temp: target + 3.3, dt: 3.0)!
+        let o2 = noDeadband.step(temp: target + 3.3, dt: 3.0)!
         expect(o2 > o1, "斜率死区抑制了 D 项 (有死区\(Int(o1)) vs 无死区\(Int(o2)))")
         expectClose(o2 - o1, 8.0 * 0.3, 0.01, "D 项差值 = kD×slope")  // 2.4
     }
@@ -463,23 +508,23 @@ func testAIController() {
     // v3: 误差死区——目标±1° 内 P 项归零，输出不漂移
     do {
         var c = AIController()
-        _ = c.step(temp: target)                    // 建立基线
-        _ = c.step(temp: target + 0.5)              // 初始斜率推一下 D 项
+        _ = c.step(temp: target, dt: 3.0)                    // 建立基线
+        _ = c.step(temp: target + 0.5, dt: 3.0)              // 初始斜率推一下 D 项
         let baseline = c.output                     // 此后温度恒定
-        for _ in 0..<20 { _ = c.step(temp: target + 0.5) }  // 误差 0.5° < 1° 死区，斜率=0
+        for _ in 0..<20 { _ = c.step(temp: target + 0.5, dt: 3.0) }  // 误差 0.5° < 1° 死区，斜率=0
         expectClose(c.output, baseline, 0.01, "误差死区内 P 项不积累（防漂移）")
         // 超出死区后 P 项恢复
         let before = c.output
-        _ = c.step(temp: target + 2)                // 误差 2° > 1° 死区
+        _ = c.step(temp: target + 2, dt: 3.0)                // 误差 2° > 1° 死区
         expect(c.output != before, "超出死区后 P 项恢复推动")
     }
 
     // v3: 无学习数据时的主动前馈——升温段至少有 20% 地板
     do {
         var c = AIController()
-        _ = c.step(temp: 60)
+        _ = c.step(temp: 60, dt: 3.0)
         // 升温到 65（误差 -11°，斜率 5/3s ≈ 1.67°C/s > 0.15 死区）
-        let o = c.step(temp: 65)!
+        let o = c.step(temp: 65, dt: 3.0)!
         // 无 learned → 前馈 = error > 5 ? 60 : error > 2 ? 35 : 20 = 20
         // PD 项可能给出更低值（误差负 → P 项为负），前馈地板应抬到 20
         expect(o >= 20, "无学习数据时升温前馈地板 ≥ 20% (得 \(Int(o)))")
@@ -487,8 +532,8 @@ func testAIController() {
     // v3: 无学习数据 + 大幅超目标时前馈更强
     do {
         var c = AIController()
-        _ = c.step(temp: 75)   // 建立基线
-        let o = c.step(temp: 82)!  // 升温 7°，误差 6° > 5 → 前馈 60
+        _ = c.step(temp: 75, dt: 3.0)   // 建立基线
+        let o = c.step(temp: 82, dt: 3.0)!  // 升温 7°，误差 6° > 5 → 前馈 60
         expect(o >= 60, "大幅超目标时前馈 ≥ 60% (得 \(Int(o)))")
     }
 
@@ -496,46 +541,46 @@ func testAIController() {
     // 无 learned 时，curvePercent 作为升温前馈基准
     do {
         var c = AIController()
-        _ = c.step(temp: 60)
+        _ = c.step(temp: 60, dt: 3.0)
         // 升温到 65，无 learned，curvePercent=25（用户曲线在 65°C 的值）
         // 前馈 = min(25, 80) = 25 > 硬编码 20 → 用曲线值
-        let o = c.step(temp: 65, curvePercent: 25)!
+        let o = c.step(temp: 65, curvePercent: 25, dt: 3.0)!
         expect(o >= 25, "curvePercent=25 作为前馈基准 (得 \(Int(o)))")
     }
     // v6: learned 优先于 curvePercent
     do {
         var c = AIController()
-        _ = c.step(temp: 60)
+        _ = c.step(temp: 60, dt: 3.0)
         // learned=40, curvePercent=25 → 前馈用 learned=40
-        let o = c.step(temp: 65, learned: 40, curvePercent: 25)!
+        let o = c.step(temp: 65, learned: 40, curvePercent: 25, dt: 3.0)!
         expect(o >= 40, "learned=40 优先于 curvePercent=25 (得 \(Int(o)))")
     }
     // v6: 首拍种子用 curvePercent（无 learned 时）
     do {
         var c = AIController()
         // 首拍无 learned，curvePercent=30 → output=30
-        let o = c.step(temp: 70, curvePercent: 30)!
+        let o = c.step(temp: 70, curvePercent: 30, dt: 3.0)!
         expectClose(o, 30, 0.01, "首拍种子用 curvePercent=30 (得 \(Int(o)))")
     }
     // v6: 夺回种子用 curvePercent（无 learned 时）
     do {
         var c = AIController()
         // 先进入空闲交还
-        for _ in 0..<40 { _ = c.step(temp: 60) }  // 深凉 10 拍交还
+        for _ in 0..<40 { _ = c.step(temp: 60, dt: 3.0) }  // 深凉 10 拍交还
         expect(c.idleReleased, "已交还")
         // 夺回时无 learned，curvePercent=35 → output=35
-        let o = c.step(temp: 80, curvePercent: 35)!
+        let o = c.step(temp: 80, curvePercent: 35, dt: 3.0)!
         expectClose(o, 35, 0.01, "夺回种子用 curvePercent=35 (得 \(Int(o)))")
     }
 
     // v4: errorDeadband 边界——error=2.0 恰好在死区内（<= 而非 <）
     do {
         var c = AIController()
-        _ = c.step(temp: target)           // 建立基线
-        _ = c.step(temp: target + 2)       // slope 推一下 D 项
+        _ = c.step(temp: target, dt: 3.0)           // 建立基线
+        _ = c.step(temp: target + 2, dt: 3.0)       // slope 推一下 D 项
         let baseline = c.output
         // error=2.0，abs(2.0)<=2.0 为 true → P 项归零，不会 windup
-        for _ in 0..<20 { _ = c.step(temp: target + 2) }
+        for _ in 0..<20 { _ = c.step(temp: target + 2, dt: 3.0) }
         expectClose(c.output, baseline, 0.01, "error=2.0 在死区内（<=），P 项不积累")
     }
 
@@ -545,11 +590,11 @@ func testAIController() {
         // 旧逻辑（无 anti-windup）：80°C 时 output 仍接近 100（P 项抵消 D 项）
         // 新逻辑（有 anti-windup）：80°C 时 output 明显下降（饱和时跳过同向 P 项）
         var c = AIController()
-        _ = c.step(temp: 76)                    // 建立基线
-        for _ in 0..<10 { _ = c.step(temp: 88) } // 推到饱和
+        _ = c.step(temp: 76, dt: 3.0)                    // 建立基线
+        for _ in 0..<10 { _ = c.step(temp: 88, dt: 3.0) } // 推到饱和
         expect(c.output >= 95, "88°C 应饱和到接近 100 (得 \(Int(c.output)))")
         // 降温到 80°C（error=4，P 项为正但在饱和时被跳过）
-        for _ in 0..<4 { _ = c.step(temp: 80) }
+        for _ in 0..<4 { _ = c.step(temp: 80, dt: 3.0) }
         // anti-windup 下，降温段 D 项不被 P 项抵消，output 应明显低于 100
         expect(c.output < 80, "anti-windup 让饱和后降温恢复更快 (得 \(Int(c.output)))")
     }
@@ -558,24 +603,24 @@ func testAIController() {
     // v7: 升级为曲线锚定，output 向 curvePercent 双向收敛（3%/拍）
     do {
         var c = AIController()
-        _ = c.step(temp: 76)   // seed=30
+        _ = c.step(temp: 76, dt: 3.0)   // seed=30
         // 推高 output（kP=1.5，需要更多拍）
-        for _ in 0..<15 { _ = c.step(temp: 85) }
+        for _ in 0..<15 { _ = c.step(temp: 85, dt: 3.0) }
         let hi = c.output
         expect(hi >= 80, "推高到 80+ (得 \(Int(hi)))")
         // 缓慢降温到死区（每拍降 1°C），避免 D 项一次性把 output 拉低：
         // deadband=2.0，死区 [74,78]，76.5°C 在死区内
         // curvePercent=40 作为锚定目标，output 应向 40 收敛
         for t in stride(from: 84.0, through: 77.0, by: -1.0) {
-            _ = c.step(temp: t, learned: 40, curvePercent: 40)
+            _ = c.step(temp: t, learned: 40, curvePercent: 40, dt: 3.0)
         }
         // 进入死区 (76.5, error=0.5 < 2.0 在死区内)
-        _ = c.step(temp: 76.5, learned: 40, curvePercent: 40)
+        _ = c.step(temp: 76.5, learned: 40, curvePercent: 40, dt: 3.0)
         let afterSlope = c.output
         expect(afterSlope > 45, "进入死区时 output 仍高于 learned+5=45 (得 \(Int(afterSlope)))")
         // 后续拍 slope=0，曲线锚定（v9 探测阶梯：每 25s 迈 ≤1.5%）向 curvePercent=40 收敛。
         // 280 拍 × 3s = 840s ≈ 33 步 × 1.5% ≈ 50pp 行程，足够从 ~70 收敛到 40
-        for _ in 0..<280 { _ = c.step(temp: 76.5, learned: 40, curvePercent: 40) }
+        for _ in 0..<280 { _ = c.step(temp: 76.5, learned: 40, curvePercent: 40, dt: 3.0) }
         expect(c.output < afterSlope, "死区内 output 持续回落 (从\(Int(afterSlope))到\(Int(c.output)))")
         expect(c.output <= 43, "曲线锚定到 40 附近 (得 \(Int(c.output)))")
         expect(c.output >= 39, "不低于曲线锚定目标 (得 \(Int(c.output)))")
@@ -584,9 +629,9 @@ func testAIController() {
     // v4: 升温前馈对 learned 加上限 80%——即使 learned 被污染为 100%，前馈也不会拉满
     do {
         var c = AIController()
-        _ = c.step(temp: 70)   // 建立基线
+        _ = c.step(temp: 70, dt: 3.0)   // 建立基线
         // 升温到 75（slope=5/3≈1.67 > 0.15 死区），learned=100（污染）
-        let o = c.step(temp: 75, learned: 100)!
+        let o = c.step(temp: 75, learned: 100, dt: 3.0)!
         expect(o <= 80, "learned=100% 被污染时前馈上限 80% (得 \(Int(o)))")
         expect(o >= 60, "仍保留合理的前馈力度 (得 \(Int(o)))")
     }
@@ -594,33 +639,33 @@ func testAIController() {
     // v4: anti-windup output=0 触底——负向 P 项被跳过，不让 output 变负
     do {
         var c = AIController()
-        _ = c.step(temp: 76)   // 首拍 seed=30
+        _ = c.step(temp: 76, dt: 3.0)   // 首拍 seed=30
         // 大幅降温到 60°C（error=-16），P 项应把 output 推向 0
-        for _ in 0..<5 { _ = c.step(temp: 60) }
+        for _ in 0..<5 { _ = c.step(temp: 60, dt: 3.0) }
         expect(c.output == 0, "大幅降温后 output 触底 0% (得 \(Int(c.output)))")
         // 触底后继续降温：P 项负向被跳过，output 不变
         let frozen = c.output
-        for _ in 0..<5 { _ = c.step(temp: 60) }
+        for _ in 0..<5 { _ = c.step(temp: 60, dt: 3.0) }
         expect(c.output == frozen, "触底后负向 P 项被跳过，output 冻结 (得 \(Int(c.output)))")
     }
 
     // v4: learned=nil + curvePercent=nil 时死区内不回落（无基准，保守维持）
     do {
         var c = AIController()
-        _ = c.step(temp: 76)   // seed=30
+        _ = c.step(temp: 76, dt: 3.0)   // seed=30
         // 缓慢升温到 80°C 推高 output
-        for _ in 0..<10 { _ = c.step(temp: 80) }
+        for _ in 0..<10 { _ = c.step(temp: 80, dt: 3.0) }
         expect(c.output > 30, "推高 output (得 \(Int(c.output)))")
         // 平缓降温到死区
         for t in stride(from: 79.0, through: 77.0, by: -1.0) {
-            _ = c.step(temp: t)
+            _ = c.step(temp: t, dt: 3.0)
         }
         // 进入死区 (76.5, error=0.5)，learned=nil, curvePercent=nil
-        let r = c.step(temp: 76.5)
+        let r = c.step(temp: 76.5, dt: 3.0)
         let afterStep = c.output
         expect(r != nil, "learned=nil+curvePercent=nil 不交还")
         // 后续 10 拍温度不变，无基准不回落
-        for _ in 0..<10 { _ = c.step(temp: 76.5) }
+        for _ in 0..<10 { _ = c.step(temp: 76.5, dt: 3.0) }
         expect(abs(c.output - afterStep) < 1,
                "无基准时死区内不回落 (得 \(Int(c.output)) vs \(Int(afterStep)))")
     }
@@ -629,17 +674,17 @@ func testAIController() {
     // 打破正反馈：即使无 learned，curvePercent 也能拉下冻结在高位的 output
     do {
         var c = AIController()
-        _ = c.step(temp: 76)
-        for _ in 0..<10 { _ = c.step(temp: 80) }  // 推高 output
+        _ = c.step(temp: 76, dt: 3.0)
+        for _ in 0..<10 { _ = c.step(temp: 80, dt: 3.0) }  // 推高 output
         expect(c.output > 30, "推高 output (得 \(Int(c.output)))")
         for t in stride(from: 79.0, through: 77.0, by: -1.0) {
-            _ = c.step(temp: t, curvePercent: 45)
+            _ = c.step(temp: t, curvePercent: 45, dt: 3.0)
         }
         // 进入死区，curvePercent=45（用户曲线在 76.5°C 的值）
-        _ = c.step(temp: 76.5, curvePercent: 45)
+        _ = c.step(temp: 76.5, curvePercent: 45, dt: 3.0)
         let afterStep = c.output
         // 后续 10 拍温度不变，curvePercent=45 < output-5 → 每拍降 1%
-        for _ in 0..<10 { _ = c.step(temp: 76.5, curvePercent: 45) }
+        for _ in 0..<10 { _ = c.step(temp: 76.5, curvePercent: 45, dt: 3.0) }
         expect(c.output < afterStep,
                "curvePercent=45 时死区内回落 (得 \(Int(c.output)) vs \(Int(afterStep)))")
         expect(c.output >= 45, "回落不低于 curvePercent-5 (得 \(Int(c.output)))")
@@ -650,17 +695,17 @@ func testAIController() {
     // 用 min(96, 18)=18 作基准 → output > 18+5=23 → 回落
     do {
         var c = AIController()
-        _ = c.step(temp: 76)
-        for _ in 0..<10 { _ = c.step(temp: 80) }  // 推高 output
+        _ = c.step(temp: 76, dt: 3.0)
+        for _ in 0..<10 { _ = c.step(temp: 80, dt: 3.0) }  // 推高 output
         // 降温到死区（target=76, deadband=2, 死区 [74,78]）
         for t in stride(from: 79.0, through: 77.0, by: -1.0) {
-            _ = c.step(temp: t, learned: 96, curvePercent: 18)
+            _ = c.step(temp: t, learned: 96, curvePercent: 18, dt: 3.0)
         }
-        _ = c.step(temp: 76.5, learned: 96, curvePercent: 18)
+        _ = c.step(temp: 76.5, learned: 96, curvePercent: 18, dt: 3.0)
         let afterStep = c.output
         // 后续 10 拍：learned=96, curvePercent=18, min=18
         // output > 18+5=23 → 每拍降 1%
-        for _ in 0..<10 { _ = c.step(temp: 76.5, learned: 96, curvePercent: 18) }
+        for _ in 0..<10 { _ = c.step(temp: 76.5, learned: 96, curvePercent: 18, dt: 3.0) }
         expect(c.output < afterStep,
                "learned=96 污染时 curvePercent=18 仍能回落 (得 \(Int(c.output)) vs \(Int(afterStep)))")
         // 回落不低于 min(96,18)-5=13
@@ -674,21 +719,21 @@ func testAIController() {
         var c1 = AIController()
         var o1: Double = 0
         // 建立低位稳态（低温 + 高曲线，模拟"用户想要 60% 但 AI 积分停在低位"）
-        for _ in 0..<5 { o1 = c1.step(temp: 76, curvePercent: 60)! }  // 死区内，锚=60
+        for _ in 0..<5 { o1 = c1.step(temp: 76, curvePercent: 60, dt: 3.0)! }  // 死区内，锚=60
         expect(o1 > 30, "低位向曲线抬升起点 >30 (得 \(Int(o1)))")
         // 继续稳态，锚定向 60 双向收敛
-        for _ in 0..<20 { o1 = c1.step(temp: 76, curvePercent: 60)! }
+        for _ in 0..<20 { o1 = c1.step(temp: 76, curvePercent: 60, dt: 3.0)! }
         expect(o1 >= 55, "稳态双向收敛到曲线 60 附近（低位抬升）(得 \(Int(o1)))")
 
         // 场景2：output 高于曲线 → 锚定向下压（散热好，用户想要更低转速）
         var c2 = AIController()
-        _ = c2.step(temp: 76)
-        for _ in 0..<15 { _ = c2.step(temp: 85) }  // 推高到高位
-        for t in stride(from: 84.0, through: 77.0, by: -1.0) { _ = c2.step(temp: t, curvePercent: 30) }
-        _ = c2.step(temp: 76.5, curvePercent: 30)   // 进入死区
+        _ = c2.step(temp: 76, dt: 3.0)
+        for _ in 0..<15 { _ = c2.step(temp: 85, dt: 3.0) }  // 推高到高位
+        for t in stride(from: 84.0, through: 77.0, by: -1.0) { _ = c2.step(temp: t, curvePercent: 30, dt: 3.0) }
+        _ = c2.step(temp: 76.5, curvePercent: 30, dt: 3.0)   // 进入死区
         let hi2 = c2.output
         // v9 探测阶梯：280 拍 ≈ 33 步行程，从 ~70 收敛到 30
-        for _ in 0..<280 { _ = c2.step(temp: 76.5, curvePercent: 30) }
+        for _ in 0..<280 { _ = c2.step(temp: 76.5, curvePercent: 30, dt: 3.0) }
         expect(c2.output < hi2, "高位向曲线收敛（过高回落）(得 \(Int(c2.output)) vs \(Int(hi2)))")
         expect(c2.output <= 33, "回落到曲线 30 附近 (得 \(Int(c2.output)))")
         expect(c2.output >= 29, "不低于曲线 30 (得 \(Int(c2.output)))")
@@ -733,21 +778,21 @@ func testAIIdleAndLearn() {
     do {
         var c = AIController()
         var early = true
-        for _ in 0..<39 { if c.step(temp: 66) == nil { early = false } }
+        for _ in 0..<39 { if c.step(temp: 66, dt: 3.0) == nil { early = false } }
         expect(early, "前 39 拍不提前交还")
-        expect(c.step(temp: 66) == nil, "第 40 拍交还")
+        expect(c.step(temp: 66, dt: 3.0) == nil, "第 40 拍交还")
         expect(c.idleReleased, "交还状态置位")
         // 停转瞬态：交还后立即升温斜率，宽限期内不夺回（否则风扇永远停不下来）
-        expect(c.step(temp: 70) == nil, "宽限期内瞬态斜率不夺回")
-        for _ in 0..<20 { _ = c.step(temp: 66) }   // 宽限过期
-        let r = c.step(temp: 70)                    // 斜率 +4 ≥ 0.8，宽限后单拍夺回
+        expect(c.step(temp: 70, dt: 3.0) == nil, "宽限期内瞬态斜率不夺回")
+        for _ in 0..<20 { _ = c.step(temp: 66, dt: 3.0) }   // 宽限过期
+        let r = c.step(temp: 70, dt: 3.0)                    // 斜率 +4 ≥ 0.8，宽限后单拍夺回
         expect(r != nil && !c.idleReleased, "宽限后斜率骤增单拍夺回")
     }
     // 深凉快速通道（60° ≤ 76−12）→ 10 拍交还，缩短负载后空转窗口
     do {
         var c = AIController()
-        for _ in 0..<9 { expect(c.step(temp: 60) != nil, "深凉前 9 拍不交还") }
-        expect(c.step(temp: 60) == nil, "深凉第 10 拍交还")
+        for _ in 0..<9 { expect(c.step(temp: 60, dt: 3.0) != nil, "深凉前 9 拍不交还") }
+        expect(c.step(temp: 60, dt: 3.0) == nil, "深凉第 10 拍交还")
     }
     // dt 语义：10s 间隔下深凉 30s = 3 拍释放（计时按秒恒定，不随拍长伸缩）
     do {
@@ -759,45 +804,45 @@ func testAIIdleAndLearn() {
     // 斜率突增 → 宽限后单拍抢跑夺回（负载陡升抢时间）
     do {
         var c = AIController()
-        for _ in 0..<10 { _ = c.step(temp: 60) }   // 深凉第 10 拍精确释放，宽限刚开启
+        for _ in 0..<10 { _ = c.step(temp: 60, dt: 3.0) }   // 深凉第 10 拍精确释放，宽限刚开启
         expect(c.idleReleased, "先交还")
-        expect(c.step(temp: 63) == nil, "释放后首拍斜率被宽限吸收")
-        for _ in 0..<20 { _ = c.step(temp: 60) }   // 宽限过期
-        let r = c.step(temp: 63)                    // 63 < 76 但斜率 +3 ≥ 0.8
+        expect(c.step(temp: 63, dt: 3.0) == nil, "释放后首拍斜率被宽限吸收")
+        for _ in 0..<20 { _ = c.step(temp: 60, dt: 3.0) }   // 宽限过期
+        let r = c.step(temp: 63, dt: 3.0)                    // 63 < 76 但斜率 +3 ≥ 0.8
         expect(r != nil && !c.idleReleased, "宽限后斜率骤增单拍夺回")
     }
     // 过线夺回不受宽限限制：释放后立刻被动破目标，连续 2 拍夺回（真负载兜底）
     do {
         var c = AIController()
-        for _ in 0..<10 { _ = c.step(temp: 60) }
+        for _ in 0..<10 { _ = c.step(temp: 60, dt: 3.0) }
         expect(c.idleReleased, "深凉交还")
-        expect(c.step(temp: 76) == nil, "破目标首拍确认中（宽限期内也夺回得到）")
-        let r = c.step(temp: 76)
+        expect(c.step(temp: 76, dt: 3.0) == nil, "破目标首拍确认中（宽限期内也夺回得到）")
+        let r = c.step(temp: 76, dt: 3.0)
         expect(r != nil && !c.idleReleased, "过线连续 2 拍夺回")
     }
     // 滞回防抖：被动升温不破目标不夺回（斜率阈值调高隔离温度条件）
     do {
         var t = AITuning(); t.idleReclaimSlopePerSec = 99
         var c = AIController(tuning: t)
-        for _ in 0..<40 { _ = c.step(temp: 55) }
-        expect(c.step(temp: 69) == nil, "69 远低于目标维持交还")
-        expect(c.step(temp: 75) == nil, "75 被动平衡温不破目标仍交还（防极限环关键）")
-        expect(c.step(temp: 76) == nil, "76 破目标首拍确认中")
-        expect(c.step(temp: 76) != nil, "76 连续 2 拍夺回")
+        for _ in 0..<40 { _ = c.step(temp: 55, dt: 3.0) }
+        expect(c.step(temp: 69, dt: 3.0) == nil, "69 远低于目标维持交还")
+        expect(c.step(temp: 75, dt: 3.0) == nil, "75 被动平衡温不破目标仍交还（防极限环关键）")
+        expect(c.step(temp: 76, dt: 3.0) == nil, "76 破目标首拍确认中")
+        expect(c.step(temp: 76, dt: 3.0) != nil, "76 连续 2 拍夺回")
     }
     // 静音会议期禁止交还（系统接管行为不确定）
     do {
         var c = AIController()
-        for _ in 0..<60 { _ = c.step(temp: 55, allowRelease: false) }
+        for _ in 0..<60 { _ = c.step(temp: 55, allowRelease: false, dt: 3.0) }
         expect(!c.idleReleased, "allowRelease=false 不交还")
-        expect(c.step(temp: 55, allowRelease: false) != nil, "会议期持续输出")
+        expect(c.step(temp: 55, allowRelease: false, dt: 3.0) != nil, "会议期持续输出")
     }
     // 交还中途静音激活 → 强制夺回（不等连续拍确认：会议风扇必须受静音封顶约束）
     do {
         var c = AIController()
-        for _ in 0..<40 { _ = c.step(temp: 55) }
+        for _ in 0..<40 { _ = c.step(temp: 55, dt: 3.0) }
         expect(c.idleReleased, "先交还")
-        let r = c.step(temp: 55, allowRelease: false)   // 温度未变，仅静音激活
+        let r = c.step(temp: 55, allowRelease: false, dt: 3.0)   // 温度未变，仅静音激活
         expect(r != nil && !c.idleReleased, "静音激活强制夺回")
     }
     // 振荡冷却 + 循环抑制（v2.9.2）：夺回后 10 分钟窗口内非深凉门槛翻倍（40→80 拍）；
@@ -806,21 +851,21 @@ func testAIIdleAndLearn() {
     // 抑制期满后恢复释放能力（30 分钟一次试探，降磨损 15×）。
     do {
         var c = AIController()
-        for _ in 0..<40 { _ = c.step(temp: 66) }
+        for _ in 0..<40 { _ = c.step(temp: 66, dt: 3.0) }
         expect(c.idleReleased, "首次交还")
-        _ = c.step(temp: 76); _ = c.step(temp: 76)      // 过线连续 2 拍夺回
+        _ = c.step(temp: 76, dt: 3.0); _ = c.step(temp: 76, dt: 3.0)      // 过线连续 2 拍夺回
         expect(!c.idleReleased, "已夺回")
         expect(c.cyclingGuardArmed, "释放后 6s 即夺回 → 武装循环抑制")
         var releasedAt40 = false
         for i in 0..<80 {
-            let r = c.step(temp: 66)
+            let r = c.step(temp: 66, dt: 3.0)
             if i == 39 { releasedAt40 = (r == nil) }
         }
         expect(!releasedAt40, "冷却窗口内 40 拍不释放")
         expect(!c.idleReleased, "80 拍（240s）仍在循环抑制期内不释放")
         // 抑制期满（1800s = 600 拍）→ 恢复释放能力
         var released = false
-        for _ in 0..<600 { if c.step(temp: 66) == nil { released = true; break } }
+        for _ in 0..<600 { if c.step(temp: 66, dt: 3.0) == nil { released = true; break } }
         expect(released, "抑制期满后恢复交还")
     }
     // 交还中安全事件由管线兜住（AI 输出 nil 不豁免红线）——管线侧测试另见 testPipeline
@@ -829,28 +874,28 @@ func testAIIdleAndLearn() {
     // 首拍播种优先学习值
     do {
         var c = AIController()
-        expectEqual(c.step(temp: 76, learned: 42), 42, "首拍用学习值播种")
+        expectEqual(c.step(temp: 76, learned: 42, dt: 3.0), 42, "首拍用学习值播种")
         var c2 = AIController()
-        expectEqual(c2.step(temp: 76), 30, "无学习退回公式种子")
+        expectEqual(c2.step(temp: 76, dt: 3.0), 30, "无学习退回公式种子")
     }
     // 升温抬到学习值（直接拉转速）；降温不抬
     do {
         var c = AIController()
-        _ = c.step(temp: 70)
-        let o = c.step(temp: 72, learned: 55)!   // 斜率 +2 升温
+        _ = c.step(temp: 70, dt: 3.0)
+        let o = c.step(temp: 72, learned: 55, dt: 3.0)!   // 斜率 +2 升温
         expect(o >= 55, "升温抬到学习值 (\(Int(o)))")
         var c2 = AIController()
-        _ = c2.step(temp: 80); let hi = c2.output
-        let d = c2.step(temp: 78, learned: 90)!  // 斜率 −2 降温
+        _ = c2.step(temp: 80, dt: 3.0); let hi = c2.output
+        let d = c2.step(temp: 78, learned: 90, dt: 3.0)!  // 斜率 −2 降温
         expect(d <= hi, "降温段不抬输出")
     }
     // 夺回时也用学习值播种
     do {
         var c = AIController()
-        for _ in 0..<40 { _ = c.step(temp: 55) }
+        for _ in 0..<40 { _ = c.step(temp: 55, dt: 3.0) }
         expect(c.idleReleased, "先交还")
-        _ = c.step(temp: 76, learned: 33)        // 过线确认拍 1
-        expectEqual(c.step(temp: 76, learned: 33), 33, "夺回用学习值起步")
+        _ = c.step(temp: 76, learned: 33, dt: 3.0)        // 过线确认拍 1
+        expectEqual(c.step(temp: 76, learned: 33, dt: 3.0), 33, "夺回用学习值起步")
     }
 }
 
@@ -864,12 +909,12 @@ func testAIIntentAndPower() {
         var c = AIController()
         expectEqual(c.intent(temp: 70), .holding, "无历史=维持")
         // intent() 在 daemon 中紧跟 step(temp:) 以同温调用，读取 step 内部算出的变化率
-        _ = c.step(temp: 70)
-        _ = c.step(temp: 74)   // 斜率 +4/3s ≈ 1.33°C/s > 0.2 → rising
+        _ = c.step(temp: 70, dt: 3.0)
+        _ = c.step(temp: 74, dt: 3.0)   // 斜率 +4/3s ≈ 1.33°C/s > 0.2 → rising
         expectEqual(c.intent(temp: 74), .rising, "升温斜率判 rising")
-        _ = c.step(temp: 66)   // 斜率 −8/3s ≈ −2.67°C/s < −0.2 → falling
+        _ = c.step(temp: 66, dt: 3.0)   // 斜率 −8/3s ≈ −2.67°C/s < −0.2 → falling
         expectEqual(c.intent(temp: 66), .falling, "降温斜率判 falling")
-        _ = c.step(temp: 66.3) // 斜率 +0.3/3s = 0.1°C/s < 0.2 → holding
+        _ = c.step(temp: 66.3, dt: 3.0) // 斜率 +0.3/3s = 0.1°C/s < 0.2 → holding
         expectEqual(c.intent(temp: 66.3), .holding, "带内平稳判维持")
         expect(!AIIntent.rising.label.isEmpty && AIIntent.falling.label.isEmpty == false
                && AIIntent.holding.label.isEmpty == false, "意图文案齐备")
@@ -891,10 +936,10 @@ func testAIIntentAndPower() {
     do {
         var steady = AIController()
         var predictive = AIController()
-        _ = steady.step(temp: 74, curvePercent: 30, powerWatts: 12)
-        _ = predictive.step(temp: 74, curvePercent: 30, powerWatts: 12)
-        let baseline = steady.step(temp: 74, curvePercent: 30, powerWatts: 12)!
-        let boosted = predictive.step(temp: 74, curvePercent: 30, powerWatts: 42)!
+        _ = steady.step(temp: 74, curvePercent: 30, powerWatts: 12, dt: 3.0)
+        _ = predictive.step(temp: 74, curvePercent: 30, powerWatts: 12, dt: 3.0)
+        let baseline = steady.step(temp: 74, curvePercent: 30, powerWatts: 12, dt: 3.0)!
+        let boosted = predictive.step(temp: 74, curvePercent: 30, powerWatts: 42, dt: 3.0)!
         expect(boosted > baseline + 10, "功耗突增在温度未升前提前加速")
         expect(boosted <= 100, "功耗前馈受安全上限约束")
     }
@@ -903,20 +948,20 @@ func testAIIntentAndPower() {
     do {
         // 噪声带内（±2W）：快速通路（15W 阈值）不应触发，慢速通路 EMA 后 <3W 也不触发
         var noise = AIController()
-        _ = noise.step(temp: 74, curvePercent: 30, powerWatts: 12)
-        let n1 = noise.step(temp: 74, curvePercent: 30, powerWatts: 14)!  // +2W 噪声
+        _ = noise.step(temp: 74, curvePercent: 30, powerWatts: 12, dt: 3.0)
+        let n1 = noise.step(temp: 74, curvePercent: 30, powerWatts: 14, dt: 3.0)!  // +2W 噪声
         var stable = AIController()
-        _ = stable.step(temp: 74, curvePercent: 30, powerWatts: 12)
-        let s1 = stable.step(temp: 74, curvePercent: 30, powerWatts: 12)!
+        _ = stable.step(temp: 74, curvePercent: 30, powerWatts: 12, dt: 3.0)
+        let s1 = stable.step(temp: 74, curvePercent: 30, powerWatts: 12, dt: 3.0)!
         expect(n1 <= s1 + 1, "噪声级功耗波动不触发前馈（±2W）")
 
         // 快速通路阈值边缘：raw=15W 恰不触发（> 而非 >=），raw=16W 触发但 boost 很小
         var edge = AIController()
-        _ = edge.step(temp: 74, curvePercent: 30, powerWatts: 10)
-        let e1 = edge.step(temp: 74, curvePercent: 30, powerWatts: 25)!  // raw=15W, 恰不触发
+        _ = edge.step(temp: 74, curvePercent: 30, powerWatts: 10, dt: 3.0)
+        let e1 = edge.step(temp: 74, curvePercent: 30, powerWatts: 25, dt: 3.0)!  // raw=15W, 恰不触发
         var edge2 = AIController()
-        _ = edge2.step(temp: 74, curvePercent: 30, powerWatts: 10)
-        let e2 = edge2.step(temp: 74, curvePercent: 30, powerWatts: 26)! // raw=16W, fastBoost=0.7
+        _ = edge2.step(temp: 74, curvePercent: 30, powerWatts: 10, dt: 3.0)
+        let e2 = edge2.step(temp: 74, curvePercent: 30, powerWatts: 26, dt: 3.0)! // raw=16W, fastBoost=0.7
         expect(e2 > e1, "raw 阈值边缘：16W 触发而 15W 不触发（> 语义）")
         expect(e2 - e1 <= 1.5, "快速通路边缘 boost 受 fastGain 约束")
 
@@ -926,8 +971,8 @@ func testAIIntentAndPower() {
         var stable2 = AIController()
         var gOut: Double = 0, sOut: Double = 0
         for p in [10.0, 15.0, 20.0, 25.0, 30.0] {
-            gOut = gradual.step(temp: 74, curvePercent: 30, powerWatts: p)!
-            sOut = stable2.step(temp: 74, curvePercent: 30, powerWatts: 10)!
+            gOut = gradual.step(temp: 74, curvePercent: 30, powerWatts: p, dt: 3.0)!
+            sOut = stable2.step(temp: 74, curvePercent: 30, powerWatts: 10, dt: 3.0)!
         }
         expect(gOut > sOut, "渐变负载（5 拍 10→30W）慢速通路累积触发前馈")
     }
@@ -1323,7 +1368,7 @@ func testThermalModel() {
     // R33：learned=0 不得短路曲线/公式种子（P5 欠冷更贵）；优先级仍 learned>curve>seed
     do {
         var c = AIController()
-        let o = c.step(temp: 85, learned: 0, curvePercent: 40)
+        let o = c.step(temp: 85, learned: 0, curvePercent: 40, dt: 3.0)
         if let o {
             expect(o >= 40, "learned=0 播种应落到曲线 40 或更高（得 \(o)）")
         } else { expect(false, "首拍应有输出") }
@@ -1536,13 +1581,13 @@ func testVirtualMachine() {
         var temps: [Double] = []
         // 阶段 1：轻载 30W 预热
         for _ in 0..<60 {
-            let o = ai.step(temp: vm.temp) ?? 0
+            let o = ai.step(temp: vm.temp, dt: 3.0) ?? 0
             outs.append(o); temps.append(vm.temp)
             vm.step(power: 30, percent: o, dt: 3)
         }
         // 阶段 2：重载 70W（AI 应把温度压回目标附近）
         for _ in 0..<200 {
-            let o = ai.step(temp: vm.temp) ?? 0
+            let o = ai.step(temp: vm.temp, dt: 3.0) ?? 0
             outs.append(o); temps.append(vm.temp)
             vm.step(power: 70, percent: o, dt: 3)
         }
@@ -1552,7 +1597,7 @@ func testVirtualMachine() {
         // 阶段 3：负载回落 30W，输出应明显下降
         let hiOut = outs.suffix(30).reduce(0.0) { $0 + $1 } / 30
         for _ in 0..<60 {
-            let o = ai.step(temp: vm.temp) ?? 0
+            let o = ai.step(temp: vm.temp, dt: 3.0) ?? 0
             outs.append(o)
             vm.step(power: 30, percent: o, dt: 3)
         }
@@ -1571,12 +1616,12 @@ func testVirtualMachine() {
         var ai = AIController()
         ai.tuning.targetTemp = 76
         for _ in 0..<120 {   // 先稳定在低负载
-            let o = ai.step(temp: vm.temp) ?? 0
+            let o = ai.step(temp: vm.temp, dt: 3.0) ?? 0
             vm.step(power: 20, percent: o, dt: 3)
         }
         var released = false
         for _ in 0..<120 {   // 继续低负载，应交还
-            let o = ai.step(temp: vm.temp)
+            let o = ai.step(temp: vm.temp, dt: 3.0)
             if o == nil { released = true; break }
             vm.step(power: 20, percent: o ?? 0, dt: 3)
         }
@@ -1585,7 +1630,7 @@ func testVirtualMachine() {
         for _ in 0..<30 { vm.step(power: 80, percent: 0, dt: 3) }  // 被动升温（交还中）
         var reclaimed = false
         for _ in 0..<20 {
-            let o = ai.step(temp: vm.temp)
+            let o = ai.step(temp: vm.temp, dt: 3.0)
             if o != nil { reclaimed = true; break }
             vm.step(power: 80, percent: 0, dt: 3)
         }
@@ -1598,20 +1643,20 @@ func testVirtualMachine() {
         var a2 = AIController()
         // 两路都稳定在低负载
         for _ in 0..<10 {
-            _ = a1.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10)
-            _ = a2.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10)
+            _ = a1.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10, dt: 3.0)
+            _ = a2.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10, dt: 3.0)
         }
-        let baseline = a1.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10)!
+        let baseline = a1.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10, dt: 3.0)!
         // 对照组整机不变、分项不变；实验组 CPU 12→22W（+10W > 8W 阈值）
-        let control = a2.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10)!
-        let boosted = a1.step(temp: 70, powerWatts: 30, cpuPower: 22, gpuPower: 10)!
+        let control = a2.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10, dt: 3.0)!
+        let boosted = a1.step(temp: 70, powerWatts: 30, cpuPower: 22, gpuPower: 10, dt: 3.0)!
         expect(boosted > control, "CPU 分项突增触发前馈（\(Int(control))→\(Int(boosted))）")
         expect(boosted - baseline <= 15, "前馈受分项上限约束")
         // 分项噪声（+2W < 8W 阈值）不触发
         var n1 = AIController()
-        for _ in 0..<10 { _ = n1.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10) }
-        let nb = n1.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10)!
-        let nn = n1.step(temp: 70, powerWatts: 30, cpuPower: 14, gpuPower: 10)!
+        for _ in 0..<10 { _ = n1.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10, dt: 3.0) }
+        let nb = n1.step(temp: 70, powerWatts: 30, cpuPower: 12, gpuPower: 10, dt: 3.0)!
+        let nn = n1.step(temp: 70, powerWatts: 30, cpuPower: 14, gpuPower: 10, dt: 3.0)!
         expect(nn <= nb + 1, "分项噪声级波动不触发前馈")
     }
 }
@@ -1655,28 +1700,28 @@ func testAnchorProbing() {
     // 纯控制器：带内安全区门控（上拉/下拉双向贴内沿停步）
     do {
         var c = AIController()   // target 76, band 2, margin 1 → 内沿 |error| < 1.0
-        _ = c.step(temp: 75.0, learned: 40, curvePercent: 90)   // seed=40, error=-1.0 贴下内沿
-        for _ in 0..<12 { _ = c.step(temp: 75.0, learned: 40, curvePercent: 90) }
+        _ = c.step(temp: 75.0, learned: 40, curvePercent: 90, dt: 3.0)   // seed=40, error=-1.0 贴下内沿
+        for _ in 0..<12 { _ = c.step(temp: 75.0, learned: 40, curvePercent: 90, dt: 3.0) }
         expect(c.output <= 40.5, "贴下内沿不向上迈步 (得 \(c.output))")
         var c2 = AIController()
-        _ = c2.step(temp: 75.8, learned: 40, curvePercent: 90)  // error=-0.2 带中心
-        for _ in 0..<12 { _ = c2.step(temp: 75.8, learned: 40, curvePercent: 90) }
+        _ = c2.step(temp: 75.8, learned: 40, curvePercent: 90, dt: 3.0)  // error=-0.2 带中心
+        for _ in 0..<12 { _ = c2.step(temp: 75.8, learned: 40, curvePercent: 90, dt: 3.0) }
         expect(c2.output > 41, "带中心正常向上迈步 (得 \(c2.output))")
         var c3 = AIController()
-        _ = c3.step(temp: 77.0, learned: 90, curvePercent: 20)  // error=+1.0 贴上内沿
-        for _ in 0..<12 { _ = c3.step(temp: 77.0, learned: 90, curvePercent: 20) }
+        _ = c3.step(temp: 77.0, learned: 90, curvePercent: 20, dt: 3.0)  // error=+1.0 贴上内沿
+        for _ in 0..<12 { _ = c3.step(temp: 77.0, learned: 90, curvePercent: 20, dt: 3.0) }
         expect(c3.output >= 89.5, "贴上内沿不向下迈步 (得 \(c3.output))")
     }
 
     // 探测节奏：间隔（25s）内不重复迈步，间隔过后迈下一步
     do {
         var c = AIController()
-        _ = c.step(temp: 75.5, learned: 40, curvePercent: 90)
-        for _ in 0..<5 { _ = c.step(temp: 75.5, learned: 40, curvePercent: 90) }  // 拍6 首步（holdTicks=5 后）
+        _ = c.step(temp: 75.5, learned: 40, curvePercent: 90, dt: 3.0)
+        for _ in 0..<5 { _ = c.step(temp: 75.5, learned: 40, curvePercent: 90, dt: 3.0) }  // 拍6 首步（holdTicks=5 后）
         let mid = c.output
-        for _ in 0..<6 { _ = c.step(temp: 75.5, learned: 40, curvePercent: 90) }  // +18s < 25s
+        for _ in 0..<6 { _ = c.step(temp: 75.5, learned: 40, curvePercent: 90, dt: 3.0) }  // +18s < 25s
         expect(c.output == mid, "探测间隔内不重复迈步 (\(mid) 保持)")
-        for _ in 0..<4 { _ = c.step(temp: 75.5, learned: 40, curvePercent: 90) }  // 累计 30s ≥ 25s
+        for _ in 0..<4 { _ = c.step(temp: 75.5, learned: 40, curvePercent: 90, dt: 3.0) }  // 累计 30s ≥ 25s
         expect(c.output > mid, "间隔过后迈下一步 (\(mid) → \(c.output))")
     }
 
@@ -1690,7 +1735,7 @@ func testAnchorProbing() {
         var outs: [Double] = []
         for _ in 0..<400 {
             let cp = FanConfig.percent(temp: vm.temp, curve: bal)
-            let o = ai.step(temp: vm.temp, curvePercent: cp) ?? 0
+            let o = ai.step(temp: vm.temp, curvePercent: cp, dt: 3.0) ?? 0
             outs.append(o)
             vm.step(power: 60, percent: o, dt: 3)
         }
@@ -1713,7 +1758,7 @@ func testAnchorProbing() {
         var outs: [Double] = []
         for _ in 0..<400 {
             let cp = FanConfig.percent(temp: vm.temp, curve: quiet)
-            let o = ai.step(temp: vm.temp, curvePercent: cp) ?? 0
+            let o = ai.step(temp: vm.temp, curvePercent: cp, dt: 3.0) ?? 0
             outs.append(o)
             vm.step(power: 60, percent: o, dt: 3)
         }
@@ -1741,7 +1786,7 @@ func testAnchorProbing() {
         var outs: [Double] = []
         for _ in 0..<400 {
             let cp = FanConfig.percent(temp: vm.temp, curve: matchCurve)
-            let o = ai.step(temp: vm.temp, curvePercent: cp) ?? 0
+            let o = ai.step(temp: vm.temp, curvePercent: cp, dt: 3.0) ?? 0
             outs.append(o)
             vm.step(power: 60, percent: o, dt: 3)
         }
@@ -1765,7 +1810,7 @@ func testAnchorProbing() {
         func run(_ power: Double, _ ticks: Int, record outs: inout [Double]) {
             for _ in 0..<ticks {
                 let cp = FanConfig.percent(temp: vm.temp, curve: bal)
-                let o = ai.step(temp: vm.temp, curvePercent: cp) ?? 0
+                let o = ai.step(temp: vm.temp, curvePercent: cp, dt: 3.0) ?? 0
                 outs.append(o)
                 vm.step(power: power, percent: o, dt: 3)
             }
@@ -1841,7 +1886,7 @@ func testAICyclingGuard() {
     group("AI 启停循环抑制")
     // 走到深凉释放（≤ target−12 = 60° 持续 30s）
     var c = AIController()
-    _ = c.step(temp: 70, powerWatts: 20)
+    _ = c.step(temp: 70, powerWatts: 20, dt: 3.0)
     var released = false
     for _ in 0..<12 {
         if c.step(temp: 60, powerWatts: 20, dt: 3) == nil { released = true; break }
@@ -1865,9 +1910,9 @@ func testAICyclingGuard() {
     expect(!c.cyclingGuardArmed, "reset 清空抑制状态")
     // 静音激活的强制夺回不武装抑制（模式切换 ≠ 热振荡，否则会议后 30 分钟拒绝交还）
     var q = AIController()
-    for _ in 0..<10 { _ = q.step(temp: 60) }
+    for _ in 0..<10 { _ = q.step(temp: 60, dt: 3.0) }
     expect(q.idleReleased, "先交还")
-    let qr = q.step(temp: 60, allowRelease: false)   // 会议激活强制夺回（释放后 3s）
+    let qr = q.step(temp: 60, allowRelease: false, dt: 3.0)   // 会议激活强制夺回（释放后 3s）
     expect(qr != nil && !q.idleReleased, "静音激活强制夺回")
     expect(!q.cyclingGuardArmed, "静音激活夺回不武装抑制")
     // v3.1 指数退避：连续快速循环 → 抑制期 1800→3600→7200→14400（封顶 4h）
