@@ -61,3 +61,32 @@
   质量 = 改控温行为，超出"保持控制行为不变"的边界。若用户接受轻微前馈噪声可再议。
 
 - 无。本轮范围内的取舍都记在 PROGRESS.md；未列出的即已完成。
+
+## 4. R85（2026-10-09）核实成立、本轮未修的事项
+
+详细证据与修法见 `EVOLUTION.md` 的「R85 交接口」，此处只列**需要谁动手**：
+
+1. **发版要作者点头**：VERSION 已是 4.2.52(146)、测试 5607/119 全绿、root 门禁 73/73、
+   build.sh 出四件套、CI 的打包与可执行位自证已在本地照跑一遍通过——但 **git tag 与
+   GitHub Release 仍停在 v4.2.35（2026-09-29）**，R77–R85 的内容一件都没发出去。
+   影响是可验的：App 的"检查更新"读 `releases/latest`（FanModel.swift:503），
+   老用户永远看不到 4.2.36 之后的版本；访客下载 Latest 拿到的是没有 R81 安全边界拆分、
+   没有进程实例守卫、没有 fanmcp 的旧包。推 tag 会触发 release job **公开发版**，
+   且 2026-10-01 那轮作者曾把发版步骤叫停过 ⇒ 按自治边界（sudo 与公开发版之外的
+   动作自决，公开发版摆事实后停等）没有自己推。
+2. **root 安装面跟随符号链接（要动 root 脚本 + 其字面量门禁，留下一轮）**：
+   `install.sh` / `upgrade.sh` 用 `install -m 755 -o root -g wheel "$DIST/fanmcp"` 装
+   fanprobe/fanmcp，而 `install` **会跟随源符号链接**（/tmp 实测：链接指向的文件内容
+   被复制成 0755 新文件）。staging 目录用户可写、本仓威胁模型自己就包含同 uid 竞态
+   ⇒ 同 uid 进程把 fanmcp 换成指向 root-only 文件的符号链接，root 就会把该文件内容
+   复制成全局可读的 `/usr/local/bin/fanmcp`（越权读取）。R84 记的"不扩哈希复核"
+   理由只覆盖**执行**面，没覆盖这条**读取**面。
+3. **SMCReadout / SMCDriver 两份 80 字节布局无防漂移门**：当前逐行相同（本轮 diff 过），
+   但 fanctltests 不依赖 SMCReadout，改一处不改另一处不会红。
+4. **本机安装偏差**：装机 App 与 daemon 都是 **4.2.50(144)**，仓库是 4.2.52(146)；
+   `/usr/local/bin/fanmcp` 仍不存在（install.sh 需 root，永不自做）。
+   4.2.51 是脚本/CI/文档轮（Swift 侧只差版本串），4.2.52 的 Swift 改动集中在
+   SMCCore + App，daemon 侧只有 ControlEngine 的判据搬家（行为不变）——
+   要不要为它弹一次 root 授权，归作者。Hermes 的 MCP 目前指向
+   `~/Documents/风扇管理/dist/fanmcp`（build.sh 原地覆盖，路径不断，实测可用）；
+   R84 给的稳定落点 `/usr/local/bin/fanmcp` 要等第 4 条装完才能切。

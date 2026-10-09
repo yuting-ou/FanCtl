@@ -67,7 +67,10 @@ final class FanModel: ObservableObject {
     @Published var history: [TempSample] = []
     @Published var boostEndDate: Date? = nil
     @Published var quietEndDate: Date? = nil
-    let quietCapPercent: Double = 30
+    /// 静音封顶百分比。App 自己起静音时用默认值；磁盘上是别的入口（MCP）写的
+    /// 封顶值时以磁盘为准（R85）——面板必须显示 daemon 真正在执行的那个数。
+    @Published var quietCapPercent: Double = FanModel.defaultQuietCapPercent
+    static let defaultQuietCapPercent: Double = 30
     @Published var systemPower: Double? = nil
     @Published var loginItemEnabled = SMAppService.mainApp.status == .enabled
     @Published var batterySaver = false
@@ -412,8 +415,14 @@ final class FanModel: ObservableObject {
         //（首次启动观感突兀，且用户尚未理解通知的价值）。首个过热/风扇健康
         // 事件发生时由 NotificationService.ensureAuthorized() 懒请求。
 
-        // 恢复冲刺状态
-        if let end = UserDefaults.standard.object(forKey: Self.boostEndKey) as? Date {
+        // R85：先以磁盘为准对账静音/冲刺窗口（磁盘是 daemon 正在用的事实）。
+        // 必须放在下面两段 UserDefaults 恢复之前：恢复路径里的 endBoost/saveConfig
+        // 会先把 App 不知道的外部窗口抹掉。
+        adoptOverlayFromDisk(cfg)
+
+        // 恢复冲刺状态（磁盘上没有生效中的冲刺时，才按 App 自己的快照恢复）
+        if boostEndDate == nil,
+           let end = UserDefaults.standard.object(forKey: Self.boostEndKey) as? Date {
             if end > Date() {
                 boostEndDate = end
             } else {
@@ -423,14 +432,16 @@ final class FanModel: ObservableObject {
 
         // 恢复静音承诺。冲刺与静音互斥（startBoost/startQuiet 内部互清），
         // 但崩溃残留可能两者同时有效：冲刺优先，静音残留直接清除
-        if let end = UserDefaults.standard.object(forKey: Self.quietEndKey) as? Date, end > Date() {
-            if boostEndDate == nil {
-                quietEndDate = end
+        if quietEndDate == nil {
+            if let end = UserDefaults.standard.object(forKey: Self.quietEndKey) as? Date, end > Date() {
+                if boostEndDate == nil {
+                    quietEndDate = end
+                } else {
+                    UserDefaults.standard.removeObject(forKey: Self.quietEndKey)
+                }
             } else {
                 UserDefaults.standard.removeObject(forKey: Self.quietEndKey)
             }
-        } else {
-            UserDefaults.standard.removeObject(forKey: Self.quietEndKey)
         }
         // 4.1.2（R22 审查轮）：恢复出的有效冲刺/静音是直改字段、不走 startBoost/startQuiet
         // 入口，补一次标签同步——否则重启后带活跃冲刺时字形停在扇叶，直到第一拍 status。
@@ -1001,7 +1012,8 @@ final class FanModel: ObservableObject {
     // 从磁盘同步配置（外部修改时）
     private func syncConfigFromDisk() {        guard let mtime = ConfigStore.configModificationDate(), mtime != lastSeenConfigMTime else { return }
         lastSeenConfigMTime = mtime
-        // 自己写入的回声直接忽略（App 是唯一写入方，外部修改立即可见）
+        // 自己写入的回声直接忽略（自写的内容 App 内存里已有；外部写入才需要对账。
+        // 注意 App 自 R83 起**不再是唯一写入方**——MCP 也写 config.json）
         if mtime == lastOwnConfigMTime { return }
         let cfg = ConfigStore.loadConfig()
         if cfg.mode != mode {
@@ -1035,6 +1047,41 @@ final class FanModel: ObservableObject {
             customPoints = cfg.curve
             persistCustomPoints()
         }
+        // 静音/冲刺窗口同理回填（R85）：这两个字段此前只出不进
+        adoptOverlayFromDisk(cfg)
+    }
+
+    /// 以磁盘为准对账静音承诺 / 冲刺这两段窗口（判据在 SMCCore.OverlaySync，可测）。
+    /// App 自 R83（MCP 入口）起不再是 config.json 的唯一写入方，而它每次 saveConfig
+    /// 都会用内存值写回 quietUntil/quietCapPercent/boostUntil ——不回填就等于抹掉别人的设置：
+    /// MCP 开的静音被静默取消；冲刺更糟，boostUntil 被写成 nil 而 mode 仍是 manual 100%，
+    /// daemon 的到期判定要求 boostUntil != nil，于是永不触发（永久全速）。
+    private func adoptOverlayFromDisk(_ cfg: FanConfig) {
+        let a = OverlaySync.adopt(disk: cfg, appQuietEnd: quietEndDate,
+                                  appQuietCap: quietCapPercent, appBoostEnd: boostEndDate,
+                                  now: Date())
+        guard a.changed else { return }
+        if !OverlaySync.sameInstant(a.quietEnd, quietEndDate) {
+            quietEndDate = a.quietEnd
+            if let q = a.quietEnd { UserDefaults.standard.set(q, forKey: Self.quietEndKey) }
+            else { UserDefaults.standard.removeObject(forKey: Self.quietEndKey) }
+        }
+        if let cap = a.quietCapPercent {
+            if abs(cap - quietCapPercent) > 0.5 { quietCapPercent = cap }
+        } else if quietCapPercent != Self.defaultQuietCapPercent {
+            // 没有生效中的静音就把封顶值收回默认：否则别的入口写过的 25%
+            // 会留着，等 App 自己下次开静音时被写进 config（静默改变用户预期的 30%）
+            quietCapPercent = Self.defaultQuietCapPercent
+        }
+        if !OverlaySync.sameInstant(a.boostEnd, boostEndDate) {
+            boostEndDate = a.boostEnd
+            if let b = a.boostEnd { UserDefaults.standard.set(b, forKey: Self.boostEndKey) }
+            else { UserDefaults.standard.removeObject(forKey: Self.boostEndKey) }
+            // 不是 App 起的冲刺 ⇒ 手里没有"冲刺前快照"，到期只能诚实回 auto
+            // （与 MCP 的 boost end=true、daemon 的过期交还同一语义）
+            if a.boostIsForeign { UserDefaults.standard.removeObject(forKey: Self.boostPrevKey) }
+        }
+        syncMenuBarState()   // 字形：扇叶↔闪电/月亮必须跟着真实窗口走
     }
 
     // MARK: 风扇健康监测

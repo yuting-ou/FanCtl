@@ -137,6 +137,7 @@ Sources/
 │   ├── SpinKillGuard.swift    结束空转进程的实例核验守卫(pid 复用/uid/路径,核验不过不触碰信号)
 │   ├── RampMonitor.swift      风扇加速归因(输出急升监视→采前 3 名占用,旁路观察不反作用控制)
 │   ├── TrendCurve.swift       趋势图上屏前整理(剔不可信读数+轻度平滑)
+│   ├── OverlayWindow.swift    静音/冲刺窗口的唯一生效判据 + App 对账(daemon/App/MCP 三入口同源,R85)
 │   └── AliveDebouncer.swift 守护进程存活去抖(App 侧判 daemon 在线)
 ├── SMCCore/Driver/     SMCDriver 子目标(R81 依赖边界):IOKit 读写连接 + FanController 写实现——依赖图里只有 fanctld 与测试
 ├── SMCCore/Readout/    SMCReadout 子目标(R81 依赖边界):IOKit 只读连接,整个模块无写原语——只有 fanprobe 依赖它

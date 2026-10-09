@@ -264,11 +264,17 @@ public struct FanMCP {
         // "还剩多少秒"，决策语义仍全在 daemon
         let c = hooks.loadConfig()
         var overlay = [String: Any]()
-        overlay["quietActive"] = isActive(c.quietUntil, now: now)
-        overlay["quietRemainingSeconds"] = remaining(c.quietUntil, now: now)
-        overlay["quietCapPercent"] = num(c.quietCapPercent, 0)
-        overlay["boostActive"] = isActive(c.boostUntil, now: now)
-        overlay["boostRemainingSeconds"] = remaining(c.boostUntil, now: now)
+        // 生效判据与 daemon 同源（OverlayWindow，R85）。此前只判 `until > now`：
+        // config 里一个 48h 的 quietUntil（手改/损坏）daemon 视为未设置、根本不封顶，
+        // MCP 却报 quietActive=true，同一份 JSON 里 mode 还是 auto —— 自相矛盾。
+        // 静音缺封顶值时 daemon 同样不封顶，故也不报"静音中"。
+        let quietOn = OverlayWindow.quietActive(config: c, now: now)
+        overlay["quietActive"] = quietOn
+        overlay["quietRemainingSeconds"] = remaining(quietOn ? c.quietUntil : nil, now: now)
+        overlay["quietCapPercent"] = num(quietOn ? c.quietCapPercent : nil, 0)
+        let boostOn = OverlayWindow.isActive(until: c.boostUntil, now: now)
+        overlay["boostActive"] = boostOn
+        overlay["boostRemainingSeconds"] = remaining(boostOn ? c.boostUntil : nil, now: now)
         out["overlay"] = overlay
         out["config"] = [
             "aiTargetTemp": num(c.aiTargetTemp, 0),
@@ -308,7 +314,16 @@ public struct FanMCP {
             }
         }
         let today = hooks.loadStats()
-        guard days == 1 else { return .success(pretty(statsMultiDay(days: days, today: today))) }
+        guard days == 1 else {
+            // 一行数据都没有 ≠ "各项都是 0"：新装机器/归档为空时，那些 0 会被 AI
+            // 当成实测读数（"近 7 天均温 0°、调速 0 次"）。days=1 本来就失败关闭，
+            // 多天路径此前却在 guard let s = today 之前返回，口径不对称。
+            guard let multi = statsMultiDay(days: days, today: today) else {
+                return .failure("近 \(days) 天没有任何散热记录：history.json 归档为空，且当日 stats.json 不可读"
+                    + "（常见于新装机器或 daemon 未运行）。不要把这些 0 当成实测结果。")
+            }
+            return .success(pretty(multi))
+        }
         guard let s = today else {
             return .failure("stats.json 不可读：daemon 可能未运行（战报由 daemon 每拍累计）。")
         }
@@ -327,7 +342,8 @@ public struct FanMCP {
         return .success(pretty(out))
     }
 
-    private func statsMultiDay(days: Int, today: DailyStats?) -> [String: Any] {
+    /// nil = 窗口内一行数据都没有（调用方据此失败关闭，不把 0 报成实测）
+    private func statsMultiDay(days: Int, today: DailyStats?) -> [String: Any]? {
         var all = hooks.loadHistory()
         if let t = today { all.append(t) }   // history 是跨天归档，当日不在其中
         // 只取能解析日键的行，按日期排序后取最近 N 天
@@ -335,6 +351,7 @@ public struct FanMCP {
             .filter { DailyStats.epochDay(ofDayKey: $0.date) != nil }
             .sorted { epoch($0.date) < epoch($1.date) }
             .suffix(days)
+        guard !rows.isEmpty else { return nil }
         var list = [[String: Any]]()
         var tempSum = 0.0, tempSec = 0.0, revolutions = 0.0, speed = 0.0
         var high = 0.0, quiet = 0.0, maxT = -Double.infinity
@@ -377,8 +394,24 @@ public struct FanMCP {
             return .failure("配置写入失败：config.json 落盘被拒。数据目录在 /Library/Application Support/FanCtl/"
                 + "（root:admin 775），当前用户需要 admin 组身份；可让用户在面板里改一次以确认 App 侧是否同样失败。")
         }
+        // 写入成功 ≠ 生效：daemon 不在跑时 config 只是躺在盘上。此前无条件承诺
+        // "≤20s 生效"，而同一文件的读路径（toolStatus）对缺 status.json 是失败关闭的
+        // ——写路径零检查，两种口径。R85：按实测的 status 新鲜度说话（仍算成功，
+        // 因为意图确实落盘了，但不替 daemon 许一个兑不了的 SLA）。
+        let now = hooks.now()
+        let pickup: String
+        if let s = hooks.loadStatus() {
+            let age = max(0, now.timeIntervalSince(s.timestamp))
+            pickup = age <= 30
+                ? "daemon 会在下一拍热加载（状态 \(Int(age))s 前更新，≤20s 生效）"
+                : "⚠️ 设置已落盘，但 daemon 状态已 \(Int(age))s 未更新（正常 ≤20s 一拍）"
+                    + "——可能不会生效，请让用户检查 fanctld 是否在运行"
+        } else {
+            pickup = "⚠️ 设置已落盘，但读不到 status.json（守护进程可能未安装或未运行）"
+                + "——在 fanctld 起来之前不会生效"
+        }
         return .success(pretty(["ok": true, "changed": what,
-                                "note": "daemon 会在下一拍热加载（≤20s）；安全红线（92° 兜底/SSD/电池托底）不受此设置影响。"]))
+                                "note": pickup + "；安全红线（92° 兜底/SSD/电池托底）不受此设置影响。"]))
     }
 
     private func toolSetMode(_ args: [String: Any]) -> ToolOutcome {
@@ -702,11 +735,6 @@ public struct FanMCP {
 
     // MARK: - JSON 小工具
 
-    private func isActive(_ until: Date?, now: Date) -> Bool {
-        guard let u = until else { return false }
-        return u > now
-    }
-
     private func remaining(_ until: Date?, now: Date) -> Any {
         guard let u = until, u > now else { return NSNull() }
         return num(u.timeIntervalSince(now), 0)
@@ -723,7 +751,12 @@ public struct FanMCP {
     private func num(_ v: Double?, _ digits: Int) -> Any {
         guard let v, v.isFinite else { return NSNull() }
         let scale = pow(10.0, Double(digits))
-        return (v * scale).rounded() / scale
+        let scaled = v * scale
+        // 乘法本身会溢出：|v| > ~1.8e307 且 digits ≥ 1 时 scaled = inf（isFinite 守卫
+        // 在乘之前，拦不住）。inf 让整个结果对象不是合法 JSON，pretty() 退化成
+        // "此路径不应触达"，却仍以 isError:false 交回客户端——整份状态就此丢失。
+        guard scaled.isFinite else { return NSNull() }
+        return scaled.rounded() / scale
     }
 
     private func iso(_ d: Date) -> String {

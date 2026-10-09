@@ -80,11 +80,14 @@ public struct ProcessProbe {
     }
 
     public static let live = ProcessProbe { pid in
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(pid)]
+        // Int32(Int) 是**会 trap 的转换**（不是截断）。解码侧已把 pid 收口到 ≤10_000_000，
+        // 这里再兜一层：拿不到实例就是"核验不了"，交 verify 失败关闭，绝不让 App 崩。
+        guard let pid32 = Int32(exactly: pid) else { return nil }
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid32]
         var info = kinfo_proc()
         var size = MemoryLayout<kinfo_proc>.stride
         let rc = sysctl(&mib, 4, &info, &size, nil, 0)
-        guard rc == 0, size > 0, info.kp_proc.p_pid == Int32(pid) else { return nil }
+        guard rc == 0, size > 0, info.kp_proc.p_pid == pid32 else { return nil }
         let start = Double(info.kp_proc.p_starttime.tv_sec)
             + Double(info.kp_proc.p_starttime.tv_usec) / 1_000_000
         guard start > 0 else { return nil }
@@ -98,8 +101,9 @@ public struct ProcessProbe {
 
     /// 可执行路径：libproc 的 proc_pidpath（受限时返回 nil → 调用侧按"核验不了就拒"处理）
     static func executablePath(pid: Int) -> String? {
+        guard let pid32 = Int32(exactly: pid) else { return nil }
         var buf = [CChar](repeating: 0, count: 4096)   // PROC_PIDPATHINFO_MAXSIZE = 4*MAXPATHLEN
-        let n = proc_pidpath(Int32(pid), &buf, UInt32(buf.count))
+        let n = proc_pidpath(pid32, &buf, UInt32(buf.count))
         guard n > 0 else { return nil }
         return String(cString: buf)
     }
@@ -114,7 +118,10 @@ public struct SignalSender {
     public init(send: @escaping (_ pid: Int, _ signal: Int32) -> Int32) { self.send = send }
 
     public static let live = SignalSender { pid, signal in
-        if kill(Int32(pid), signal) == 0 { return 0 }
+        // 越界 pid 不 trap：报 EINVAL（"根本不是合法目标"），由 execute 如实转成
+        // signalNotDelivered——既不崩，也不谎报"已退出"（ESRCH 才是那个意思）。
+        guard let pid32 = Int32(exactly: pid) else { return EINVAL }
+        if kill(pid32, signal) == 0 { return 0 }
         return Int32(errno)
     }
 }

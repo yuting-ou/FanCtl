@@ -342,7 +342,8 @@ public final class ControlEngine {
     /// 冲刺侧由调用方把"异常"并入过期路径（恢复 auto），静音侧视为未设置。
     private func saneHorizon(_ date: Date?, label: String) -> Date? {
         guard let d = date else { return nil }
-        if d.timeIntervalSince(hooks.now()) > 24 * 3600 {
+        // 判据本体在 OverlayWindow（daemon/App/MCP 三入口同源，R85），这里只多一句一次性告警
+        if OverlayWindow.effective(until: d, now: hooks.now()) == nil {
             if !horizonWarned.contains(label) {
                 horizonWarned.insert(label)
                 hooks.log("\(label)截止时间异常久远（\(d)），已忽略——正常写入 ≤30 分钟")
@@ -420,9 +421,10 @@ public final class ControlEngine {
         // boostUntil 过期 → 本拍起视为 auto 交还系统，直到 App 恢复并写入新配置。
         // 不修改 config 本身：App 重启后 init 仍能按 UserDefaults 恢复冲刺前状态。
         var effectiveConfig = config
-        let saneBoostUntil = saneHorizon(config.boostUntil, label: "冲刺")
-        let boostExpired = config.boostUntil != nil
-            && (saneBoostUntil == nil || hooks.now() >= saneBoostUntil!)
+        // 判据本体走 OverlayWindow（三入口同源）；仍调一次 saneHorizon 是为了保留
+        // "冲刺截止时间异常久远"那句一次性告警——判据搬家不该顺带弄丢诊断信息。
+        _ = saneHorizon(config.boostUntil, label: "冲刺")
+        let boostExpired = OverlayWindow.boostExpired(config: config, now: hooks.now())
         if boostExpired, config.mode == .manual {
             effectiveConfig.mode = .auto
             if !boostExpiredLogged {
@@ -627,8 +629,7 @@ public final class ControlEngine {
         // 静音承诺生效判定（hoist：AI 空闲交还抑制与评测排除共用同一判定）。
         // v3.6.2（F5）：异常久远的 quietUntil 视为未设置
         let saneQuietUntil = saneHorizon(config.quietUntil, label: "静音承诺")
-        let quietActive = saneQuietUntil != nil && config.quietCapPercent != nil
-            && hooks.now() < saneQuietUntil!
+        let quietActive = OverlayWindow.quietActive(config: config, now: hooks.now())
         // 管线 decide() 内部有独立的 quiet 判定——把消毒后的 horizon 下传，
         // 否则引擎判无效而管线仍按原值封顶（两条判定路径必须同源）
         effectiveConfig.quietUntil = saneQuietUntil

@@ -36,8 +36,8 @@ jobs:
           swift run -c release --disable-sandbox fanctltests 2>&1 | tee test-output.txt
           N=$(grep -oE '全部通过：[0-9]+ 项断言' test-output.txt | grep -oE '[0-9]+' | head -1)
           echo "断言数: $N"
-          if [ -z "$N" ] || [ "$N" -lt 5319 ]; then
-            echo "::error::断言数 $N 低于契约下限 5319（测试被删/跳过？）"
+          if [ -z "$N" ] || [ "$N" -lt 5601 ]; then
+            echo "::error::断言数 $N 低于契约下限 5601（测试被删/跳过？）"
             exit 1
           fi
           echo "ASSERTIONS=$N" >> "$GITHUB_ENV"
@@ -130,6 +130,12 @@ jobs:
         run: |
           swift build -c release --disable-sandbox --product fanctld
           swift build -c release --disable-sandbox --product fanprobe
+          # R85：fanmcp 也必须在这里编。它不在 fanctltests 的依赖图里（测试只依赖
+          # SMCCore + SMCDriver），而另外两处会编它的步骤都带触发条件——冒烟只在
+          # main 推送跑、release 只在 tag 跑 ⇒ Sources/fanmcp/main.swift 编译坏掉时
+          # PR 全绿，红灯要落到 main 或发版才炸（R23 P3-3 为 App 目标补编译校验
+          # 时声明要防的正是这一类漂移）。
+          swift build -c release --disable-sandbox --product fanmcp
       - name: App 目标编译校验（不跑，仅编）
         run: swift build -c release --disable-sandbox --product FanCtlApp
 

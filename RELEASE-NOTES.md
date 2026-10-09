@@ -25,6 +25,38 @@
 
 ## 本版变更要点
 
+- 4.2.52：**双入口一致性（R85）**——4.2.50 加了 MCP 这个**第二写入方**，但 App 仍按
+  "我是 config.json 的唯一写入方"行事，于是两条入口互相抹对方的状态，而且都不报错：
+  ① **AI 助手开的「冲刺 15 分钟」会变成永久全速**：App 的 syncConfigFromDisk 回填了
+  mode/manualPercent/曲线，唯独不读 quietUntil/boostUntil，而它每次 saveConfig 都用内存值
+  写回这两个字段 ⇒ boostUntil 被写成 nil 而 mode 仍是 manual 100%，daemon 的到期判定
+  要求 boostUntil != nil，于是永不触发（风扇钉在 100% 直到有人手动改模式）；
+  ② **AI 助手开的静音被静默取消**：同一原因，面板任意一次操作或每小时的自动优化
+  就会把 quietUntil 抹成 nil，会议中途风扇重新拉满，而面板从来没显示过这段静音；
+  ③ MCP 报的窗口生效判据比 daemon 松（只判 `until > now`）：config 里一个 48h 的
+  quietUntil（手改/损坏）daemon 视为未设置、根本不封顶，MCP 却回 `quietActive:true`，
+  同一份 JSON 里 mode 还是 auto——自相矛盾。
+  修法是把判据收成**一份**：新增 `SMCCore/OverlayWindow.swift`（24h 卫生上限 + "静音必须
+  有封顶值" + 冲刺到期），daemon 的 saneHorizon/quietActive/boostExpired、MCP 的 overlay、
+  App 的对账三处全部改为调它；App 侧新增 `adoptOverlayFromDisk`，以磁盘为准回填三段窗口
+  （含 iso8601 秒精度容差，避免把 App 自己刚写的窗口误判成外部写入而清掉冲刺前快照），
+  封顶值改为可变以显示别的入口写的真值，启动对账排在 UserDefaults 恢复之前。
+  同轮另修三条会误导人/会崩的：MCP 写路径此前无条件承诺"daemon 会在下一拍热加载
+  （≤20s）"，daemon 死了也照样许（改为按实测 status 新鲜度说话）；`fanctl_stats days>1`
+  在零数据时回一堆 0（新装机器问"近 7 天散热如何"会得到"均温 0°、调速 0 次"，被 AI 读成
+  实测；改为失败关闭）；`num()` 的 isFinite 守卫在乘 scale 之前，1e308 乘出 inf 会让整份
+  status 退化成"此路径不应触达"却仍以 isError:false 交回（改为该字段 NSNull，其余字段保留）。
+  还修一条崩溃：`SpinAlert.pid` 此前只判 `> 0` 无上限（同文件的 ppid/threads/fdCount 都有界），
+  而下游三处用的是**会 trap 的** `Int32(pid)`；alerts.json 在用户家目录（同 uid 可写），
+  且 canKillSpin 在 PanelView 的 body 里——每拍都调、不用点按钮 ⇒ 一个越界 pid 就能崩掉
+  常驻菜单栏 App。现解码侧按 10_000_000 收口（与 ppid 同值），三处转换改 `Int32(exactly:)`
+  失败关闭（信号器报 EINVAL，不谎报"已退出"）。
+  CI/门禁：test job 此前不编 fanmcp（它不在 fanctltests 依赖图里，而唯一会编它的冒烟步
+  只在 main 推送跑、release 只在 tag 跑 ⇒ 编译坏掉时 PR 全绿），现补上并加防回潮门；
+  契约下限 **5319/101 → 5601/111**（R79–R84 六轮未抬，余量涨到 216 条断言 / 14 组，
+  足够整删 TestsMCP 与 TestsKillGuard 两组仍绿）。测试 5535 → **5607 断言 / 119 组**，
+  新增 4 组全部过变异检验（10 个变异点逐一看到红；其中"秒精度容差"第一轮存活——
+  夹具取了整秒时间戳使断言成为空气门，已修正夹具并补前提断言）。
 - 4.2.51：**MCP 发行链闭合（R84）**——4.2.50 发布了 `fanmcp`，但发行链还不认识它：
   CI 的 Release zip 不收集、install.sh/upgrade.sh 不安装、uninstall.sh 不清理，
   Release 用户装不到 MCP 服务器（本机无碍，Hermes 直指 dist/fanmcp）。本轮全链接上：

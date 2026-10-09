@@ -2323,3 +2323,96 @@ init 参数静默吞值）——审查计划本身也是审查。UI 教训：Cha
 - 测试 **5535 断言 / 115 组**全绿（Swift 侧零改动——发行链闭合是脚本/CI/文档轮，
   唯一 Swift 改动是 fanmcpVersion 常量随 VERSION 同步）；root 脚本门禁 66 → **72**；
   契约下限 5319/101 未动。
+
+## R85（4.2.52(146)）：双入口一致性——"App 是唯一写入方"这个前提在 R83 就失效了
+
+- **选题（作者原话："检查问题并修复"）**：盘点先撞见一条交付链断点——VERSION 已是
+  4.2.51(145)、测试与门禁全绿、RELEASE-NOTES 要点行齐备、build.sh 也能出四件套，
+  但 **git tag 与 GitHub Release 都停在 v4.2.35**（R77–R84 全压在一个提交里，从未发版）。
+  后果是可验的：App 的 `checkForUpdate` 读 `releases/latest`（FanModel.swift:503），
+  于是老用户永远看不到 4.2.36–4.2.51；访客下载 Latest 拿到的是**没有** R81 安全边界拆分、
+  没有进程实例守卫、没有 fanmcp 的旧包。按杠杆排序（状态说谎 > 特权边界 > 交付链），
+  本轮先修"状态说谎"，发版留给作者点头（见下"交接口"）。
+- **两路独立对抗审查**（数据口径/可靠性 + 提权面/一致性）共 15 条指控，逐条自己读码核实。
+  本轮采纳 7 条，其中"App 会静默抹掉 MCP 写入的 quiet/boost"被**两路独立发现**——
+  这类交叉命中在本仓历史上还从没出现过（以往约 1/3 指控是虚构的）。
+- **头号缺陷的机制（值得记，因为它是"新增入口没有同步改所有权模型"的通用形态）**：
+  App 每次 `saveConfig()` 都用内存值写回 `quietUntil/quietCapPercent/boostUntil`
+  （FanModel.swift:313-317），而 `syncConfigFromDisk()` 回填了 mode/manualPercent/preset/
+  aiTargetTemp/offsets/曲线，**唯独不读这三个字段**（旧注释还写着"App 是唯一写入方"）。
+  于是 MCP 开静音 → 面板任意一次操作、或每小时的 `maybeAutoOptimize` → 静音被无声取消；
+  MCP 开冲刺 → App 采纳了 mode=manual/100%（这两个字段它**是**回填的）但不知道有 boostUntil
+  → 下次 saveConfig 写成 `boostUntil: nil` + `mode: manual` + `manualPercent: 100`
+  → daemon 的到期判定是 `config.boostUntil != nil && ...`（ControlEngine:424）⇒ **永不触发**，
+  风扇钉在 100% 直到有人手动改模式。ControlEngine:418-421 的注释正好预言了这个形态
+  （"App 崩溃/退出后 config 保持 manual 100% 无限持续"），只是没想到触发者是 App 自己。
+- **修法是把判据收成一份，而不是三处各改一遍**：新增 `SMCCore/OverlayWindow.swift`
+  （24h 卫生上限 / isActive / quietActive 要求封顶值在场 / boostExpired）+ `OverlaySync.adopt`
+  （App 的对账纯函数，返回 quietEnd/cap/boostEnd/boostIsForeign/changed）。
+  daemon 的 `saneHorizon`、`quietActive`、`boostExpired` 三处改为调它（**行为不变**，
+  由既有 F5 引擎回归 + 81 成员 HIL 扫描当回归网；顺带消掉两个 `saneBoostUntil!` 强解包），
+  MCP 的 overlay 改为调它，App 新增 `adoptOverlayFromDisk` 在启动对账与 syncConfigFromDisk
+  两处调它。**为什么不给 MCP 单写一份镜像**：本仓 R78 就记过"第二份镜像 = 键名漂移能
+  安静跑几个月"，而这次的漂移（MCP 只判 `until > now`）正是镜像的产物。
+  App 侧的三个细节：① `quietCapPercent` 从 `let 30` 改成 `@Published var`，否则面板永远
+  显示 30 而 daemon 在执行别的入口写的 25；② 采纳外部冲刺时清掉 `boostPrevKey`
+  （没有快照可恢复，到期诚实回 auto，与 MCP 的 `boost end=true` 同语义）；
+  ③ 启动时把磁盘对账排在 UserDefaults 恢复**之前**，否则恢复路径里的 `endBoost→saveConfig`
+  会先把外部窗口抹掉。
+- **同轮修掉的三条"会说谎的读数" + 一条崩溃**：MCP 写路径无条件承诺"≤20s 生效"（daemon
+  死了也照许，而同文件的读路径对缺 status.json 是失败关闭的——两种口径）；
+  `fanctl_stats days>1` 的 `guard days == 1` 排在 `guard let s = today` **之前**，零数据时
+  回一堆 0 被 AI 读成实测；`num()` 的 isFinite 守卫在乘 scale **之前**，1e308 乘出 inf
+  让整份 status 退化成"此路径不应触达"却仍以 isError:false 交回；`SpinAlert.pid` 只判 `> 0`
+  无上限（同文件 ppid/threads/fdCount 都有界）而下游三处是会 trap 的 `Int32(pid)`，
+  alerts.json 在用户家目录且 `canKillSpin` 在 PanelView 的 body 里（每拍都调、不用点按钮）
+  ⇒ 一个越界 pid 崩掉常驻菜单栏 App。现解码按 10_000_000 收口 + 三处改 `Int32(exactly:)`
+  失败关闭（信号器报 EINVAL，不谎报"已退出"）。
+- **变异检验：10 个变异点，第一轮 9 杀 1 存活——存活的那条是我自己的夹具造假**。
+  "秒精度容差"那条断言用 `now = Date(timeIntervalSince1970: 1_790_000_000)`（整秒）
+  构造 appBoost，`floor()` 前后完全相等 ⇒ tolerance 改成 0 也全绿（空气门，与 R69 记的
+  "自摆假绿"同族）。修法：夹具改带亚秒（+600.7），并**补两条前提断言**把"夹具确实带
+  亚秒差""差值确实落在容差内"钉住，防止将来再被改回空气门。重跑该变异 → 3 条红。**10/10**。
+- **CI/门禁**：test job 此前不编 fanmcp（不在 fanctltests 依赖图里，唯一会编它的冒烟步
+  只在 main 推送跑、release 只在 tag 跑 ⇒ 编译坏掉时 PR 全绿），补 `--product fanmcp`
+  并加防回潮门（72 → 73）。**契约下限 5319/101 → 5601/111**：R79–R84 六轮都没抬，
+  实测从 5344 涨到 5535、组数 110→115，余量因此涨到 216 条断言 / 14 组——足够把
+  TestsMCP 与 TestsKillGuard 两组整段删掉而两道门全绿。教训写进 main.swift 的抬升记录：
+  门槛要**每轮**跟着实测走，"以后一起抬"等于当轮没有门。
+- 测试 5535 → **5607 断言 / 119 组**（+4 组：窗口三入口同源 / MCP 不替 daemon 撒谎 /
+  App 对账外部窗口 / pid 越界不崩）；App 侧接线另有一道静态门（fanctltests 不依赖
+  FanCtlApp，纯函数测得到判据、测不到"App 有没有真的去调"，故钉 `adoptOverlayFromDisk(`
+  出现 ≥3 次 = 1 定义 + 2 调用点，删掉任一调用点即红——已用变异验证）。
+
+### R85 交接口（核实成立但本轮**未修**，按杠杆排序）
+
+1. **发行链断点（要作者点头才动）**：VERSION 4.2.52(146) 已就绪、全绿，但 v4.2.36–v4.2.52
+   从未打 tag。打 tag 会触发 release job 公开发版（外部可见），且 2026-10-01 那轮作者
+   曾把发版步骤叫停过 ⇒ 摆事实后停等，不自作主张推 tag。本地已把 CI 的打包与
+   可执行位自证照跑一遍（zip 内三脚本 + 三二进制全部 `^.rwxr-xr-x`，解包后 fanmcp 实跑
+   握手成功），资产名 `FanCtl-v4.2.52.zip` 与 `SelfUpgrade.assetURL` 契约一致，
+   单调门（v4.2.52 > v4.2.35）与 RELEASE-NOTES 门都已核过会过。
+2. **root 安装面跟随符号链接（特权边界，已实测复现）**：`install.sh:130-142` 与
+   `upgrade.sh:190-194` 用 `[[ -f "$DIST/fanmcp" ]]` + `install -m 755 -o root -g wheel`
+   装 fanprobe/fanmcp；`-f` 对指向普通文件的符号链接为真，而 **`install` 会跟随源符号链接**
+   （/tmp 实测：`install -m 755 link.bin out.bin` 把目标内容复制成 0755 新文件）。
+   staging 目录用户可写（本仓威胁模型自己就包含同 uid 竞态，见 upgrade.sh:20-21），
+   同 uid 进程把它换成指向 root-only 文件的符号链接 ⇒ root 把该文件内容复制成
+   全局可读的 `/usr/local/bin/fanmcp`（越权读取）。R84 记的"不扩哈希复核"理由
+   （"它们由用户态 exec，不在 root 执行代码信任链上"）只覆盖**执行**面，没覆盖这条**读取**面。
+   修法很小（安装前拒符号链接），但要同时改 install/upgrade 与它们的字面量门禁，
+   属独立主题，留下一轮。
+3. **SMCReadout / SMCDriver 两份 80 字节布局无防漂移门**：当前逐行相同（本轮 diff 过），
+   但 fanctltests 不依赖 SMCReadout（Package.swift:27），`SMCParamStruct` 等四个结构体
+   两处各一份，改一处不改另一处不会红。PROGRESS 记的取舍是"接受小段重复"，
+   缺的只是一道门（静态比对，或让测试依赖 SMCReadout 后断言 stride/字段偏移）。
+4. **低severity（核实成立，未修）**：`fanctl_status`/`fanctl_config_get` 标 `readOnlyHint:true`
+   但默认 hook `ConfigStore.loadConfig()` 会 `ensureDirectories()` 并在缺失时写默认配置
+   （Config.swift:1186-1193）——一次状态轮询可创建 config.json；`safety["controlFault"] = s.controlFault ?? false`
+   把"旧 daemon 没这字段"报成"无故障"（TestsMCP:196 已钉成故意行为）；`statusFresh` 的
+   30s 阈值只测了 true 分支，改成 3000 全绿；test-root-scripts.sh 对 upgrade.sh 的 fanmcp
+   门只钉两个独立子串（`rm -f "$STAGING/fanmcp"` + 一句注释即可通过）；
+   `fanctl_set_mode(curve, curvePreset:)` 用出厂点覆盖 App 存在 UserDefaults 的 AI 个性化曲线
+   且会被 App 下次 saveConfig 改回（瞬态）；MCP 的 `capPercent` 允许 0–100 而面板是常量 30
+   （红线仍成立：FanPipeline 的 quiet 封顶在 SSD/电池/92° 三条托底**之前**，cap=0 也压不住）。
+

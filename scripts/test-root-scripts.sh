@@ -328,6 +328,11 @@ if grep -q -- '--product fanmcp' "$ROOT/scripts/build.sh" \
 else
     bad "build.sh 不再编译/组装 dist/fanmcp（Release 用户拿不到 MCP 服务器）"
 fi
+if grep -q -- '--product fanmcp' "$ROOT/.github/workflows/ci.yml"; then
+    ok "ci.yml 编译 fanmcp（它不在 fanctltests 依赖图里，漏编则 PR 全绿、坏在 main/发版才炸）"
+else
+    bad "ci.yml 不编 fanmcp：唯一会编它的冒烟步只在 main 推送跑、release 只在 tag 跑"
+fi
 if grep -qF 'install -m 755 -o root -g wheel "$DIST/fanmcp" /usr/local/bin/fanmcp' "$INSTALL"; then
     ok "install.sh 把 fanmcp 装到 /usr/local/bin（AI 客户端可执行路径，与 fanprobe 同层）"
 else

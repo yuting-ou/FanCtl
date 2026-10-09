@@ -12,7 +12,7 @@ import Foundation
 import SMCCore
 
 // 与 VERSION 同步（fanctltests 有同源门钉住，改 VERSION 必须同步这里）
-let fanmcpVersion = "4.2.51 (145)"
+let fanmcpVersion = "4.2.52 (146)"
 
 let server = FanMCP.live(version: fanmcpVersion)
 let stderr = FileHandle.standardError

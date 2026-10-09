@@ -88,11 +88,14 @@ public struct SpinAlert: Codable, Equatable, Identifiable {
             return raw ?? nil
         }
 
-        // pid 是主键，必须存在且为正；缺失/非法时整条告警无意义，直接抛（调用方按坏数据处理）
+        // pid 是主键，必须存在且为正；缺失/非法时整条告警无意义，直接抛（调用方按坏数据处理）。
+        // 上限与 ppid 同值：下游 SpinKillGuard 的探针与 kill 都要过 `Int32(pid)`，那是
+        // **会 trap 的转换**——alerts.json 在用户家目录（同 uid 可写），一个 99999999999
+        // 就能把菜单栏 App 崩在面板渲染路径上（canKillSpin 在 body 里，每拍都调，不用点按钮）。
         guard let pidRaw: Int?? = try? c.decodeIfPresent(Int.self, forKey: .pid),
-              let pid = pidRaw ?? nil, pid > 0 else {
+              let pid = pidRaw ?? nil, pid > 0, pid <= 10_000_000 else {
             throw DecodingError.dataCorrupted(.init(codingPath: [CodingKeys.pid],
-                                                    debugDescription: "pid 缺失或非正数"))
+                                                    debugDescription: "pid 缺失或不在 1...10000000"))
         }
         self.pid = pid
         self.ppid = safeInt(.ppid, 0, 10_000_000)
