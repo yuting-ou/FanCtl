@@ -83,10 +83,14 @@
    理由只覆盖**执行**面，没覆盖这条**读取**面。
 3. **SMCReadout / SMCDriver 两份 80 字节布局无防漂移门**：当前逐行相同（本轮 diff 过），
    但 fanctltests 不依赖 SMCReadout，改一处不改另一处不会红。
-4. **本机安装偏差**：装机 App 与 daemon 都是 **4.2.50(144)**，仓库是 4.2.52(146)；
-   `/usr/local/bin/fanmcp` 仍不存在（install.sh 需 root，永不自做）。
-   4.2.51 是脚本/CI/文档轮（Swift 侧只差版本串），4.2.52 的 Swift 改动集中在
-   SMCCore + App，daemon 侧只有 ControlEngine 的判据搬家（行为不变）——
-   要不要为它弹一次 root 授权，归作者。Hermes 的 MCP 目前指向
-   `~/Documents/风扇管理/dist/fanmcp`（build.sh 原地覆盖，路径不断，实测可用）；
-   R84 给的稳定落点 `/usr/local/bin/fanmcp` 要等第 4 条装完才能切。
+4. **本机安装偏差——已清零（2026-10-10，经 macOS 管理员授权对话框）**：从**发行包**
+   （`gh release download v4.2.52` 解到 /tmp，root 执行 `~/Documents` 内脚本会被系统
+   EPERM 拒）走 install.sh，App 与 daemon 均 **4.2.52 (146)**，`/usr/local/bin/fanmcp`
+   已装（root:wheel 755）；`fanprobe --report` 19 行自检过，诊断包头部自报
+   "App 4.2.52 · daemon 自报 4.2.52"。Hermes 的 `qingfeng` 条目已改指
+   `/usr/local/bin/fanmcp`（备份 `~/.hermes/config.yaml.bak-20261010-fanmcp-stable`）。
+   **顺带在真机端到端验了 R85 的修复**：MCP 开一段"封顶 100%（=不封顶）1 分钟"的静音
+   → config.json 落盘 → 12s 后仍在（旧代码会被 App 的 saveConfig 抹掉）→ 到期后 App
+   的 tick 调 `endQuiet()` 把字段写回 null；**只有采纳过这段窗口的 App 才会做这个清理**
+   （旧代码下这两个字段会永远留在盘上），故采纳与对称取消都在真机上成立。
+   写路径的 note 也已是新口径（"状态 Ns 前更新"，报实测新鲜度而非无条件承诺）。
