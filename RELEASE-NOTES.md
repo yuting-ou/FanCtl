@@ -25,6 +25,26 @@
 
 ## 本版变更要点
 
+- 4.2.53：**daemon 下线清态四路合一（R86）**——面板判定 daemon 下线的清态逻辑此前在
+  4 条路径各抄一份（checkStatusFreshness 的读成功/读失败两支、refreshFromStatus 的
+  解码失败/陈旧两支），且**已经分叉**：读成功支清 18 个字段，解码失败/陈旧支只清 11–12 个。
+  走后者时面板一边显示「守护进程未运行」、一边留着过期的分项功耗 / 学习地图 / 决策透镜 /
+  环境温度，夜间/电池安静档徽章也继续挂——与「未运行」自相矛盾（安静档是 daemon 判定的，
+  它不在跑就没有任何档在生效）。收成单一 `FanModel.clearDaemonState()`（22 字段并集：
+  原 4 块的 19 个 + 补清 nightOverride / batteryOverride / learningRecently），
+  分叉在结构上不再可能；并给原本**每拍都清**的两条路径加生死翻转守卫——daemon 死期间
+  文件事件仍会反复调到 refreshFromStatus，每拍重写 22 个 @Published 等于每拍让整面板
+  失效一次，与 R52「只在真变了才发布」同一条纪律。故意**不清**的在函数注释里列明：
+  appliedPercent/appliedPercents/fans 保留末次读数调暗显「数据停更」（比清空回填诚实）、
+  hardwareProfile 是机器属性、learnedPoints/learnedSamples 另有 ConfigStore 来源、
+  用户意图字段（mode/曲线/偏移/补偿开关）daemon 死了也不能丢。清掉的 20 个字段只由
+  refreshFromStatus 的 assign() 从 status.json 赋值，daemon 回来即恢复。
+  验证：build 门禁 5607 断言 / 119 组全绿 + 离屏死态渲染（头部「未运行」、无残留徽章）
+  + 一路独立对抗审查**无确认缺陷**（它抓到的唯一问题是本说明曾误写 components 的回填
+  路径，已改）。真机活体死态**未能验**：造稳定死态窗口需停 daemon 的 sudo（作者未执行）；
+  无 sudo 的替代方案（循环删除 status.json）实测被 daemon 每拍原子重建 + AliveDebouncer
+  「上线立即生效」语义抵消，死态稳不住——已记入 EVOLUTION R86 反经验。FanModel 不在
+  fanctltests 依赖图内（App 目标需旧 SDK 编译），本修复无自动断言，属已知覆盖缺口。
 - 4.2.52：**双入口一致性（R85）**——4.2.50 加了 MCP 这个**第二写入方**，但 App 仍按
   "我是 config.json 的唯一写入方"行事，于是两条入口互相抹对方的状态，而且都不报错：
   ① **AI 助手开的「冲刺 15 分钟」会变成永久全速**：App 的 syncConfigFromDisk 回填了

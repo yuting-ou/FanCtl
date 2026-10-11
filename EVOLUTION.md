@@ -2424,3 +2424,53 @@ init 参数静默吞值）——审查计划本身也是审查。UI 教训：Cha
    且会被 App 下次 saveConfig 改回（瞬态）；MCP 的 `capPercent` 允许 0–100 而面板是常量 30
    （红线仍成立：FanPipeline 的 quiet 封顶在 SSD/电池/92° 三条托底**之前**，cap=0 也压不住）。
 
+
+## R86（4.2.53(148)）：daemon 下线清态四路合一——"抄四份"的债第一次真的分叉了
+
+**选题来源**：不是目标模式循环，是一次架构评审（用户问"这个架构做得怎么样"）顺带挖出的
+活 bug。评审结论另记：安全架构（依赖图强制特权边界 / 纯函数决策管线 / 失效模式覆盖）
+是真功夫；债务集中在两处大可变状态——`ControlEngine.beat()`（356→1346 行单函数、
+类内 85 个可变字段）与 `FanModel`（71 个 @Published 的上帝对象）。本轮回的是后者身上
+第一个**已分叉**的复制粘贴。
+
+**事实**：daemon 下线的清态在 4 条路径各抄一份，读成功支清 18 字段、解码失败/陈旧支只清
+11–12 字段。走后者时面板「守护进程未运行」与过期的分项功耗/学习地图/决策透镜/环境温度/
+安静档徽章同屏——安静档徽章尤其自相矛盾（nightOverride/batteryOverride 是 daemon 判定的）。
+
+**修法**：单一 `clearDaemonState()`（22 字段并集）+ 两条每拍清的路径加生死翻转守卫
+（死期间文件事件仍反复进 refreshFromStatus；每拍重写 22 个 @Published = 每拍整面板失效
+一次，违 R52 纪律）。故意不清的清单写进函数注释（末次读数调暗显「数据停更」是设计、
+hardwareProfile 是机器属性、用户意图不能丢）——**"不清什么"比"清什么"更容易在下次复制时丢**。
+
+**验证**：门禁 5607/119 全绿；离屏死态渲染无残留徽章；一路 fresh 对抗审查无确认缺陷
+（唯一指控是我注释误写 components 回填路径——syncPanelData 只从 panelVisible.didSet 调，
+长开面板不覆盖，已改注释）。
+
+**反经验（活体演示为什么失败）**：想无 sudo 造稳定死态窗口，循环删除 status.json——
+失败。daemon 每拍（~3s）原子重建，每次重建触发文件事件→一次成功刷新→AliveDebouncer
+「上线立即生效」立刻判活并重置去抖；死态只存在于我删除与 daemon 重建的缝隙里，第 40 秒
+截屏抓到的是活态。**结论：只要 daemon 还在写，无 sudo 就造不出稳定死态**；显示层修复的
+真机活体验证要么停 daemon（作者 sudo），要么给 App 加路径重定向入口（扩大发行调试面），
+两者都不值——接受"结构单点 + 离屏渲染 + 审查"的证据等级并如实记录缺口。
+
+**已知覆盖缺口（不掩饰）**：fanctltests 依赖图里没有 FanCtlApp（App 目标需钉旧 SDK，
+见 BLOCKED §2），故本修复**零自动断言**。防回潮只能靠"清态只剩一处"的结构事实。
+
+### R86 交接口（架构评审核实成立、本轮**未修**，按杠杆排序）
+
+1. `ControlEngine.beat()` 990 行单函数 + 85 可变字段：纯函数提取拿走了决策，接线仍全挤
+   一处；4.2.52 的"双入口一致性"类 bug 就长在这。拆它要先给接线层建可注入测试面。
+2. `FanModel` 71 个 @Published，daemon 镜像态/用户意图态/App 派生态类型上不可区分；
+   本轮的分叉清态就是它的症状。结构解法是把 daemon 镜像态收进一个可选值类型
+   （nil = 死），但牵动 ~百处视图引用，属独立一轮。
+3. config.json 三个写者（App / fanmcp / 手改）last-writer-wins 无锁无 CAS：MCP 的写落在
+   syncConfigFromDisk 与防抖 saveConfig 之间会被覆盖（非 overlay 字段）。窗口小但写者
+   已从 1 变 3。
+4. 断言契约下限 5601 vs 实际 5607：余量 216 条 / 14 组，足够整删 TestsMCP 与
+   TestsKillGuard 仍绿（R85 已记，本轮复核仍未抬）。5600 徽章被循环灌水
+   （expectPersonalityOrdered 单次 ~816 条），当覆盖率代理不可信。
+5. 调试机器进发行目标：TickBench.swift 344 行、FanCtlApp.init 的 ~150 行 --snapshot 分支、
+   `nonisolated(unsafe) snapshotPlainCards` 全局在 ~10 处视图分叉；NotificationService 的
+   `struct ProcessInfo` 遮蔽 Foundation.ProcessInfo。
+6. `CurveOptimizer.optimize` 只在 App 进程被调（FanModel:1218）：用户不开面板曲线就永不
+   重优化。可能是刻意（root 代码最小化），但架构文档没写这句权衡。

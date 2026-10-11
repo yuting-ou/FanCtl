@@ -616,6 +616,54 @@ final class FanModel: ObservableObject {
         configSource = source
     }
 
+    /// daemon 下线时清掉全部"只在 daemon 活着时才有意义"的状态。
+    ///
+    /// 此前这段清态在 4 个下线路径各抄一份（checkStatusFreshness 的读成功/读失败两支、
+    /// refreshFromStatus 的解码失败/陈旧两支），且已经分叉：读成功支清 18 个字段，
+    /// 解码失败支只清 11 个——走后者时面板会一边显示"守护进程未运行"、一边留着过期的
+    /// 分项功耗 / 学习地图 / 决策透镜 / 环境温度。收成一个函数后，分叉在结构上不再可能。
+    ///
+    /// 故意**不清**的（清了反而是错的）：
+    /// - `appliedPercent`/`appliedPercents`/`fans`：面板刻意保留末次读数并调暗 +
+    ///   改标题为"数据停更"，比清空回填更诚实（PanelView 的 `.opacity(daemonAlive ? 1 : 0.55)`）。
+    /// - `hardwareProfile`：描述机器本身（风扇数/冷却分级），不随 daemon 生死变化。
+    /// - `learnedPoints`/`learnedSamples`：另有独立来源，直接从 ConfigStore.loadLearn() 重读。
+    /// - `configWriteFailed`：App 自己写 config.json 的结果，不是 daemon 状态。
+    /// - `envCompensation`/`palmCompensation`/`quietHours`/`envTempOverride`/`mode`/
+    ///   `manualPercent`/`preset`/`aiTargetTemp`：用户意图，daemon 死了也不能丢。
+    ///
+    /// 回填：其中 20 个字段只由 refreshFromStatus 的 assign() 从 status.json 赋值，
+    /// daemon 回来即恢复；`components`/`learnedNow` 例外，它们由 syncPanelData /
+    /// refreshFromStatus 的面板可见段独立回填（learnedNow 的来源 ai-learn.json 是持久
+    /// 知识，不随 daemon 生死失效）。这两段都在死态的 return 之后，所以死期间它们保持
+    /// 清空，直到重开面板或 daemon 回来——清这两个只是让生死翻转瞬间不显示过期行。
+    private func clearDaemonState() {
+        controlReason = nil
+        aiIntent = nil
+        controlFault = false
+        faultReason = nil
+        targetUnreachable = false
+        aiHighEffort = false
+        curveTargetPercent = nil
+        currentLoopInterval = nil
+        components = []
+        learnedNow = nil
+        learnMap = []
+        decisionTrace = nil
+        learningRecently = false
+        daemonMode = nil
+        configMismatch = false
+        envTemp = nil
+        systemPower = nil
+        aiTargetEffective = nil
+        palmComp = nil
+        calibrating = false
+        // 安静档覆盖标记：daemon 不在跑，就没有任何档在生效。留着会让面板继续画
+        // 夜间/电池曲线并挂"生效中"徽章——与"守护进程未运行"自相矛盾。
+        nightOverride = false
+        batteryOverride = false
+    }
+
     private func checkStatusFreshness() {
         if let status = ConfigStore.loadStatus() {
             let age = Date().timeIntervalSince(status.timestamp)
@@ -636,49 +684,14 @@ final class FanModel: ObservableObject {
             } else if wasAlive && !daemonAlive {
                 // daemon 刚下线：立即清除过期决策状态，避免 UI 长时间显示
                 // 过期的 controlReason/aiIntent/controlFault（下次 refreshFromStatus 最多 12s 后）
-                controlReason = nil
-                aiIntent = nil
-                controlFault = false
-                faultReason = nil
-                targetUnreachable = false
-                aiHighEffort = false
-                curveTargetPercent = nil
-                components = []
-                learnedNow = nil
-                learnMap = []
-                decisionTrace = nil
-                daemonMode = nil
-                configMismatch = false
-                envTemp = nil
-                systemPower = nil
-                aiTargetEffective = nil
-                palmComp = nil
-                calibrating = false
+                clearDaemonState()
             }
         } else {
             // status.json 不存在或无法读取：daemon 下线（含刚下线需清除状态）。
             // 读失败同样走去抖：单次读失败不闪断，连续 2 次才宣布下线；
             // 宽限期内保持现状（UI 数据是旧的但完整，好过清空回填）
             if !aliveDebouncer.update(observedAlive: false) {
-                if daemonAlive {
-                    controlReason = nil
-                    aiIntent = nil
-                    controlFault = false
-                    faultReason = nil
-                    targetUnreachable = false
-                    aiHighEffort = false
-                    curveTargetPercent = nil
-                    components = []
-                    learnedNow = nil
-                    learnMap = []
-                    decisionTrace = nil
-                    daemonMode = nil
-                    configMismatch = false
-                    envTemp = nil
-                    systemPower = nil
-                    aiTargetEffective = nil
-                    palmComp = nil
-                }
+                if daemonAlive { clearDaemonState() }
                 daemonAlive = false
             }
         }
@@ -694,36 +707,21 @@ final class FanModel: ObservableObject {
         guard let status = preloaded ?? ConfigStore.loadStatus() else {
             // 读失败走同一去抖器：单次失败宽限，连续 2 次判死
             if !aliveDebouncer.update(observedAlive: false) {
+                let wasAlive = daemonAlive
                 daemonAlive = false
-                controlReason = nil
-                aiIntent = nil
-                currentLoopInterval = nil
-                controlFault = false
-                faultReason = nil
-                targetUnreachable = false
-                aiHighEffort = false
-                curveTargetPercent = nil
-                daemonMode = nil
-                configMismatch = false
-                aiTargetEffective = nil
-                palmComp = nil
+                if wasAlive { clearDaemonState() }
             }
             return
         }
         lastStatusTimestamp = status.timestamp
+        let wasAlive = daemonAlive
         daemonAlive = aliveDebouncer.update(observedAlive: Date().timeIntervalSince(status.timestamp) < 30)
         if !daemonAlive {
-            controlReason = nil
-            aiIntent = nil
-            controlFault = false
-            faultReason = nil
-            targetUnreachable = false
-            aiHighEffort = false
-            curveTargetPercent = nil
-            daemonMode = nil
-            configMismatch = false
-            aiTargetEffective = nil
-            palmComp = nil
+            // 只在生死翻转那一拍清一次：本函数在 daemon 死期间仍会被文件事件反复调到，
+            // 每拍重写 22 个 @Published 等于每拍让整面板失效一次（与 R52 同一条纪律）。
+            // 清掉的字段里 20 个只由下面的 assign() 赋值，而这里已 return，不会再被填脏；
+            // 另两个（components/learnedNow）由 syncPanelData 独立回填，清了也留不住。
+            if wasAlive { clearDaemonState() }
             return
         }
 
