@@ -430,6 +430,19 @@ struct ContentView: View {
         }
     }
 
+    // 监测卡右上角的 tab 说明（单一来源，四个 tab 同一条 Text 同一种排版）
+    private var monitorTabHint: String? {
+        switch model.monitorTab {
+        case 0:
+            guard let first = model.history.first else { return nil }
+            return "最近 \(max(1, Int(Date().timeIntervalSince(first.id) / 60))) 分钟"
+        case 1: return "各部件温度 · 最热在顶"
+        case 2: return "今日战报"
+        case 3: return "CPU 占用最高 · GPU 温度"
+        default: return nil
+        }
+    }
+
     // 监测卡：趋势 sparkline / 哪里最热明细，固定高度避免切换时面板尺寸突变
     private var monitorCard: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -439,23 +452,15 @@ struct ContentView: View {
                     items: [("趋势", 0), ("最热", 1), ("今日", 2), ("占用", 3)],
                     selection: Binding(get: { model.monitorTab }, set: { model.monitorTab = $0 }))
                 Spacer()
-                if model.monitorTab == 0, let first = model.history.first {
-                    let mins = max(1, Int(Date().timeIntervalSince(first.id) / 60))
-                    Text("最近 \(mins) 分钟")
+                if let hint = monitorTabHint {
+                    // 单行钉死：占用页文案最长（"CPU 占用最高 · GPU 温度"），此前折成两行，
+                    // 把卡内正文整体下移 14pt——四个 tab 的说明必须占同一行高，
+                    // 否则切 tab 时正文会跳。缩到 0.8 兜底，不换行。
+                    Text(hint)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                } else if model.monitorTab == 1 {
-                    Text("各部件温度 · 最热在顶")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                } else if model.monitorTab == 2 {
-                    Text("今日战报")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                } else if model.monitorTab == 3 {
-                    Text("CPU 占用最高 · GPU 温度")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                 }
             }
             ZStack(alignment: .top) {

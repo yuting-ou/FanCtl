@@ -115,7 +115,10 @@ struct TempGaugeCard: View {
                 }
             }
             // 主温度独占一行，保持视觉冲击力
-            HStack(alignment: .firstTextBaseline, spacing: 1) {
+            // spacing 取负是给度数符号做字距：本卡 ° 是独立 Text（数字要渐变、° 要降透明度，
+            // 不能合成一串），按 spacing 1 排会隔出 ~9pt，看着像"70 °"。-2 收到接近单串
+            // 排版的紧度，且对 0/8 这类圆右缘数字不撞笔画（-6 实测会压到"0"上）。
+            HStack(alignment: .firstTextBaseline, spacing: -2) {
                 Text(temp > 1 ? "\(Int(temp))" : "--")
                     .font(.system(size: 32, weight: .semibold, design: .rounded))
                     .foregroundStyle(color.gradient)
@@ -129,6 +132,10 @@ struct TempGaugeCard: View {
                 Text("°")
                     .font(.system(size: 22, weight: .medium, design: .rounded))
                     .foregroundStyle(color.opacity(0.6))
+                    // 度数符号要"挂"在数字上方，不是坐在基线上：本卡 ° 是独立 Text 与
+                    // 32pt 数字共基线，实测环心只到字高的 0.51（读起来像分隔圆点）；
+                    // AI 卡那处 "64°" 是单串排版，环心在字高 0.74。抬 5pt 让两处一致。
+                    .baselineOffset(5)
             }
             // 副值：Apple 风 chip 标签，紧贴主温度下方，主从层级清晰
             // 小圆点 + "核心均温 X°"，用 capsule 背景与主温度形成视觉分隔
