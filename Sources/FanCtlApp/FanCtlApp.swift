@@ -62,7 +62,11 @@ struct FanCtlApp: App {
             // 可选指定模式预览：--snapshot auto|curve|manual（仅渲染，不写配置）
             // v2.6.2：先处理子视图快照分支（custom 会被 FanMode(rawValue:) 劫持成 .custom 模式，
             // 导致整面 custom 快照永远不可达——见下方 switch）
-            let lastArg = CommandLine.arguments.last
+            let lastArg = CommandLine.arguments.last(where: {
+                !$0.hasPrefix("-") && !$0.contains("=")
+                    && !["warn", "boost", "dead", "lens", "dark"].contains($0)
+            })
+
             // 排版实测用：--snapshot warn <mode> 强制最长警示条在场，量最坏情况总高
             if CommandLine.arguments.contains("warn") { model.configWriteFailed = true }
             // 排版实测：--snapshot lens 预览决策透镜行与学习地图有数据态（布局最坏情况）
@@ -164,10 +168,16 @@ struct FanCtlApp: App {
                     break
                 }
             }
-            // 排版实测的场景开关：只改模型字段，不碰配置与 SMC（与 warn/boost/dead/lens 同族）。
+            // 排版实测的场景开关：只改内存里的模型字段（tab3 会顺带拉起一次只读 /bin/ps
+            // 采样——monitorTab 的 didSet 行为，与真机切到「占用」tab 同一条路）。
             // 每个名字对应一个"默认屏看不见"的 UI 形态，供逐屏量网格。
+            // **拼错或未知的场景名一律 exit(2)**：静默忽略会照样写出一张 PNG，
+            // 而那张图其实是默认屏——量具说谎比没有量具更糟。
             func applySnapshotScene(_ spec: String, to m: FanModel, now: Date) {
-                for s in spec.split(separator: ",") {
+                // cold 先跑：它清 history/stats/进程榜，若排在 tab2/tab3 之后会把
+                // 刚填进去的夹具抹掉，而文件名仍写着那两个 tab。
+                let tokens = spec.split(separator: ",").map(String.init)
+                for s in (tokens.filter { $0 == "cold" } + tokens.filter { $0 != "cold" }) {
                     switch String(s) {
                     case "digits":       // 度数符号字距的最坏两位：1（右余白最大）与 0（圆右缘）
                         m.cpuTemp = 81; m.gpuTemp = 90
@@ -192,7 +202,13 @@ struct FanCtlApp: App {
                             m.gpuTemp = 63
                         }
                     case "editcurve":    // 自定义档：可拖控制点 + 恢复预设 + 锚点条
+                        // 显式清覆盖：真机此刻若挂着夜间/电池安静档，曲线会被换成安静档、
+                        // 控制点根本不在屏上（4.2.55 逐屏量时踩到：夹具名不副实）。
                         m.preset = .custom
+                        m.batteryOverride = false; m.nightOverride = false
+                    case "nightcustom":  // 自定义档 + 夜间覆盖（画安静档曲线的那一屏）
+                        m.preset = .custom
+                        m.quietHours = true; m.nightOverride = true
                     case "spin":         // 后台空转告警行（AI 卡状态链链首，带按钮）
                         m.spinAlerts = [SpinAlert(pid: 4242, ppid: 1, name: "Foo Helper",
                                                   cpu: 94.6, peak: 99, heldSeconds: 620,
@@ -231,7 +247,11 @@ struct FanCtlApp: App {
                         m.aiMetrics = nil; m.learnedNow = nil; m.decisionTrace = nil
                         m.curveTargetPercent = nil; m.aiIntent = nil; m.rampAttribution = nil
                     case "singlefan":    // 单风扇机器的命名分支（"风扇 1" 而非"左风扇"）
-                        if !m.fans.isEmpty { m.fans = [m.fans[0]] }
+                        guard !m.fans.isEmpty else {
+                            FileHandle.standardError.write(Data("scene=singlefan 无风扇可读\n".utf8))
+                            break
+                        }
+                        m.fans = [m.fans[0]]
                     case "metrics":      // AI 评测磁贴（与透镜行互斥，故先撤透镜）
                         m.decisionTrace = nil
                         var met = AIControlMetrics(targetTemp: 76)
@@ -253,14 +273,21 @@ struct FanCtlApp: App {
                             d.maxTemp = 90 - Double(i); d.maxTempAt = now
                             d.tempSum = (64 + Double(i)) * 1200; d.tempCount = 1200
                             d.highTempSeconds = 3600 - Double(i) * 600
+                            // 直方图堆在热尾（桶宽 2°C、起点 40°C ⇒ 第 21 桶起 = 82°C+），
+                            // 与 maxTemp 90 / highTempSeconds 同一口径。判据写成显式下界：
+                            // 原来的 `b > 20 && b < 34` 上界恒真（bucketCount=28），是空气条件。
                             d.tempHistogram = (0..<TempHistogram.bucketCount).map { b in
-                                Double((b > 20 && b < 34) ? 900 : 40)
+                                Double(b >= 21 ? 900 : 40)
                             }
                             return d
                         }
                         m.pendingAICurve = CurveOptimizer.optimize(days: days)
+                        if m.pendingAICurve == nil {
+                            FileHandle.standardError.write(Data("scene=suggest 优化器返回 nil（夹具不足以出建议，这张图不是建议块）\n".utf8))
+                        }
                     default:
-                        break
+                        FileHandle.standardError.write(Data("未知 scene 名：\(s)（可用：quiet/tab1/tab2/tab3/editcurve/nightcustom/spin/nofan/battery/night/palm/unreachable/calibrate/higheffort/rec/fault/mismatch/envover/cold/singlefan/metrics/suggest/digits）\n".utf8))
+                        exit(2)
                     }
                 }
             }

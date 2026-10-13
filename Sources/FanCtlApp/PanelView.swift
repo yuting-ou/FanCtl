@@ -737,6 +737,12 @@ struct ContentView: View {
                                    onChange: { model.updateCustomPoints($0) },
                                    height: model.pendingAICurve != nil ? 52 : 92)
                 // #13: 恢复到均衡预设（自定义模式的初始基准）
+                if snapshotPlainCards {
+                    // 快照：borderless Button 离屏退 🚫 → 静态 Label（自定义档这一屏要量排版）
+                    Label("恢复预设", systemImage: "arrow.counterclockwise")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
                 Button {
                     model.updateCustomPoints(CurvePreset.balanced.points)
                 } label: {
@@ -745,6 +751,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
+                }
             } else {
                 CurveChart(config: model.batteryOverride
                                ? FanConfig(mode: .curve, curve: model.points(for: .quiet), preset: .quiet)
@@ -759,7 +766,7 @@ struct ContentView: View {
             
             // 底部提示行：电池覆盖 > AI 结论 > 再优化提示 > 常规；右侧 AI 优化按钮
             HStack(spacing: 6) {
-                Text(batteryHint ?? model.aiSummary
+                Text(batteryHint ?? nightHint ?? model.aiSummary
                      ?? (model.aiNudge ? "💡 数据已更新，建议重新 AI 优化" : nil)
                      ?? (model.preset == .custom
                                      ? "拖动蓝色控制点自定义曲线 · 当前输出 \(Int(model.appliedPercent))%"
@@ -806,8 +813,15 @@ struct ContentView: View {
                     Text(suggestion.summary)
                         .font(.caption2).foregroundStyle(.secondary)
                     HStack {
-                        Button("保留当前") { model.dismissAICurve() }
-                            .buttonStyle(.borderless)
+                        if snapshotPlainCards {
+                            // 快照：borderless Button 桥接 AppKit 离屏退 🚫 → 等尺寸静态标签
+                            //（这一屏要量动作行的排版，占位块会把整行盖掉）
+                            Text("保留当前")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Button("保留当前") { model.dismissAICurve() }
+                                .buttonStyle(.borderless)
+                        }
                         Spacer()
                         Button("确认应用") { model.confirmAICurve() }
                             .buttonStyle(.borderedProminent)
@@ -836,6 +850,16 @@ struct ContentView: View {
     private var batteryHint: String? {
         model.batteryOverride
             ? "电池供电 · 安静档生效中 · 当前输出 \(Int(model.appliedPercent))%"
+            : nil
+    }
+
+    // 夜间覆盖同理：此时卡上画的是安静档曲线、自定义档的控制点**不在屏上**，
+    // 不能再提示"拖动蓝色控制点"（4.2.55 逐屏量时踩到：夜间档生效 + 自定义档同屏时，
+    // 旧文案指向一个画面上不存在的操作）。句式与长度对齐 batteryHint——提示行右侧还有
+    // "AI 优化"按钮，超过 ~20 字会被 tail 截断（第一版 26 字实测截成"当前…"）。
+    private var nightHint: String? {
+        model.nightOverride
+            ? "夜间安静档生效中 · 当前输出 \(Int(model.appliedPercent))%"
             : nil
     }
 

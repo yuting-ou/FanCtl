@@ -115,9 +115,10 @@ struct TempGaugeCard: View {
                 }
             }
             // 主温度独占一行，保持视觉冲击力
-            // spacing 取负是给度数符号做字距：本卡 ° 是独立 Text（数字要渐变、° 要降透明度，
-            // 不能合成一串），按 spacing 1 排会隔出 ~9pt，看着像"70 °"。-2 收到接近单串
-            // 排版的紧度，且对 0/8 这类圆右缘数字不撞笔画（-6 实测会压到"0"上）。
+            // spacing 取负是给度数符号做字距。本卡 ° 是独立 Text（数字要渐变、环要降透明度，
+            // 不能合成一串），串与串之间没有字体 kern，实测间隙随末位数字的字宽余白浮动：
+            // spacing 1 时 0 结尾 4.0pt、1/4 结尾 9.5pt（"81 °" 那种松散感）；收到 -2 是
+            // 1.0~6.5pt，与 AI 卡单串 "64°" 实测的 2.5pt 同一档；-6 会让 0 结尾压上笔画。
             HStack(alignment: .firstTextBaseline, spacing: -2) {
                 Text(temp > 1 ? "\(Int(temp))" : "--")
                     .font(.system(size: 32, weight: .semibold, design: .rounded))
