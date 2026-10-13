@@ -80,6 +80,8 @@ struct TempGaugeCard: View {
         default: return "偏高"
         }
     }
+    // 副值 chip 的实测高（快照标定：10pt 圆体行高 + 上下各 2pt）。
+    private static let subTempSlotHeight: CGFloat = 17
     // 副值显示条件：有值且与主值差异>1°（差异太小显示无意义）
     private var showSubTemp: Bool {
         guard let s = subTemp, s > 1, temp > 1, abs(temp - s) > 1 else { return false }
@@ -145,10 +147,16 @@ struct TempGaugeCard: View {
                 .background(Capsule().fill(.quaternary.opacity(0.5)))
                 .contentTransition(.opacity)
                 .transition(.opacity.combined(with: .scale(scale: 0.9)).combined(with: .move(edge: .top)))
+            } else {
+                // GPU 没有"核心均温"这类真实副指标（不伪造数据、不为对称而编），但槽位照留。
+                // 松态下 HStack 会把两卡拉到等高（=较宽的 CPU 卡），Spacer 一吸收看不出差别；
+                // 但面板被挤压/拉伸时（警示态、lens 态、daemon 挂）Spacer 只能压到 0，
+                // 少一行固定内容的 GPU 卡最小高就矮一截——快照实测顶边错开 12pt、高差 25pt
+                // （warn 态 CPU 156..463 / GPU 181..438px）。留同高槽位后两卡同为 156..463。
+                Color.clear.frame(height: Self.subTempSlotHeight)
             }
-            // 把 sparkline 锚到卡底：CPU 有副值 chip、GPU 无（GPU 无"核心均温"这类真实副指标，
-            // 不伪造数据、不为对称而改守护进程）。Spacer 吸收两卡高度差，使左右 sparkline
-            // 基线对齐，消除"CPU 多一行导致 GPU 折线悬空"的视觉不对称。
+            // 把 sparkline 锚到卡底：两卡副值槽位等高后，Spacer 只剩"把折线压到卡底"这一职，
+            // 左右折线基线对齐；两卡高度差那条靠上面的槽位保证。
             Spacer(minLength: 0)
             SparkLine(values: history, color: color)
                 .frame(height: 26)
@@ -266,16 +274,20 @@ struct FanSpinner: View {
     let tint: Color
 
     var body: some View {
-        // 快照模式（ImageRenderer 离屏）不支持 NSViewRepresentable，退回静态图标
-        if snapshotPlainCards {
-            Image(systemName: "fanblades.fill")
-                .font(.title3)
-                .foregroundStyle(tint.gradient)
-                .opacity(rpm < 50 ? 0.3 : 1.0)
-        } else {
-            SpinnerNSView(rpm: rpm, tint: tint)
-                .frame(width: fanSpinnerSide, height: fanSpinnerSide)
+        // 快照模式（ImageRenderer 离屏）不支持 NSViewRepresentable，退回静态图标。
+        // 尺寸对两条分支同值：只给运行时那条套 frame，快照里的图标就按字身排布，
+        // 与真机差 4pt——拿快照核对左列对齐会量到假位置。
+        Group {
+            if snapshotPlainCards {
+                Image(systemName: "fanblades.fill")
+                    .font(.title3)
+                    .foregroundStyle(tint.gradient)
+                    .opacity(rpm < 50 ? 0.3 : 1.0)
+            } else {
+                SpinnerNSView(rpm: rpm, tint: tint)
+            }
         }
+        .frame(width: fanSpinnerSide, height: fanSpinnerSide)
     }
 }
 

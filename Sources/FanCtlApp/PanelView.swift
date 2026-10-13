@@ -629,6 +629,9 @@ struct ContentView: View {
                 }
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // 不是多余的 2pt：上行风扇图标是 24pt 框里的 fanblades，墨迹落在 31pt；
+                // 本行 arrow.up.right 的墨迹在 28pt。按框对齐会两行箭头/叶片左端差 3pt，
+                // 这 2pt 把它抹平（快照实测 28→30 vs 31）。
                 .padding(.horizontal, 2)
                 .transition(.opacity)
             }
@@ -1359,57 +1362,79 @@ extension ContentView {
         .help(t.explanation)
     }
 
-    // 学习地图（可折叠）：采信桶温度→风量折线 + 冻结按钮
+    // 学习地图（可折叠）：采信桶温度→风量折线 + 冻结按钮。
+    // 自绘展开行而非 DisclosureGroup：系统三角把整块标签右推 ~10pt（快照实测文字落在
+    // 57pt，而上方透镜行的文字在 47pt）——同一张卡里两行文字不同列。自己排布后
+    // chevron 与 ⊕ 同列、文字与透镜行同列，展开内容顺同一列缩进。
     fileprivate func learnMapDisclosure(_ model: FanModel,
                                         expanded: Binding<Bool>) -> some View {
-        DisclosureGroup(isExpanded: expanded) {
-            if model.learnMap.isEmpty {
-                Text("暂无采信数据——AI 在稳态时记录温度与风量的对应关系，正常使用数小时后出现")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .padding(.vertical, 4)
-            } else {
-                // v3.7：展开内容整体限高——无约束时 Charts 自适应高度会溢出 216pt 卡
-                //（快照 lens 实测溢出盖住底部按钮）；88pt 图 + 20pt 按钮 + hint 均在预算内
-                VStack(spacing: 6) {
-                    LearnMapView(points: model.learnMap)
-                        .frame(height: 72)
-                        .padding(.top, 2)   // Y 轴顶标"100"不被裁（快照 lens 实测裁半）
-                    if let hint = model.freezeHint {
-                        Text(hint)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                    }
-                    Button {
-                        model.freezeCurveFromLearn()
-                    } label: {
-                        Label("冻结为曲线快照", systemImage: "camera.on.rectangle")
-                            .font(.system(size: 11, weight: .semibold))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 4)
-                    }
-                    .buttonStyle(PressableButtonStyle())
-                    .controlSize(.small)
-                    .disabled(!model.canFreezeCurve)
-                    .help(model.canFreezeCurve
-                          ? "把 AI 学到的稳态经验转成普通曲线（快照）。之后 AI 继续学习，快照不跟进；安全兜底不变。"
-                          : "至少需要 2 个采信温度点（正常使用几小时后达成）")
+        VStack(alignment: .leading, spacing: 6) {
+            Button { expanded.wrappedValue.toggle() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: expanded.wrappedValue ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        // 占位宽按上方透镜行的 scope 图标盒子取（scope 墨迹 28..39.5、
+                        // 文字落在 47；chevron 自身只有 4pt 墨迹、自然盒 ~7pt）。
+                        // 不钉这格两行文字差 7.5pt；钉 11 还差 3.5pt，钉到 14 才同列。
+                        // alignment .leading 让箭头墨迹仍回到 28 那一列。
+                        .frame(width: 14, alignment: .leading)
+                    Text("学习地图（\(model.learnMap.count) 点）")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
                 }
-                .frame(height: 100, alignment: .top)
+                .contentShape(Rectangle())
             }
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "map")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text("学习地图（\(model.learnMap.count) 点）")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 0)
+            .buttonStyle(PressableButtonStyle())
+            .accessibilityValue(expanded.wrappedValue ? "已展开" : "已折叠")
+            if expanded.wrappedValue {
+                learnMapContent(model)
+                    .padding(.leading, 19)   // 与标签文字同列（27+14+5）
             }
         }
-        .font(.system(size: 10))
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.top, 2)
+    }
+
+    @ViewBuilder
+    private func learnMapContent(_ model: FanModel) -> some View {
+        if model.learnMap.isEmpty {
+            Text("暂无采信数据——AI 在稳态时记录温度与风量的对应关系，正常使用数小时后出现")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 4)
+        } else {
+            // v3.7：展开内容整体限高——无约束时 Charts 自适应高度会溢出 216pt 卡
+            //（快照 lens 实测溢出盖住底部按钮）。实际叠高 ~104pt（图 72+顶白 2 / 间距 6 /
+            // 按钮 24，freezeHint 在场再加一行），超出 100pt 限高框的部分由 326pt 槽位的
+            // 余量吸收——槽位才是硬预算，快照 lens 复验按钮不被裁。
+            VStack(alignment: .leading, spacing: 6) {
+                LearnMapView(points: model.learnMap)
+                    .frame(height: 72)
+                    .padding(.top, 2)   // Y 轴顶标"100"不被裁（快照 lens 实测裁半）
+                if let hint = model.freezeHint {
+                    Text(hint)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    model.freezeCurveFromLearn()
+                } label: {
+                    Label("冻结为曲线快照", systemImage: "camera.on.rectangle")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 4)
+                }
+                .buttonStyle(PressableButtonStyle())
+                .controlSize(.small)
+                .disabled(!model.canFreezeCurve)
+                .help(model.canFreezeCurve
+                      ? "把 AI 学到的稳态经验转成普通曲线（快照）。之后 AI 继续学习，快照不跟进；安全兜底不变。"
+                      : "至少需要 2 个采信温度点（正常使用几小时后达成）")
+            }
+            .frame(height: 100, alignment: .top)
+        }
     }
 }
 
@@ -1661,14 +1686,19 @@ private struct DaemonStatusDot: View {
                     Circle().fill(.green).frame(width: 7, height: 7)
                     Circle().stroke(.green.opacity(0.3), lineWidth: 1.2).frame(width: 7, height: 7)
                 }
+                .frame(width: 14, height: 14)
             } else {
                 PulseDotNSView(color: .systemGreen)
                     .frame(width: 14, height: 14)
             }
         } else {
+            // 7pt 点放进 14×14 框（与运行态同尺寸）：头部右列整体右锚定，未运行态差点
+            // 7pt 会把「⚡功耗 / 🌡环境」两枚胶囊一起左推、点自身横移 3.5pt——daemon
+            // 起停一次，头部右列就跳位。两态同框后只剩颜色与光晕在变。
             Circle()
                 .fill(Color.red)
                 .frame(width: 7, height: 7)
+                .frame(width: 14, height: 14)
                 .shadow(color: .red.opacity(0.5), radius: 3)
         }
     }
