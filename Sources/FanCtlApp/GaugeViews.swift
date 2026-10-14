@@ -103,7 +103,7 @@ struct TempGaugeCard: View {
                     Text(statusText)
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(color)
-                        .padding(.horizontal, 6)
+                        .padding(.horizontal, panelChipHInset)
                         .padding(.vertical, 2)
                         .background(Capsule().fill(color.opacity(0.15)))
                         .id(statusText)
@@ -150,7 +150,7 @@ struct TempGaugeCard: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
-                .padding(.horizontal, 7)
+                .padding(.horizontal, panelChipHInset)
                 .padding(.vertical, 2)
                 .background(Capsule().fill(.quaternary.opacity(0.5)))
                 .contentTransition(.opacity)
@@ -241,7 +241,7 @@ struct FanRow: View {
                     Text(offset == 0 ? "偏移" : "偏移 \(Int(offset))%")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(offset == 0 ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
-                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .padding(.horizontal, panelChipHInset).padding(.vertical, 3)
                         .background(Capsule().fill(.secondary.opacity(0.12)))
                 } else {
                 Menu {
@@ -254,7 +254,7 @@ struct FanRow: View {
                     Text(offset == 0 ? "偏移" : "偏移 \(Int(offset))%")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(offset == 0 ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
-                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .padding(.horizontal, panelChipHInset).padding(.vertical, 3)
                         .background(Capsule().fill(.secondary.opacity(0.12)))
                         .help("该风扇的独立转速偏移（±20%）。安全事件（92° 兜底/SSD 托底）不受偏移影响")
                 }

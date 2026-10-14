@@ -3,6 +3,13 @@ import SwiftUI
 import Charts
 import SMCCore
 
+/// 面板内联胶囊（药丸形小标签）的统一横向内边距。此前 9/7/6/5 四种并存，
+/// 而它们会并排出现在同一行里——横向不一，胶囊就"高矮齐、宽窄不齐"，
+/// 里面的文字也落不到同一列（27+9=36 vs 27+7=34）。纵向仍按字号分（9pt 徽章 2、
+/// 10~11pt 胶囊 3、决策原因胶囊 5），只有横向收成这一个真值。
+/// 全 App 的胶囊一律引用它；字面量 9/6/5 由 TestsCore 的门禁钉死不得复活。
+let panelChipHInset: CGFloat = 7
+
 // MARK: - 面板
 
 struct ContentView: View {
@@ -607,7 +614,7 @@ struct ContentView: View {
                     Text(r.label).font(.caption2.weight(.medium))
                 }
                 .foregroundStyle(Self.reasonColor(r))
-                .padding(.horizontal, 9).padding(.vertical, 5)
+                .padding(.horizontal, panelChipHInset).padding(.vertical, 5)
                 .background(Capsule().fill(Self.reasonColor(r).opacity(0.14)))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .id(r)  // 强制视图身份变化，触发内容转场
@@ -1001,7 +1008,7 @@ struct ContentView: View {
                             .lineLimit(1).fixedSize()
                     }
                     .foregroundStyle(s.1)
-                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .padding(.horizontal, panelChipHInset).padding(.vertical, 3)
                     .background(Capsule().fill(s.1.opacity(0.15)))
                     .id(i)
                     .transition(.opacity)
@@ -1012,7 +1019,7 @@ struct ContentView: View {
                     Text(model.controlReason == .aiIdle ? "风扇已交还系统" : "AI 状态同步中")
                         .font(.caption.weight(.medium)).foregroundStyle(.secondary)
                         .lineLimit(1).fixedSize()
-                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .padding(.horizontal, panelChipHInset).padding(.vertical, 3)
                         .background(Capsule().fill(.secondary.opacity(0.12)))
                         .id("pending")
                         .transition(.opacity)
@@ -1124,7 +1131,7 @@ struct ContentView: View {
                     Text("AI 正在全力散热").font(.caption.weight(.medium))
                 }
                 .foregroundStyle(.yellow)
-                .padding(.horizontal, 7).padding(.vertical, 3)
+                .padding(.horizontal, panelChipHInset).padding(.vertical, 3)
                 .background(Capsule().fill(.yellow.opacity(0.15)))
                 .transition(.opacity)
             }
@@ -1214,11 +1221,11 @@ struct ContentView: View {
             Label(text, systemImage: icon)
                 .font(.caption2.weight(.medium)).foregroundStyle(color)
                 .lineLimit(1).fixedSize()
-                .padding(.horizontal, 6).padding(.vertical, 3)
+                .padding(.horizontal, panelChipHInset).padding(.vertical, 3)
                 .background(Capsule().fill(color.opacity(0.12)))
             Image(systemName: icon)
                 .font(.caption2.weight(.medium)).foregroundStyle(color)
-                .padding(.horizontal, 5).padding(.vertical, 3)
+                .padding(.horizontal, panelChipHInset).padding(.vertical, 3)
                 .background(Capsule().fill(color.opacity(0.12)))
         }
         .help(help)

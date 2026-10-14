@@ -143,6 +143,18 @@ func testUIAnimationGuards() {
     } else {
         expect(false, "找不到 private func curveAIComboBar（改名要连门一起改，不得空转）")
     }
+    // R87 续：内联胶囊的横向内边距只有一个真值 panelChipHInset。此前 9/7/6/5 四种并存，
+    // 而它们会并排出现在同一行（AI 意图胶囊挨着电池/夜间胶囊），横向不一就"高矮齐、宽窄
+    // 不齐"，文字也落不到同一列。钉**引用次数**而非钉存在：新增胶囊漏走常量、或有人
+    // 把某处改回字面量，都会红（存在性断言不算牙——R47 铁律）。
+    let chipPanel = flat(panel).components(separatedBy: "padding(.horizontal,panelChipHInset").count - 1
+    let chipGauge = flat(gauge).components(separatedBy: "padding(.horizontal,panelChipHInset").count - 1
+    expectEqual(chipPanel, 6, "PanelView 内联胶囊 6 处一律走 panelChipHInset")
+    expectEqual(chipGauge, 4, "GaugeViews 内联胶囊 4 处一律走 panelChipHInset")
+    for lit in ["padding(.horizontal,5)", "padding(.horizontal,6)", "padding(.horizontal,9)"] {
+        expect(!flat(panel).contains(lit) && !flat(gauge).contains(lit),
+               "胶囊横向内边距不得复活字面量 \(lit)（走 panelChipHInset）")
+    }
     // 已知边界（R61 更新）：门仍只数**字面量**。① 剩下 4 处 numericText 里 `cur`（AI 卡 24pt 大温度，
     // PanelView:892）是 temp 类每拍量，本轮没动（R61 只测到 pct 类每拍 RSS 9.3→0.2MB 的路径，
     // temp 类实测本就 1.8MB/拍）；`learnedNow`(:941) 的经验 % 由 30 秒节奏的采样驱动、非每拍；
