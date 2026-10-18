@@ -7,40 +7,7 @@ import SwiftUI
 import ServiceManagement
 import UserNotifications
 import SMCCore
-
-// MARK: - 环形缓冲（固定容量 O(1) 追加，消除 removeAll 线性扫描）
-
-struct RingBuffer<T> {
-    private var buffer: [T?]
-    private var head = 0
-    private(set) var count = 0
-    let capacity: Int
-
-    init(capacity: Int) {
-        self.capacity = capacity
-        self.buffer = [T?](repeating: nil, count: capacity)
-    }
-
-    mutating func append(_ element: T) {
-        buffer[(head + count) % capacity] = element
-        if count < capacity {
-            count += 1
-        } else {
-            head = (head + 1) % capacity
-        }
-    }
-
-    var elements: [T] {
-        (0..<count).map { buffer[(head + $0) % capacity]! }
-    }
-
-    var isEmpty: Bool { count == 0 }
-
-    mutating func removeAll() {
-        head = 0; count = 0
-        buffer = [T?](repeating: nil, count: capacity)
-    }
-}
+import FanCtlAppCore
 
 // MARK: - 数据模型
 
@@ -224,18 +191,13 @@ final class FanModel: ObservableObject {
             }
         }
     }
-    private var historyBuffer = RingBuffer<TempSample>(capacity: 200)
+    private var historyBuffer = RingBuffer<TempSample>(capacity: TrendHistoryPolicy.capacity)
     private var aiBaselineTemps: [Double] = []    // AI 模式进入后前 30s 温度采样（#4 推荐）
     private var aiModeEnteredAt: Date? = nil      // 进入 AI 模式的时间
     @Published var stats: DailyStats? = nil
     @Published var customPoints: [CurvePoint] = CurvePreset.balanced.points
 
-    struct TempSample: Identifiable, Codable {
-        let id: Date
-        let cpu: Double
-        let gpu: Double
-        var temp: Double { max(cpu, gpu) }
-    }
+    typealias TempSample = FanCtlAppCore.TrendSample
 
     // 部件温度显示模型（从 daemon 传来的传感器数据转换）
     struct ComponentTempDisplay: Identifiable {
@@ -244,19 +206,9 @@ final class FanModel: ObservableObject {
     }
 
     // 高占用进程（“谁在发热”面板用）
-    typealias ProcessUsage = ProcessInfo
+    typealias ProcessUsage = FanCtlAppCore.ProcessUsage
 
-    private static let historyWindow: TimeInterval = 10 * 60
-    /// R52：趋势环按**它自己的信息率**采样——200 点铺满 600s 窗 = 3s/点。
-    /// 此前每拍（daemon 快拍可到 1s）都 append 并重发 history，SwiftUI 每拍重画整张
-    /// 趋势图；--tickbench 拆开归因实测：只让温度抖 = 853ms/拍，其余量都钉住 = 9ms/拍，
-    /// 差额就是这张图。快拍时段少采两拍不丢信息（环形缓冲本来就按 3s 分辨率显示）。
-    static let trendSampleSeconds: TimeInterval = 3
-
-    /// R53：趋势落盘节奏（秒）。原本按"每 30 拍"计，R52 把采样改成 3s 节奏后若仍按拍计
-    /// 会恶化到 90s，故改为按时间计。提成命名常量而不是留裸字面量：裸 `>= 30` 改成
-    /// `>= 0` 就是每拍写盘而测试全绿，静态门只能钉住有名字的单一真值。
-    static let historySaveSeconds: TimeInterval = 30
+    // 采样/落盘节奏与容量真值在 FanCtlAppCore.TrendHistoryPolicy（有执行级测试）
 
     private static let historyFile: URL = {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -267,20 +219,11 @@ final class FanModel: ObservableObject {
     private var trendDirty = false
 
     private static func loadHistoryBuffer() -> RingBuffer<TempSample> {
-        var ring = RingBuffer<TempSample>(capacity: 200)
-        guard let data = try? Data(contentsOf: historyFile),
-              let samples = try? JSONDecoder().decode([TempSample].self, from: data) else { return ring }
-        let cutoff = Date().addingTimeInterval(-historyWindow)
-        for s in samples where s.id >= cutoff { ring.append(s) }
-        return ring
+        TrendHistoryStore(fileURL: historyFile).load()
     }
 
     private func persistHistory() {
-        let dir = Self.historyFile.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        if let data = try? JSONEncoder().encode(historyBuffer.elements) {
-            try? data.write(to: Self.historyFile, options: .atomic)
-        }
+        TrendHistoryStore(fileURL: Self.historyFile).persist(historyBuffer.elements)
     }
     static let boostDuration: TimeInterval = 15 * 60
     static let quietDuration: TimeInterval = 30 * 60
@@ -307,22 +250,23 @@ final class FanModel: ObservableObject {
     let upgrader = SelfUpgradeService()
 
     var config: FanConfig {
-        let offsets = fanOffsets.allSatisfy { $0 == 0 } ? nil : fanOffsets
-        return FanConfig(mode: mode, manualPercent: manualPercent,
-                  curve: points(for: preset),
-                  preset: preset,
-                  batteryPreset: batterySaver ? .quiet : nil,
-                  batteryCurve: batterySaver ? points(for: .quiet) : nil,
-                  quietUntil: quietEndDate,
-                  quietCapPercent: quietEndDate != nil ? quietCapPercent : nil,
-                  aiTargetTemp: aiTargetTemp,
-                  fanOffsets: offsets,
-                  boostUntil: boostEndDate,
-                  envCompensation: envCompensation,
-                  quietHours: quietHours,
-                  nightCurve: quietHours ? points(for: .quiet) : nil,
-                  envTempOverride: envTempOverride,
-                  palmCompensation: palmCompensation)
+        FanConfigIntent.make(
+            mode: mode,
+            manualPercent: manualPercent,
+            curve: points(for: preset),
+            preset: preset,
+            batterySaver: batterySaver,
+            quietCurve: points(for: .quiet),
+            quietUntil: quietEndDate,
+            quietCapPercent: quietCapPercent,
+            aiTargetTemp: aiTargetTemp,
+            fanOffsets: fanOffsets,
+            boostUntil: boostEndDate,
+            envCompensation: envCompensation,
+            quietHours: quietHours,
+            nightCurve: points(for: .quiet),
+            envTempOverride: envTempOverride,
+            palmCompensation: palmCompensation)
     }
 
     func points(for p: CurvePreset) -> [CurvePoint] {
@@ -343,18 +287,9 @@ final class FanModel: ObservableObject {
     private var lastOwnConfigMTime: Date? = nil
     private let notifications = NotificationService()  // #1: 通知逻辑提取到独立类
     // 毛刺剔除：status.json 原子写，个别异常读（≤1 或较上一拍骤降>30°C）多为写瞬间截断，
-    // 一律沿用上一拍有效值，不采信异常值（防止 prev 被置 0 后 deglitch 失效、兜底被破坏）。
+    // 一律沿用上一拍有效值。hold 计数/CPU-GPU 独立门都在 FanCtlAppCore.StatusProjector。
     private var lastStatusTimestamp: Date = .distantPast
-    // 毛刺剔除 hold 计数：与 daemon smooth() 的 glitchMaxHold=3 对齐——
-    // 连续 3 拍仍"骤降>30°C"则采信（真实大幅降温，如负载结束），
-    // 此前无 hold 计数会永久钉在旧温度，菜单栏/过热通知长期失真
-    // v2.6.2:CPU/GPU 独立计数（此前共享,一个传感器毛刺会消耗另一个的 hold 额度）;
-    // raw<=1(daemon 传感器故障写 0)也加 hold——持续写 0 时应采信并显示故障,
-    // 而不是永远沿用旧温度(旧值 ≥90° 时 checkOverheat 每 10 分钟误发高温通知)
-    private var glitchHoldCPU = 0
-    private var glitchHoldGPU = 0
-    private var zeroHoldCPU = 0
-    private var zeroHoldGPU = 0
+    private var statusProjector = StatusProjector()
 
     init() {
         FanCtlPaths.ensureDirectories()
@@ -496,12 +431,10 @@ final class FanModel: ObservableObject {
     /// 失败都再挂一个 600s timer，"重试一次"实为无限链，长期离线机器每 10 分钟
     /// 网络唤醒一次）。命中"跳过此版本"不提示。
     @MainActor func checkForUpdate(force: Bool = false, retry: Int = 0) {
-        if updateCheckInFlight { return }
-        if !force,
-           let last = UserDefaults.standard.object(forKey: Self.updateLastCheckKey) as? Date,
-           Date().timeIntervalSince(last) < 24 * 3600 {
-            return
-        }
+        let lastSuccess = UserDefaults.standard.object(forKey: Self.updateLastCheckKey) as? Date
+        guard UpdateCheckPolicy.shouldCheck(now: Date(), lastSuccess: lastSuccess,
+                                            force: force,
+                                            inFlight: updateCheckInFlight) else { return }
         updateCheckInFlight = true
         let owner = self
         Task.detached(priority: .utility) {
@@ -524,21 +457,23 @@ final class FanModel: ObservableObject {
                 owner.updateCheckInFlight = false
                 guard let tag else {
                     // v3.6.1：失败不写 lastCheck——原实现在请求前落盘，开机时网络未就绪
-                    // 的这次失败会消费掉整个 24h 窗口。R23：重试预算 3 次封顶——
-                    // 原"重试一次"每次失败再挂 timer，实为无限链
-                    if retry < 3 {
-                        let retryTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: false) { _ in
+                    // 的这次失败会消费掉整个 24h 窗口。重试预算由 UpdateCheckPolicy 封顶，
+                    // 不会退化成"每次失败再挂一个 timer"的无限链。
+                    if let delay = UpdateCheckPolicy.nextRetryDelay(afterFailure: retry) {
+                        let retryTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
                             Task { @MainActor in owner.checkForUpdate(retry: retry + 1) }
                         }
-                        retryTimer.tolerance = 120
+                        retryTimer.tolerance = UpdateCheckPolicy.retryTolerance
                     }
                     return
                 }
                 UserDefaults.standard.set(Date(), forKey: Self.updateLastCheckKey)
                 let local = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
-                if VersionCheck.isNewer(tag, than: local),
-                   UserDefaults.standard.string(forKey: Self.updateSkippedKey) != tag {
-                    owner.updateAvailable = tag
+                let skipped = UserDefaults.standard.string(forKey: Self.updateSkippedKey)
+                if let available = UpdateCheckPolicy.availableUpdate(fetchedTag: tag,
+                                                                     localVersion: local,
+                                                                     skippedTag: skipped) {
+                    owner.updateAvailable = available
                 }
             }
         }
@@ -731,64 +666,43 @@ final class FanModel: ObservableObject {
         configMismatch = status.mode != mode && Date().timeIntervalSince(lastUserChange) > 2
 
         let sensors = status.sensors
-        // 数值防御：status.json 损坏/手改可含超大有限值或异常 RPM，
-        // Double→Int 越界在 Swift 是 fatal trap（daemon 侧有全套防御，App 侧此前为零）
-        let newCpu = deglitchTemperature(sanitizeTemp(sensors.cpuDie), prev: cpuTemp,
-                              glitchHold: &glitchHoldCPU, zeroHold: &zeroHoldCPU)
-        let newGpu = deglitchTemperature(sanitizeTemp(sensors.gpuDie), prev: gpuTemp,
-                              glitchHold: &glitchHoldGPU, zeroHold: &zeroHoldGPU)
-
-        let changed = Int(max(newCpu, newGpu)) != Int(max(cpuTemp, gpuTemp))
+        // status.json 可损坏/被手改：映射、毛刺剔除与逐字段消毒统一在
+        // FanCtlAppCore.StatusProjector（执行级测试覆盖），这里只负责赋值。
         let prevApplied = self.appliedPercent   // R82 续十：急升判定要用旧值
+        let p = statusProjector.project(status)
         let assign = {
-            self.cpuTemp = newCpu
-            self.cpuAverageTemp = sensors.cpuAverage.flatMap { $0.isFinite && $0 > 0 && $0 < 150 ? $0 : nil }
-            self.gpuTemp = newGpu
-            self.ssdTemp = sensors.ssd.flatMap { $0.isFinite && $0 > 0 && $0 < 150 ? $0 : nil }
-            self.palmRestTemp = sensors.palmRest.flatMap { $0.isFinite && $0 > 0 && $0 < 150 ? $0 : nil }
-            self.appliedPercent = (status.appliedPercent.isFinite
-                ? max(0, min(100, status.appliedPercent)) : 0)   // 钳位防 Int() trap
-            self.appliedPercents = status.appliedPercents?.map { $0.isFinite ? $0 : 0 } ?? [self.appliedPercent]
-            self.noteAppliedBeat(applied: self.appliedPercent, prev: prevApplied)
-            self.onBattery = status.onBattery ?? false
-            self.batteryOverride = status.batteryOverride ?? false
-            self.nightOverride = status.nightOverride ?? false
-            // v3.6.1：无效值显式清 nil——原 if-let 只在有效时覆盖，daemon 把 envTemp
-            // 置 nil（环境传感器失效）后 App 头部胶囊永远显示几分钟前的陈旧值
-            self.envTemp = status.envTemp.flatMap { $0.isFinite && $0 > 0 && $0 < 60 ? $0 : nil }
-            self.controlReason = status.reason
-            self.aiIntent = status.aiIntent
-            self.curveTargetPercent = status.curveTargetPercent
-            self.learningRecently = status.learningRecently ?? false
-            self.learnedSamples = status.learnedSamples ?? 0
-            self.hardwareProfile = status.hardwareProfile
-            self.calibrating = status.calibrating ?? false
-            // v3.7：学习地图只在 daemon 侧样本变化时才变（节流），直接透传；
-            // 数值防御在 LearnedPoint 生成侧保证，但 status.json 可被手改（同 decisionTrace
-            // 威胁模型）——isFinite 挡不住超大有限值（1e300 撑爆图表 x 域坍成一线），补温度区间。
-            self.learnMap = (status.learnMap ?? []).filter {
-                $0.temp.isFinite && $0.temp > 0 && $0.temp < 150
-                    && $0.percent.isFinite && $0.percent >= 0 && $0.percent <= 100
-                    && $0.samples > 0
-            }
-            self.decisionTrace = status.decisionTrace?.sanitized()
-            self.targetUnreachable = status.targetUnreachable ?? false
-            // R77：#12「AI 全力散热」由 daemon 判定下发（status.aiHighEffort），App 不再
-            // 自己按时长重算——此前计时器活在 UI 进程里，面板重建即归零，"持续 20s"测不准，
-            // 且阈值与 daemon 分叉，违反"App 展示一律读 status.json、不得重算控制语义"。
-            // 旧 daemon 无此字段 → nil → false（不显示该提示，退回只有 targetUnreachable 的行为）
-            self.aiHighEffort = status.aiHighEffort ?? false
-            if let pts = status.learnedPoints { self.learnedPoints = pts }
-            self.currentLoopInterval = status.loopInterval
-            self.controlFault = status.controlFault ?? false
-            self.faultReason = status.faultReason
-            self.aiTargetEffective = status.aiTargetEffective.flatMap {
-                $0.isFinite && $0 > 20 && $0 < 100 ? $0 : nil
-            }
-            self.palmComp = status.palmComp.flatMap { $0.isFinite && $0 > 0.5 && $0 <= 4 ? $0 : nil }
-            self.systemPower = status.powerWatts.flatMap { $0.isFinite && $0 > 0.1 && $0 < 1000 ? $0 : nil }
+            self.cpuTemp = p.cpuTemp
+            self.cpuAverageTemp = p.cpuAverageTemp
+            self.gpuTemp = p.gpuTemp
+            self.ssdTemp = p.ssdTemp
+            self.palmRestTemp = p.palmRestTemp
+            self.appliedPercent = p.appliedPercent
+            self.appliedPercents = p.appliedPercents
+            self.noteAppliedBeat(applied: p.appliedPercent, prev: prevApplied)
+            self.onBattery = p.onBattery
+            self.batteryOverride = p.batteryOverride
+            self.nightOverride = p.nightOverride
+            self.envTemp = p.envTemp
+            self.controlReason = p.controlReason
+            self.aiIntent = p.aiIntent
+            self.curveTargetPercent = p.curveTargetPercent
+            self.learningRecently = p.learningRecently
+            self.learnedSamples = p.learnedSamples
+            self.hardwareProfile = p.hardwareProfile
+            self.calibrating = p.calibrating
+            self.learnMap = p.learnMap
+            self.decisionTrace = p.decisionTrace
+            self.targetUnreachable = p.targetUnreachable
+            self.aiHighEffort = p.aiHighEffort
+            if let pts = p.learnedPoints { self.learnedPoints = pts }
+            self.currentLoopInterval = p.currentLoopInterval
+            self.controlFault = p.controlFault
+            self.faultReason = p.faultReason
+            self.aiTargetEffective = p.aiTargetEffective
+            self.palmComp = p.palmComp
+            self.systemPower = p.systemPower
         }
-        if panelVisible && changed {
+        if panelVisible && p.changed {
             withAnimation(.snappy(duration: 0.25)) { assign() }
         } else {
             assign()
@@ -810,14 +724,7 @@ final class FanModel: ObservableObject {
         // 转换风扇状态（数值防御：异常 RPM 不入 UI，避免 Int() trap）
         // v3.6.1：id 同样消毒——status.json 手改/损坏的负 id/超大 id 会让
         // fanOffsets[id] 越界崩溃或 while-append 写出十万级配置数组
-        var fanStates: [FanState] = []
-        for entry in status.fans where entry.id >= 0 && entry.id < 8 {
-            fanStates.append(FanState(id: entry.id,
-                                      actualRPM: safeRPM(entry.actualRPM),
-                                      minRPM: safeRPM(entry.minRPM),
-                                      maxRPM: safeRPM(entry.maxRPM),
-                                      targetRPM: safeRPM(entry.targetRPM)))
-        }
+        let fanStates = p.fans
         let rpmOld = fans.map { Int($0.actualRPM / 10) }
         let rpmNew = fanStates.map { Int($0.actualRPM / 10) }
         if rpmNew != rpmOld {
@@ -838,24 +745,21 @@ final class FanModel: ObservableObject {
         let nowT = Date()
         // R76：入环前先过可信门（与 daemon 统计同一谓词）——8.4°C 那种坏读数此前只被
         // `> 1` 放行，真机曾连进 45 条，把趋势图 y 轴从 45–74° 拉成 8–74°。
-        if hottest > 1, StatsSampler.tempPlausible(hottest, envTemp: envTemp),
-           nowT.timeIntervalSince(lastTrendAppend) >= Self.trendSampleSeconds {
+        // 节奏与可信谓词现在统一在 TrendHistoryPolicy.shouldAppend（执行级测试覆盖）。
+        if TrendHistoryPolicy.shouldAppend(hottest: hottest, envTemp: envTemp,
+                                           now: nowT, lastAppend: lastTrendAppend) {
             lastTrendAppend = nowT
             trendDirty = true
             // 内存采样照常：200 样本环形缓冲让"重开面板立即可见最近趋势"
             historyBuffer.append(TempSample(id: nowT, cpu: cpuTemp, gpu: gpuTemp))
-            // #7: RingBuffer 自动淘汰最旧元素，O(1) 追加，无 removeAll 线性扫描
             // v3.5.1（R3）：落盘仅在面板可见时进行——trend 文件唯一消费者是面板
-            // 打开时的快速恢复；面板长关期间每 30 事件一次 200 样本原子写是纯浪费
-            //（内存环仍在累积，App 退出时 willTerminate 兜底落盘）
-            if panelVisible {
-                // R53 收回 R52 的自伤：落盘原本"每 30 拍"一次，R52 把趋势采样改成 3s 节奏后
-                // 若仍按样本数计，快拍期就从 30s 恶化到 90s（强杀时多丢 60s 趋势）。
-                // 改成按**时间**判：与拍频解耦，最坏窗口恒定 30s。
-                if nowT.timeIntervalSince(lastHistorySave) >= Self.historySaveSeconds {
-                    lastHistorySave = nowT
-                    persistHistory()
-                }
+            // 打开时的快速恢复；面板长关期间每 30 秒一次 200 样本原子写是纯浪费
+            //（内存环仍在累积，App 退出时 willTerminate 兜底落盘）。
+            // R53：按时间而非按拍——与拍频解耦，最坏丢失窗口恒定 30s。
+            if TrendHistoryPolicy.shouldPersist(now: nowT, lastSave: lastHistorySave,
+                                                panelVisible: panelVisible) {
+                lastHistorySave = nowT
+                persistHistory()
             }
         }
 
@@ -904,15 +808,8 @@ final class FanModel: ObservableObject {
                        style: UserDefaults.standard.string(forKey: "menuBarStyle") ?? "both")
     }
 
-    // status.json 数值防御：非有限/越界值不进入 UI（daemon 侧有防御，App 侧此前为零）
-    private func sanitizeTemp(_ v: Double) -> Double {
-        v.isFinite && v > 0 && v < 150 ? v : 0
-    }
-    private func safeRPM(_ v: Double) -> Double {
-        v.isFinite ? min(max(v, 0), 20_000) : 0
-    }
-
-    // deglitch 已提取到 SMCCore (deglitchTemperature)，供 App 与测试共用
+    // status.json 数值防御已收敛到 FanCtlAppCore.StatusDefense（有执行级测试）
+    // deglitch 在 SMCCore（App 与测试共用）
 
     // 面板专属数据同步
     private func syncPanelData() {
@@ -942,7 +839,7 @@ final class FanModel: ObservableObject {
         func add(_ id: String, _ raw: Double?) {
             guard let raw, raw.isFinite else { hotspotHolds[id] = nil; return }
             var g = hotspotHolds[id] ?? (0, 0, raw)
-            let shown = deglitchTemperature(sanitizeTemp(raw), prev: g.prev,
+            let shown = deglitchTemperature(StatusDefense.temperature(raw), prev: g.prev,
                                             glitchHold: &g.glitch, zeroHold: &g.zero)
             guard shown > 1 else { hotspotHolds[id] = nil; return }
             hotspotHolds[id] = (g.glitch, g.zero, shown)

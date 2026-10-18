@@ -3,6 +3,7 @@ import Charts
 import ServiceManagement
 import UserNotifications
 import SMCCore
+import FanCtlAppCore
 
 // FanCtl 菜单栏 App
 // macOS 26 Liquid Glass 风格面板：玻璃卡片分组 + 实时曲线图，自适应深/浅色。

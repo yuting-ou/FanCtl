@@ -2554,3 +2554,37 @@ AI 意图胶囊 7pt、电池/体感/夜间胶囊 6pt（图标降级态 5pt）、
 边界说明（免得下一轮误伤）：行级横幅（空转告警 / 压不住目标，圆角矩形整宽）与整宽盒
 （曲线×AI 协同、学习状态、今日磁贴）**不是胶囊**，它们的内边距是盒→文字的层级距离，
 不参与这条统一。
+
+## R88（工作树，未发版）：App 展示层第一次有"执行级"测试
+
+**起因**：架构评审的结论是"承重墙已浇好，隔断没做"——FanCtlApp 是 executable target，
+fanctltests 编不到 FanModel/MenuBarState，App 侧行为只能读源码文本做静态门；status.json
+的数值防御、配置意图构造、菜单栏发布去重、ps 进程榜解析全在盲区里。
+
+**落点**：
+- 新增 Foundation-only `FanCtlAppCore`（不 import SwiftUI）：status.json 数值防御
+  （StatusDefense）、config 意图构造（FanConfigIntent）、菜单栏量化状态（MenuBarState）、
+  ps 输出解析（ProcessUsageParser）。
+- FanCtlApp 依赖新 target；fanctltests 也依赖它，新增 4 组执行级测试（5740/125）。
+- R88 续：趋势历史也进入 core——`TrendHistoryPolicy`（可信门/3s 采样/30s 落盘/容量）、
+  `TrendHistoryStore`（注入路径的落盘/恢复）、`RingBuffer` 与 `TrendSample`。FanModel
+  只保留接线；原"按出现次数钉节奏"的源码门改成"必须走 policy"的边界门。
+- R88 续二：升级检查的节流/重试/提示判定进入 `UpdateCheckPolicy`（24h 成功窗口、在途
+  阻断、force 语义、3 次重试预算、跳过 tag）；网络与升级执行仍在 App。
+- R88 续三：`refreshFromStatus` 的 50 行字段映射/毛刺剔除进入 `StatusProjector`，FanModel
+  只负责把投影值赋给 @Published；坏 status.json 的字段级防御第一次有执行级测试。最终
+  5850/130，FanModel 1415 → 1337 行。
+- 顺手补了两处防御：appliedPercents 逐项钳 [0,100]；MenuBarState 的温度桶先限域再 Int()
+  （1e300 是有限数，原实现会 trap）。
+- 文档：architecture.md 的 target 依赖图加入 FanCtlAppCore，并写明"SwiftUI 仍在
+  executable，纯逻辑先放 core"的分界。
+
+**验证**：release 5850/130 全绿；变异检验 25 处（百分比钳位、静音封顶同生共死、icon 样式
+发布去重、helper CPU 归并、自定义曲线透传、quiet 真值、非有限 CPU 过滤、学习点 0/100
+边界、环形回绕、可信门、面板关闭不落盘、窗口外样本过滤、升级在途阻断、24h 节流、重试
+预算/跳过 tag、策略收到真实上次时刻、策略常量真值、状态投影毛刺/逐风扇消毒/动画桶）累计
+触发 54 条失败；build.sh 全产物构建成功；root 脚本门禁 73/0；离屏快照（默认 + label）
+可出图。
+
+**未做**：FanModel 仍是 1476 行协调器；下一刀按"变更原因"拆，不按行数——候选是趋势历史
+（环形缓冲 + 落盘节奏）与升级编排。PanelView 仍 1912 行，留待视觉轮。

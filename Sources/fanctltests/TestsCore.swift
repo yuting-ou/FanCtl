@@ -91,8 +91,8 @@ func testUIAnimationGuards() {
     let viewDir = root.appendingPathComponent("Sources/FanCtlApp")
     let viewFiles = ((try? FileManager.default.subpathsOfDirectory(atPath: viewDir.path))?.sorted() ?? [])
         .filter { $0.hasSuffix(".swift") }
-    expectEqual(viewFiles.count, 11,
-                "FanCtlApp 视图文件数=11（死数字：新增文件会同时进下面的转场预算）")
+    expectEqual(viewFiles.count, 10,
+                "FanCtlApp 视图文件数=10（死数字：新增文件会同时进下面的转场预算）")
     var transTotal = 0
     var tweenTotal = 0
     for f in viewFiles {
@@ -164,21 +164,49 @@ func testUIAnimationGuards() {
     // R52：趋势环按自身信息率采样 + 只在真变了才重发 history。
     // 这条不是观感而是每拍成本：SwiftUI 侧 `history` 每拍换新数组 = 整张图重排重绘。
     let modelCode = codeOnly(model).joined()
-    // 存在性反断言不算牙（R47 教训）：钉**次数**，把采样条件旁路掉但留着声明也会红
-    expectEqual(modelCode.components(separatedBy: "trendSampleSeconds").count - 1, 2,
-                "trendSampleSeconds 出现 2 次（声明 + 采样条件）——旁路节奏门即红")
-    expectEqual(modelCode.components(separatedBy: "lastTrendAppend").count - 1, 3,
-                "lastTrendAppend 出现 3 次（声明 + 比较 + 盖时间戳）——绕过计时即红")
+    // R88：采样/落盘节奏已移到 FanCtlAppCore.TrendHistoryPolicy（执行级测试覆盖可信门、
+    // 3s 采样、30s 落盘）。源码门只守接线：FanModel 不许绕过策略自己比时间。
+    expectEqual(modelCode.components(separatedBy: "TrendHistoryPolicy.shouldAppend").count - 1, 1,
+                "采样必须走 TrendHistoryPolicy.shouldAppend（旁路即红）")
+    expectEqual(modelCode.components(separatedBy: "lastTrendAppend = nowT").count - 1, 1,
+                "采样放行后必须盖时间戳")
+    expect(!modelCode.contains("timeIntervalSince(lastTrendAppend)"),
+           "采样节奏不得在 FanModel 内重算（策略在 core）")
     expect(modelCode.contains("if trendDirty"),
            "history 只在环真的动了才重发（无条件赋值等于每拍告诉 SwiftUI 图变了）")
     expectEqual(modelCode.components(separatedBy: "history = historyBuffer.elements").count - 1, 2,
                 "history 赋值点=2（面板打开时全量 + 每拍条件式），加第三处即红")
-    // R53 审查 O5：落盘节奏原本是裸字面量 `>= 30`，改成 0 就是"每拍写一次盘"而全绿。
-    // 与 trendSampleSeconds 同法——命名常量 + 钉出现次数。
-    expectEqual(modelCode.components(separatedBy: "historySaveSeconds").count - 1, 2,
-                "historySaveSeconds 出现 2 次（声明 + 落盘条件）——旁路落盘节奏门即红")
-    expectEqual(modelCode.components(separatedBy: "lastHistorySave").count - 1, 3,
-                "lastHistorySave 出现 3 次（声明 + 比较 + 盖时间戳）——绕过计时即红")
+    expectEqual(modelCode.components(separatedBy: "TrendHistoryPolicy.shouldPersist").count - 1, 1,
+                "落盘必须走 TrendHistoryPolicy.shouldPersist（旁路即红）")
+    expectEqual(modelCode.components(separatedBy: "lastHistorySave = nowT").count - 1, 1,
+                "落盘后必须盖时间戳")
+    expect(!modelCode.contains("timeIntervalSince(lastHistorySave)"),
+           "落盘节奏不得在 FanModel 内重算（策略在 core）")
+    expectEqual(modelCode.components(separatedBy: "statusProjector.project(status)").count - 1, 1,
+                "status 映射必须走 StatusProjector（在 FanModel 里手抄映射即红）")
+    // 只数调用点挡不住"把上次时刻换成 .distantPast"——策略仍在，但节流实际失效。
+    expect(modelCode.contains("lastAppend: lastTrendAppend"),
+           "采样策略必须收到真实上次采样时刻（.distantPast = 每拍采样）")
+    expect(modelCode.contains("lastSave: lastHistorySave"),
+           "落盘策略必须收到真实上次落盘时刻（.distantPast = 每拍写盘）")
+    // R88：升级检查的接线同样要守——纯策略测试抓不到把 inFlight/skipped 传死值。
+    expect(modelCode.contains("lastSuccess: lastSuccess"),
+           "升级检查必须收到真实上次成功时刻")
+    expect(modelCode.contains("inFlight: updateCheckInFlight"),
+           "升级检查必须在途阻断（传 false = 并发重复请求）")
+    expect(modelCode.contains("skippedTag: skipped"),
+           "升级提示必须收到真实跳过 tag")
+    expectEqual(modelCode.components(separatedBy:
+        "UserDefaults.standard.set(Date(), forKey: Self.updateLastCheckKey)").count - 1, 1,
+        "lastCheck 只在成功路径写一次（失败不得消费 24h 窗口）")
+    if let guardRange = modelCode.range(of: "guard let tag else"),
+       let writeRange = modelCode.range(of:
+        "UserDefaults.standard.set(Date(), forKey: Self.updateLastCheckKey)") {
+        expect(guardRange.lowerBound < writeRange.lowerBound,
+               "失败返回（guard let tag）必须先于 lastCheck 写入")
+    } else {
+        expect(false, "升级检查源码锚点缺失（guard let tag / lastCheck 写入）")
+    }
     expectEqual(flat(model).components(separatedBy: "withAnimation").count - 1, 3,
                 "FanModel 的 withAnimation 总数=3（死预算：新增一处事务级动画即红）")
     // :722 的 `withAnimation(.snappy(0.25)) { assign() }` **刻意不设反断言**：R51 用
@@ -1713,11 +1741,15 @@ func testTrendCurvePrepare() {
     guard let modelSrc = try? String(contentsOfFile: root.appendingPathComponent(
         "Sources/FanCtlApp/FanModel.swift").path, encoding: .utf8),
           let viewsSrc = try? String(contentsOfFile: root.appendingPathComponent(
-        "Sources/FanCtlApp/MonitorViews.swift").path, encoding: .utf8) else {
+        "Sources/FanCtlApp/MonitorViews.swift").path, encoding: .utf8),
+          let trendSrc = try? String(contentsOfFile: root.appendingPathComponent(
+        "Sources/FanCtlAppCore/TrendHistory.swift").path, encoding: .utf8) else {
         expect(false, "静态门读不到源码（缺席必须判红）"); return
     }
-    expect(modelSrc.contains("StatsSampler.tempPlausible(hottest, envTemp: envTemp)"),
-           "趋势入环前必须过与 daemon 同源的 tempPlausible（撤掉即红）")
+    expect(modelSrc.contains("TrendHistoryPolicy.shouldAppend"),
+           "趋势入环必须走 TrendHistoryPolicy.shouldAppend（撤掉即红）")
+    expect(trendSrc.contains("StatsSampler.tempPlausible(hottest, envTemp: envTemp)"),
+           "入环可信门必须与 daemon 同源（tempPlausible；撤掉即红）")
     expect(viewsSrc.contains("TrendCurve.prepare(rawTemps:"),
            "TrendChart 必须走上屏整理（绕过去即红）")
 }

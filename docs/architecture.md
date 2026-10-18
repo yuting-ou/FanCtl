@@ -25,10 +25,18 @@ SMCCore（共享：值类型/协议面/配置模型/控制策略/ControlEngine�
    │                 └─ 只被 fanctld（root 守护进程）与 fanctltests 依赖
    └── SMCReadout = Sources/SMCCore/Readout/  IOKit 只读连接，**整个模块没有写原语**
                      └─ 只被 fanprobe 依赖
-FanCtlApp → 仅 SMCCore（拿不到任何硬件通路，连只读连接都不依赖）
+FanCtlApp → SMCCore + FanCtlAppCore（仅 Foundation 的展示逻辑：status 数值防御 /
+            config 意图构造 / 菜单栏量化状态 / 趋势历史与 ps 解析 / 升级检查策略；
+            没有 SwiftUI，测试可直接编译执行）
+fanctltests → SMCCore + SMCDriver + FanCtlAppCore（App 逻辑不再只靠源码静态门）
 fanmcp   → 仅 SMCCore（MCP 服务器：温度/转速转述 status.json，意图写 config.json——
            与 FanCtlApp 同层的"文件消费者"，依赖图里没有 Driver/Readout，结构上碰不到硬件）
 ```
+
+- **App 展示层的可测试边界**：SwiftUI 视图与 `@main` 仍留在 executable target（CLT 的
+  macOS 27 SDK 缺 SwiftUIMacros，测试不能依赖它）；所有会被 status/config 坏数据击穿的
+  纯逻辑落在 `FanCtlAppCore`，由 `fanctltests` 直接执行。新增展示逻辑时先问"能不能放进
+  FanCtlAppCore 并用值类型表达"，再考虑写进视图。
 
 - 引擎侧解耦：`ControlEngine.fans` 的类型是 SMCCore 里的协议 `FanActuating`（声明读写面），
   唯一实体 `FanController` 在 SMCDriver——所以 App/fanprobe 既拿不到实现、也构造不出对象。

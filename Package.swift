@@ -16,15 +16,19 @@ let package = Package(
         .target(name: "SMCReadout", dependencies: ["SMCCore"], path: "Sources/SMCCore/Readout"),
         // 后台守护进程（root 运行）：按温度曲线自动调速
         .executableTarget(name: "fanctld", dependencies: ["SMCCore", "SMCDriver"]),
+        // App 展示层纯逻辑：Foundation-only（无 SwiftUI/AppKit），可被 fanctltests 直接
+        // 编译执行。status.json 的数值防御与 config 意图构造住在这一层，避免"只有 App
+        // target 才编到、测试只能读源码文本"的盲区。
+        .target(name: "FanCtlAppCore", dependencies: ["SMCCore"]),
         // 菜单栏 App：只读 status.json，无硬件通路
-        .executableTarget(name: "FanCtlApp", dependencies: ["SMCCore"]),
+        .executableTarget(name: "FanCtlApp", dependencies: ["SMCCore", "FanCtlAppCore"]),
         // 只读诊断工具
         .executableTarget(name: "fanprobe", dependencies: ["SMCCore", "SMCReadout"]),
         // MCP 服务器（stdio）：把 status/config 暴露给本地 AI 客户端（协议核心在 SMCCore.FanMCP）
         .executableTarget(name: "fanmcp", dependencies: ["SMCCore"]),
         // 纯逻辑测试（自带轻量断言 harness，无需 Xcode/XCTest，swift run fanctltests）
         // Fixtures/ 用 #filePath 定位（v3.4 E 项），不走 SwiftPM 资源机制——exclude 消音
-        .executableTarget(name: "fanctltests", dependencies: ["SMCCore", "SMCDriver"],
+        .executableTarget(name: "fanctltests", dependencies: ["SMCCore", "SMCDriver", "FanCtlAppCore"],
                           exclude: ["Fixtures"]),
     ]
 )

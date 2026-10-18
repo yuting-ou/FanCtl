@@ -1,7 +1,8 @@
 // VersionCheck — 版本语义比较（纯函数，daemon 不用、App 更新检查与测试共用）
 //
 // v3.6（方向一·进化传播链）：App 低频查询 GitHub Releases latest，与本地版本比较。
-// 本文件只放纯比较逻辑；网络部分在 FanCtlApp.UpdateChecker（无第三方依赖，Foundation 自足）。
+// 本文件只放纯比较逻辑；网络与升级执行在 FanCtlApp/FanModel，节流/重试/提示
+// 策略在 FanCtlAppCore.UpdateCheckPolicy（有执行级测试）。
 
 public enum VersionCheck {
 

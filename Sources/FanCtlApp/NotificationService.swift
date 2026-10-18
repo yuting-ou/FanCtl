@@ -2,15 +2,10 @@
 import Foundation
 import UserNotifications
 import SMCCore
+import FanCtlAppCore
 
-// 高占用进程（与 FanModel.ProcessUsage 语义一致，独立定义避免循环依赖）
-// id = 面板展示标签（角色词走括号式，用户指定）；app = 纯软件名（通知元凶行用它，
-// 避免「抖音（渲染进程）（30%）」这种双括号套娃）
-struct ProcessInfo: Identifiable, Equatable {
-    let id: String
-    let app: String
-    let cpu: Double
-}
+// 高占用进程类型与 ps 输出解析器在 FanCtlAppCore.ProcessUsage（App 与测试共用）：
+// id = 面板展示标签（角色词走括号式），app = 纯软件名（通知元凶行避免双括号套娃）。
 
 final class NotificationService {
     private let canNotify = Bundle.main.bundleIdentifier != nil
@@ -228,7 +223,7 @@ final class NotificationService {
     ///      Renderer/GPU/Utility 好几个进程，逐条列会让前三名被同一个软件占满，
     ///      用户看不出"它总共吃了多少"。故按**软件名**相加后再取前 N。
     nonisolated static func sampleCPUUsage(limit: Int = 5, minCPU: Double = 8)
-        -> [ProcessInfo] {
+        -> [ProcessUsage] {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
         p.arguments = ["-Aceo", "pcpu,comm", "-r"]
@@ -243,48 +238,8 @@ final class NotificationService {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         guard let out = String(data: data, encoding: .utf8) else { return [] }
-
-        // ① 先解析成"软件名"（中文）+ 原始占用，一条原始行一条
-        struct Raw { let app: String; let role: String?; let cpu: Double }
-        var raws: [Raw] = []
-        for line in out.split(separator: "\n").dropFirst() {
-            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            let parts = t.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-            guard parts.count == 2, let cpu = Double(parts[0]), cpu >= minCPU else { continue }
-            let path = String(parts[1])
-            let d = ProcessIdentity.detail(executable: path)
-            raws.append(Raw(app: d.app, role: d.role, cpu: cpu))
+        return ProcessUsageParser.parse(out, limit: limit, minCPU: minCPU) {
+            ProcessIdentity.detail(executable: $0)
         }
-
-        // ② 按软件名归并：同一软件的多个 helper 进程占用相加。
-        // 角色词取第一个看到的（归并后只表达"这软件在忙"，细分角色让位），
-        // 归并键是"软件名"而非路径——同一软件不同 Frameworks 下的 helper 要并成一份。
-        struct Merged { let app: String; var cpu: Double; var role: String? }
-        var order: [String] = []          // 首次出现顺序（保底，纯排序前不用）
-        var dict: [String: Merged] = [:]
-        for r in raws {
-            if dict[r.app] == nil { order.append(r.app) }
-            if var m = dict[r.app] {
-                m.cpu += r.cpu
-                if m.role == nil { m.role = r.role }
-                dict[r.app] = m
-            } else {
-                dict[r.app] = Merged(app: r.app, cpu: r.cpu, role: r.role)
-            }
-        }
-
-        return dict.values
-            .sorted { $0.cpu > $1.cpu }
-            .prefix(limit)
-            .map { m -> ProcessInfo in
-                // 角色词用全角括号缀在软件名后（用户指定样式）：「抖音（渲染进程）」
-                let label: String
-                if let role = m.role, !role.isEmpty {
-                    label = "\(m.app)（\(role)）"
-                } else {
-                    label = m.app
-                }
-                return ProcessInfo(id: label, app: m.app, cpu: m.cpu)
-            }
     }
 }

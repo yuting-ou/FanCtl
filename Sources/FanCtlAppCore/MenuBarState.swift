@@ -12,20 +12,30 @@
 import Foundation
 import Combine
 
-final class MenuBarState: ObservableObject {
-    struct Display: Equatable {
-        var tempBucket: Int = -1   // -1 = 显示 "--"（无有效温度）
-        var boostActive = false
-        var quietActive = false
-        var warnLevel = 0          // 0 无 | 1 橙 | 2 红（按显示整数值判级，与数字同源）
+public final class MenuBarState: ObservableObject {
+    public struct Display: Equatable {
+        public var tempBucket: Int = -1   // -1 = 显示 "--"（无有效温度）
+        public var boostActive = false
+        public var quietActive = false
+        public var warnLevel = 0          // 0 无 | 1 橙 | 2 红（按显示整数值判级，与数字同源）
+        public init(tempBucket: Int = -1, boostActive: Bool = false,
+                    quietActive: Bool = false, warnLevel: Int = 0) {
+            self.tempBucket = tempBucket
+            self.boostActive = boostActive
+            self.quietActive = quietActive
+            self.warnLevel = warnLevel
+        }
     }
 
     // 真值始终最新（样式切换瞬间视图重算即可读到正确显示），发布与否另判。
-    private(set) var display = Display()
+    public private(set) var display = Display()
+
+    public init() {}
 
     // 主线程调用（与 FanModel 同一线程约定：status 事件/定时器均派发回主队列）
-    func update(temp: Double, boost: Bool, quiet: Bool, style: String) {
-        let bucket = temp > 1 ? Int(temp) : -1
+    public func update(temp: Double, boost: Bool, quiet: Bool, style: String) {
+        // 1e300 也 isFinite：只判 NaN/Inf 挡不住 Int() trap，必须同时限定温度域。
+        let bucket = temp.isFinite && temp > 1 && temp < 150 ? Int(temp) : -1
         let old = display
         var next = Display(tempBucket: bucket, boostActive: boost, quietActive: quiet)
         next.warnLevel = bucket >= 88 ? 2 : (bucket >= 78 ? 1 : 0)
