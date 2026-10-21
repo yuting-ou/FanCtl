@@ -100,6 +100,8 @@ public final class ControlEngine {
     var envCompLogged = false
     var lastAIOutput: Double? = nil
     var lastAIIntent: AIIntent? = nil
+    // R89 L5 元学习：热模型前馈信任的边沿记忆（nil = 尚未表态，首拍不日志）
+    var lastFeedTrust: Bool? = nil
     var prevSmoothedTemp: Double? = nil
     var prevBaseTarget: Double? = nil
     var lastLearnAt: Date? = nil
@@ -655,9 +657,20 @@ public final class ControlEngine {
                 let learnedPct = thermalLearn.percent(for: temp, onBattery: onBattery,
                                                       powerWatts: powerWatts)
                 learnedNow = learnedPct
-                let modelPct = thermalModel.predictedPercent(for: envTemp ?? 25,
-                                                             power: powerWatts ?? 0,
-                                                             targetTemp: aiTargetEff)
+                // R89 L5 元学习：前馈信任门——预测误差证据（errEma）超限时模型预测
+                // 不参与前馈，回退纯查表；证据恢复自动再信任。边沿日志防刷屏。
+                let feedTrustNow = thermalModel.feedforwardTrusted
+                if feedTrustNow != lastFeedTrust {
+                    hooks.log(feedTrustNow
+                        ? "AI: 热模型预测误差回落，前馈恢复参与（模型与查表互补）"
+                        : "AI: 热模型预测误差超限，前馈暂停（回退查表）；持续超限将触发辨识重置")
+                    lastFeedTrust = feedTrustNow
+                }
+                let modelPct = feedTrustNow
+                    ? thermalModel.predictedPercent(for: envTemp ?? 25,
+                                                     power: powerWatts ?? 0,
+                                                     targetTemp: aiTargetEff)
+                    : nil
                 let feedPct: Double? = {
                     switch (learnedPct, modelPct) {
                     case let (l?, m?): return max(l, m)
@@ -941,7 +954,12 @@ public final class ControlEngine {
                 // v8 散热参数辨识：同一稳态样本喂线性模型（环境 + a·功耗 − b·风量 ≈ 温度）。
                 // 环境代理不可用时模型无法学习（跳过，不影响查表学习）
                 if let env = envTemp, let pw = powerWatts {
-                    thermalModel.update(env: env, power: pw, percent: baseTarget, temp: temp)
+                    // R89 L4 硬件突变证伪：连击到限 → 模型自报告重置，这里负责留证
+                    if thermalModel.update(env: env, power: pw, percent: baseTarget, temp: temp) {
+                        hooks.log("热模型: 持续 \(ThermalModel.falsifyStreakLimit) 个稳态样本预测偏差超限，"
+                            + "判定散热环境已变（重涂硅脂/清灰/换机位？），已重置辨识重新学习"
+                            + "（历史累计第 \(thermalModel.falsifiedCount) 次）")
+                    }
                     modelDirty = true
                 }
                 lastLearnAt = hooks.now()
@@ -1282,6 +1300,10 @@ public final class ControlEngine {
             thermalModelUsable: thermalModel.isMature,
             thermalModelB: thermalModel.b,
             thermalModelSamples: thermalModel.sampleCount,
+            // R89 L4/L5 可见性：信任门当前态仅 AI 模式表态（其他模式模型不参与，
+            // 表态 false 会误导）；证伪次数从未发生过就写 nil（与旧 daemon 缺席可区分）
+            thermalFeedTrusted: effectiveConfig.mode == .ai ? thermalModel.feedforwardTrusted : nil,
+            thermalModelFalsified: thermalModel.falsifiedCount > 0 ? thermalModel.falsifiedCount : nil,
             // R38：版本随每拍落盘（升级/重启后第一拍即改变摘要 → 立刻刷新）
             daemonVersion: hooks.daemonVersion
         )

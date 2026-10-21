@@ -104,6 +104,24 @@ fanmcp   → 仅 SMCCore（MCP 服务器：温度/转速转述 status.json，意
 采样纪律（daemon 把关）：只记稳态拍、排除 manual/安全覆盖/限速过渡态。
 闭环不变式：学习数据落在真实热物理曲线上（偏好无法污染物理）。
 
+## 记忆的自愈：硬件突变证伪 + 前馈信任门（R89）
+
+学习数据跨重启持久化（thermal-model.json / ai-learn.json），λ=0.999 慢遗忘只适应**缓慢
+漂移**；散热环境突变（重涂硅脂/清灰/换机位）后旧参数结构性地错，慢遗忘救不了。两道防线：
+
+1. **硬件突变证伪（ThermalModel）**：`update()` 先于 RLS 更新计算预测误差（旧参数度量
+   当前观测），errEma 滚动平均 + 高误差连击（>12°C 记拍 / ≤8°C 清零的 12/8 滞回）。
+   成熟模型（≥200 样本）+ 连击 ≥120 → 整模重置重新辨识，`falsifiedCount` 跨重置留存。
+   证伪触发时预测本已不可信——**控制行为变化为零**，重置是丢弃记忆不是丢弃观测
+   （打破连击的样本随即喂入新协方差）。
+2. **前馈信任门（L5 元学习）**：errEma >10°C → `feedforwardTrusted=false`，模型预测
+   退出前馈回退查表（宁可保守不少给风量），恢复后自动回归；errEma=nil（旧数据/新模型）
+   → 信任 = 升级前行为不变。判据是数据不是规则——证据自己决定记忆可不可信。
+
+status.json 的 `thermalFeedTrusted`/`thermalModelFalsified` 是诊断字段（只展示、不进写盘
+摘要、App 侧不消费）；daemon 日志在证伪/信任边沿各打一条。新增采样语义见
+`ThermalModel.swift` 头注；回归在 `TestsAI.testThermalModelFalsification`（含 4 处变异验证）。
+
 ## AI 模式 = 自适应预测控制（不是神经网络）
 
 `FanAIController.swift`：增量 PD + 三路功耗前馈 + 空闲交还/夺回 + 曲线锚定（v9 探测式）+
