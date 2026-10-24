@@ -122,6 +122,16 @@ jobs:
           test ! -e /usr/local/bin/fanmcp
           echo "首装→运行→卸载 全链在干净机器上通过（仓库布局 + 访客 zip 布局各一遍）"
 
+      # R90：快照量具契约（main 推送）——runner 上没有"改动前"的二进制，跨机器 golden
+      # 图又随 SDK/SwiftUI 版本漂移，所以 CI 守的是量具本身：25 个变体全部可渲染、
+      # 纯静态场景（label/cold）双跑字节一致（不确定性不许渗入静态屏）、未知场景名必须
+      # exit(2)（静默出默认屏 = 量具说谎，R87 立的牙）。像素级 A/A/B 对照是本地工具
+      # （scripts/snapshot-checks.sh compare，视觉/重构轮用）。首次运行即环境验证：
+      # ImageRenderer 离屏渲染在 runner 上若不可用，这道步会红——那也是该知道的事。
+      - name: 快照量具契约（25 变体 + 静态屏确定性 + 未知场景判废，仅 main 推送）
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: ./scripts/snapshot-checks.sh ci dist/FanCtl.app/Contents/MacOS/FanCtl
+
       - name: Release 构建
         # R23（P2）：daemon/工具用非 UI 目标直编。App 目标（FanCtlApp）单独一步编译校验
         # （R23 续轮 P3-3：不跑、只编——恢复 PR 阶段对 SelfUpgradeService/FanModel/视图的
