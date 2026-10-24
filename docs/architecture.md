@@ -27,7 +27,8 @@ SMCCore（共享：值类型/协议面/配置模型/控制策略/ControlEngine�
                      └─ 只被 fanprobe 依赖
 FanCtlApp → SMCCore + FanCtlAppCore（仅 Foundation 的展示逻辑：status 数值防御 /
             config 意图构造 / 菜单栏量化状态 / 趋势历史与 ps 解析 / 升级检查策略 /
-            AI 效果聚合与散热健康文案 / 部件行投影 / 面板格式化；
+            AI 效果聚合与散热健康文案 / AI 基线推荐与自动优化节奏 / 部件行投影 /
+            面板格式化 / daemon 下线清态策略（Mirror 钉死投影字段分类完备性）；
             没有 SwiftUI，测试可直接编译执行）
 fanctltests → SMCCore + SMCDriver + FanCtlAppCore（App 逻辑不再只靠源码静态门）
 fanmcp   → 仅 SMCCore（MCP 服务器：温度/转速转述 status.json，意图写 config.json——

@@ -2645,3 +2645,45 @@ build.sh 全量绿（阶段一曾靠它抓到 fanctltests 编不到的 FanCtlApp
 接线原句门（TrendHistoryPolicy/StatusProjector/adoptOverlayFromDisk 等钉的是 FanModel.swift
 路径，逻辑挪走必须连门一起改，R88/R89 已示范两次）；③ 快照 A/A/B 对照脚本化价值明确
 （本轮手工跑），若视觉轮继续用，值得进 scripts/ 并接入 CI（macOS runner 可跑 ImageRenderer）。
+
+## R90（4.2.60(156) + 4.2.61(157) + 4.2.62(158)）：App 展示层收敛第三轮——策略进 core、量具进脚本、契约进 CI
+
+**起因**：R89 交接口列的三件事——FanModel 剩余下沉候选（AI 基线推荐分档/自动优化
+时间门/clearDaemonState 策略化）、`--snapshot` 装配 ~200 行挤在 FanCtlApp.init
+（R87 未修#3）、快照 A/A/B 对照值得脚本化并接 CI。
+
+**落点**：
+- 4.2.60 逻辑第四刀：`AIBaselineAdvisor`（30s 采样窗 + ≤68/<73° 分档，F3 停采样语义
+  原样）、`AutoOptimizePolicy`（5s 用户冷却/1h 节流/无基线或 ≥3 天新数据）、
+  `DaemonOfflinePolicy`（18 投影语义态 + 4 面板态清、12 读数刻意保留）进 AppCore。
+  清态策略的牙是**Mirror 执行级测试**：StatusProjection 全部字段 == 清态 ∪ 读数 ∪
+  {changed}，新增投影字段不分类即红——"哪些清/哪些故意不清"从注释升为单一真值；
+  TestsCore 接线门钉住 clearDaemonState 函数体与清单一一对应（22 条赋值逐名对账，
+  且不得清保留读数）。
+- 4.2.61 量具装配抽离：FanCtlApp.init 的场景装配（演示注入/23 场景/子视图渲染/整面
+  渲染）→ `@MainActor enum SnapshotScenes`，入口 443→214 行只剩 CLI 解析分派；CLI
+  契约零变化（场景名/输出路径/未知场景 exit(2) 全保留）。快照对照收进
+  `scripts/snapshot-checks.sh`（run/compare/ci 三模式）。
+- 4.2.62 CI 接入：main 推送的冒烟步后新增 snapshot-checks.sh ci——25 变体可渲染 +
+  label/cold 双跑字节一致 + 未知场景 exit(2)。**不做跨机器像素 golden**（SDK/SwiftUI
+  版本漂移会假红），像素级 A/A/B 仍是本地工具。
+
+**验证**：本机 5965/138 组（较 R89 +65 断言 +4 组），下限随抬 5958/130；三轮 build.sh
+全量绿。快照对照踩了一个真坑并按纪律收口：B 组首跑 cold 假红（5.0% > 门 4.65%）——
+没有直接放宽门槛，先连通域分析（33 簇全为数字尺寸、无结构位移），再 git worktree
+重建 4.2.60 旧二进制**同时间窗**背靠背对照：cold 1.58%、label 逐字节一致——5% 是
+隔半小时渲染的活数据漂移不是回归。方法论写进脚本头（B 组与基线同时间窗渲染），
+噪声底改双对估计 max(A/A, B/B)。ci 模式本地三路径验证（label ✓/判废 ✓/cold 本机
+红=活数据，干净 runner 静态）。
+
+**未做**：CI 的快照步首次真实运行未发生（本仓库未推送，runner 上 ImageRenderer
+离屏渲染是否可用要第一次 main 推送才见分晓——步注释里已声明这是环境验证）；
+FanModel 仍 ~1310 行协调器，剩余内联纯逻辑已见底（下一刀该动的是结构：daemon
+镜像态收进值类型，牵动 ~百处视图引用，独立一轮）；snapshotPlainCards 全局分叉
+10+ 处未收口。
+
+**交接口**：① DaemonOfflinePolicy 的三组字段是清态语义的单一真值，改清态行为=
+改策略+连 Mirror 测试与接线门；② snapshot-checks.sh 的场景清单（23 个）与
+SnapshotScenes.apply 的 default 分支是两份手抄清单——加场景要两边同改，ci 模式的
+"变体数=25"会抓住脚本侧、未知场景 exit(2) 抓不住清单漏更（诚实边界，记账在此）；
+③ 视觉轮用 compare 模式时记住同时间窗纪律。
