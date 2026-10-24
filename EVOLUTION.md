@@ -2592,3 +2592,53 @@ status 3 秒新鲜；App 0.0% CPU / 73.7MB RSS；安装版快照可出图。未�
 
 **未做**：FanModel 仍是 1476 行协调器；下一刀按"变更原因"拆，不按行数——候选是趋势历史
 （环形缓冲 + 落盘节奏）与升级编排。PanelView 仍 1912 行，留待视觉轮。
+
+## R89（4.2.58(154) + 4.2.59(155)）：App 展示层收敛第二轮——逻辑第三刀 + 零视觉拆分
+
+**起因**：R88 把承重墙浇到了执行级，但两块债原样立着——FanModel 还有五块"只能靠读
+源码文本守"的纯逻辑（aggregate/散热健康文案/部件 deglitch/格式化层/偏移钳位三处重复），
+PanelView 1912 行一整栋楼挤在一个文件里。本轮按 R88 钉的两条铁律推进：按变更原因拆、
+不按行数拆；PanelView 拆分与视觉量具绑定（零视觉搬移）。
+
+**落点**：
+- 4.2.58 逻辑第三刀：`AIEffectStats`（时间加权聚合 + 旧数据 3s 回退 + isUsableDay 过滤 +
+  效果卡文案）、`ThermalHealthText`（°C/W 比值 + 14 天门 + ±15% 三态）、`ComponentProjector`
+  （逐部件 deglitch，与 StatusProjector 同构）、`PanelFormat`（时长/转数/倒计时/评测摘要；
+  面板完整版与磁贴紧凑版是**刻意不同的两种变体**，分立命名不强行合一）进 FanCtlAppCore，
+  各配执行级测试（固定夹具）；风扇偏移 ±20% 钳位三处收一 `FanConfigIntent.clampOffset`。
+  MonitorViews 的 duration/revs/timeFmt 私有重复实现删除，改走 PanelFormat——替换前先写
+  输出相等断言钉住旧行为，保证零漂移。
+- 文本门改边界门（R88 模式）：TestsCore 钉 aggregate 在 FanModel 内联重算的"计数门"改为
+  "聚合必须走 `AIEffectStats.aggregate(after, now: now)` 且与天数同一次 now + App 侧不得
+  另立 isUsableDay 过滤尺"；口径纪律（时间加权/过滤/回退）从文本断言升为行为断言。
+- 4.2.59 PanelView 拆分：PanelModes（四模式内容 + statStrip/adaptiveChip/curveAIComboBar/
+  intentStyle/learningStatus + 透镜/学习地图 extension，726 行）、PanelControls（分段选择器/
+  按钮样式/daemon 状态点/升级菜单，215）、PanelEffects（AILearnState/LearningDot/呼吸动效/
+  LearnMapView/DecisionTrace.explanation，197）、PanelCards（CardBackground/TintedCard/
+  panelChipHInset 真值，69）；PanelView 剩骨架 685 行（body/头部/监控卡/风扇卡/controlCard
+  编排）。跨文件需要的最小可见性放宽：learnMapExpanded @State 与 spinAlertHelp/
+  killSpinHelp/confirmKillSpin 三个辅助函数 internal（纯可见性，零行为）。
+- 静态门随迁：文件数 10→14；numericText 逐文件预算 PanelView:4→PanelModes:4；comboBar
+  锚点文件跟着走；胶囊计数从"PanelView==6/GaugeViews==4"改**全目录总和==10**（对文件搬移
+  稳健，单一真值语义不变）；字面量禁令改全目录扫，但按 R87 边界"横幅/整宽盒不是胶囊"只判
+  字面量后 120 字符内出现 Capsule() 的真胶囊——MonitorViews 趋势窗的 padding(.horizontal,6)
+  不是胶囊（SparkLine 绘图窗边距），全目录一刀切会误伤（本轮实测抓到，禁令改为语义级）。
+
+**验证**：本机 5899/134 → 5900/134（阶段二门禁改写净 +1），下限两源同抬 5894/126；
+build.sh 全量绿（阶段一曾靠它抓到 fanctltests 编不到的 FanCtlApp 漏改 `Self.aggregate`
+调用点——"测试绿 ≠ App 编得过"再次实证）；变异口径：格式化替换有输出相等断言先行。
+零视觉量具（本轮新立）：改动前 A1/A2 双跑建噪声底——默认夹具带 Double.random 趋势数据 +
+本机 daemon 活数据，同二进制两遍也有 3.5–7.5% 像素差，label（纯静态）0%；改后 B 组 25 张
+（默认 + label + 23 场景）全部 ≤ 噪声底×1.5+1pp，label 逐字节一致，尺寸全同。三条死预算
+（.animation(=32、numericText=4、胶囊=10）搬移前后逐一复核不变。未做本机安装验收（纯
+搬移 + 逻辑下沉，装机面不动；留作者按惯例）。
+
+**未做**：FanModel 仍 1332 行协调器，剩余下沉候选：AI 基线推荐分档、maybeAutoOptimize
+时间门、clearDaemonState 字段清单策略化；`--snapshot` 场景装配 ~200 行仍在 FanCtlApp.init
+（R87 未修#3 同族）；snapshotPlainCards 全局分叉 10+ 处引用未收口（拆分后新文件也引用它）。
+
+**交接口**：① PanelModes/Controls/Effects/Cards 四文件的头注释写明各自职责与可见性约定
+（"只被本文件引用的保持 private"）；② 下次拆 FanModel 时注意 TestsCore/TestsOverlay 的
+接线原句门（TrendHistoryPolicy/StatusProjector/adoptOverlayFromDisk 等钉的是 FanModel.swift
+路径，逻辑挪走必须连门一起改，R88/R89 已示范两次）；③ 快照 A/A/B 对照脚本化价值明确
+（本轮手工跑），若视觉轮继续用，值得进 scripts/ 并接入 CI（macOS runner 可跑 ImageRenderer）。

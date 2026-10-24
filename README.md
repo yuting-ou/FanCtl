@@ -147,9 +147,10 @@ Sources/
 │   ├── PowerCompositionSampler.swift powermetrics 采样器(超时强杀/降级)
 │   ├── SleepHandler.swift  睡眠/唤醒回调
 │   └── Version.generated.swift  版本常量(build.sh 从 VERSION 生成)
-├── FanCtlApp/          SwiftUI 菜单栏 App(FanCtlApp/FanModel/PanelView/CurveViews/
-│                       GaugeViews/MonitorViews/MenuBarState/FanControlActions/
-│                       NotificationService/SelfUpgradeService)
+├── FanCtlApp/          SwiftUI 菜单栏 App(FanCtlApp/FanModel/PanelView 骨架/PanelModes
+│                       四模式内容/PanelControls 通用控件/PanelEffects AI 状态原子/
+│                       PanelCards 卡片样式/CurveViews/GaugeViews/MonitorViews/
+│                       FanControlActions/NotificationService/SelfUpgradeService)
 ├── fanprobe/main.swift 只读诊断工具(无需 root;--report 出可粘贴诊断包)
 ├── fanmcp/main.swift   MCP 服务器入口(stdio;协议核心在 SMCCore.FanMCP,接 AI 助手用)
 └── fanctltests/        纯逻辑测试(自带断言 harness;断言数见顶部 tests 徽章)
