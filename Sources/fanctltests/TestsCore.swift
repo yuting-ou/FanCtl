@@ -92,9 +92,10 @@ func testUIAnimationGuards() {
     let viewDir = root.appendingPathComponent("Sources/FanCtlApp")
     let viewFiles = ((try? FileManager.default.subpathsOfDirectory(atPath: viewDir.path))?.sorted() ?? [])
         .filter { $0.hasSuffix(".swift") }
-    // R89：PanelView 拆成 PanelModes/PanelControls/PanelEffects/PanelCards，10 → 14。
-    expectEqual(viewFiles.count, 14,
-                "FanCtlApp 视图文件数=14（死数字：新增文件会同时进下面的转场预算）")
+    // R89：PanelView 拆成 PanelModes/PanelControls/PanelEffects/PanelCards，10 → 14；
+    // R90：--snapshot 装配抽成 SnapshotScenes.swift，14 → 15。
+    expectEqual(viewFiles.count, 15,
+                "FanCtlApp 视图文件数=15（死数字：新增文件会同时进下面的转场预算）")
     var transTotal = 0
     var tweenTotal = 0
     var chipTotal = 0
