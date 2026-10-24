@@ -91,16 +91,32 @@ func testUIAnimationGuards() {
     let viewDir = root.appendingPathComponent("Sources/FanCtlApp")
     let viewFiles = ((try? FileManager.default.subpathsOfDirectory(atPath: viewDir.path))?.sorted() ?? [])
         .filter { $0.hasSuffix(".swift") }
-    expectEqual(viewFiles.count, 10,
-                "FanCtlApp 视图文件数=10（死数字：新增文件会同时进下面的转场预算）")
+    // R89：PanelView 拆成 PanelModes/PanelControls/PanelEffects/PanelCards，10 → 14。
+    expectEqual(viewFiles.count, 14,
+                "FanCtlApp 视图文件数=14（死数字：新增文件会同时进下面的转场预算）")
     var transTotal = 0
     var tweenTotal = 0
+    var chipTotal = 0
     for f in viewFiles {
         guard let src = source("Sources/FanCtlApp/\(f)") else { return }
         let flatSrc = flat(src)
         let n = flatSrc.components(separatedBy: "contentTransition(.numericText").count - 1
         transTotal += n
         tweenTotal += flatSrc.components(separatedBy: ".animation(").count - 1
+        chipTotal += flatSrc.components(separatedBy: "padding(.horizontal,panelChipHInset").count - 1
+        // R87 续：胶囊横向内边距的字面量禁令扫全目录（R89 拆分前只扫 PanelView+GaugeViews，
+        // 新文件成了死角）。按 R87 边界"行级横幅与整宽盒不是胶囊"：只判**字面量后近距
+        // 出现 Capsule()** 的真胶囊用法——MonitorViews 趋势窗的 padding(.horizontal,6)
+        // 不是胶囊，是 SparkLine 的绘图窗边距，不得误伤。
+        for lit in ["padding(.horizontal,5)", "padding(.horizontal,6)", "padding(.horizontal,9)"] {
+            var searchStart = flatSrc.startIndex
+            while let r = flatSrc.range(of: lit, range: searchStart..<flatSrc.endIndex) {
+                let window = flatSrc[r.upperBound...].prefix(120)
+                expect(!window.contains("Capsule()"),
+                       "\(f) 胶囊横向内边距不得复活字面量 \(lit)（走 panelChipHInset）")
+                searchStart = r.upperBound
+            }
+        }
         // 逐文件死预算：加一处即红，搬到别的文件/独立子视图也红（绕路径①的完整版）
         let expectN: Int
         switch f {
@@ -108,9 +124,10 @@ func testUIAnimationGuards() {
         // R61 再撤 comboBar 的 diff/aiC（每拍随 AI 微调的输出百分比）⇒ 4 处：
         //   manualPercent（手动档/冲刺·静音落档才写）、cur（AI 卡大温度，temp 类）、
         //   learnedNow（经验 %，30 秒采样节奏）、points（已掌握点数，低频）。
+        // R89：4 处随模式内容迁入 PanelModes.swift（纯搬移，总数与语义不变）。
         case "GaugeViews.swift": expectN = 0
         case "MonitorViews.swift": expectN = 0
-        case "PanelView.swift": expectN = 4
+        case "PanelModes.swift": expectN = 4
         default: expectN = 0
         }
         expectEqual(n, expectN, "\(f) 的 numericText 处数=\(expectN)（每拍数字不做转场）")
@@ -129,7 +146,8 @@ func testUIAnimationGuards() {
     // R61：把 R52 记着的「别名宿主」洞按函数级堵上——comboBar 里 diff/aiC 是每拍随 AI
     // 微调的输出百分比，改等宽直读后函数体内再出现 numericText 字面量就红。
     // 诚实边界：这是**字面量级**检查，`let ct: ContentTransition = .numericText()` 那种注入绕得过。
-    let panel = source("Sources/FanCtlApp/PanelView.swift") ?? ""
+    // R89：comboBar 随模式内容迁入 PanelModes.swift（锚点文件跟着走，牙不变）。
+    let panel = source("Sources/FanCtlApp/PanelModes.swift") ?? ""
     if let start = panel.range(of: "private func curveAIComboBar") {
         let tail = String(panel[start.upperBound...])
         let body = tail.range(of: "\n    private ").map { String(tail[..<$0.lowerBound]) } ?? tail
@@ -147,14 +165,10 @@ func testUIAnimationGuards() {
     // 而它们会并排出现在同一行（AI 意图胶囊挨着电池/夜间胶囊），横向不一就"高矮齐、宽窄
     // 不齐"，文字也落不到同一列。钉**引用次数**而非钉存在：新增胶囊漏走常量、或有人
     // 把某处改回字面量，都会红（存在性断言不算牙——R47 铁律）。
-    let chipPanel = flat(panel).components(separatedBy: "padding(.horizontal,panelChipHInset").count - 1
-    let chipGauge = flat(gauge).components(separatedBy: "padding(.horizontal,panelChipHInset").count - 1
-    expectEqual(chipPanel, 6, "PanelView 内联胶囊 6 处一律走 panelChipHInset")
-    expectEqual(chipGauge, 4, "GaugeViews 内联胶囊 4 处一律走 panelChipHInset")
-    for lit in ["padding(.horizontal,5)", "padding(.horizontal,6)", "padding(.horizontal,9)"] {
-        expect(!flat(panel).contains(lit) && !flat(gauge).contains(lit),
-               "胶囊横向内边距不得复活字面量 \(lit)（走 panelChipHInset）")
-    }
+    // R89：PanelView 拆分后胶囊随宿主散到 PanelModes(5)/PanelView(1)/GaugeViews(4)——
+    // 按文件钉数会在下一次搬移时全碎，改为钉**全目录总和**（语义不变：单一真值 +
+    // 字面量禁令全目录扫，见上）。
+    expectEqual(chipTotal, 10, "全目录内联胶囊 10 处一律走 panelChipHInset（PanelModes 5 + PanelView 1 + GaugeViews 4）")
     // 已知边界（R61 更新）：门仍只数**字面量**。① 剩下 4 处 numericText 里 `cur`（AI 卡 24pt 大温度，
     // PanelView:892）是 temp 类每拍量，本轮没动（R61 只测到 pct 类每拍 RSS 9.3→0.2MB 的路径，
     // temp 类实测本就 1.8MB/拍）；`learnedNow`(:941) 的经验 % 由 30 秒节奏的采样驱动、非每拍；
