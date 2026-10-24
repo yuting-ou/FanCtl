@@ -3,6 +3,8 @@ import SwiftUI
 import SMCCore
 
 struct SparkLine: View {
+    // 自绘 Path，可在 ImageRenderer 离屏渲染（R89 拆分时此句从 PanelView 尾部的
+    // 孤儿注释归还到它描述的类型上）
     let values: [Double]
     let color: Color
     // 可选的 x 位置分数（0~1，与 values 等长）：事件驱动采样下拍间隔不均，

@@ -2633,6 +2633,9 @@ build.sh 全量绿（阶段一曾靠它抓到 fanctltests 编不到的 FanCtlApp
 （.animation(=32、numericText=4、胶囊=10）搬移前后逐一复核不变。未做本机安装验收（纯
 搬移 + 逻辑下沉，装机面不动；留作者按惯例）。
 
+**补记**：拆分时 PanelView 尾部有一行孤儿注释（"迷你趋势折线（自绘 Path…）"，
+  与 SparkLine 不同文件）——已归还到 GaugeViews 的 SparkLine 声明上，非代码丢失。
+
 **未做**：FanModel 仍 1332 行协调器，剩余下沉候选：AI 基线推荐分档、maybeAutoOptimize
 时间门、clearDaemonState 字段清单策略化；`--snapshot` 场景装配 ~200 行仍在 FanCtlApp.init
 （R87 未修#3 同族）；snapshotPlainCards 全局分叉 10+ 处引用未收口（拆分后新文件也引用它）。
