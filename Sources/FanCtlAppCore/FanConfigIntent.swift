@@ -40,4 +40,10 @@ public enum FanConfigIntent {
                   envTempOverride: envTempOverride,
                   palmCompensation: palmCompensation)
     }
+
+    /// 风扇偏移的单一钳位真值 ±20%（R89 收口：此前 max(-20, min(20,)) 在 FanModel 的
+    /// init / syncConfigFromDisk / setFanOffset 三处各写一份，改限要改三处）。
+    public static func clampOffset(_ v: Double) -> Double {
+        max(-20, min(20, v))
+    }
 }

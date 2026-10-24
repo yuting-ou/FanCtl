@@ -199,11 +199,9 @@ final class FanModel: ObservableObject {
 
     typealias TempSample = FanCtlAppCore.TrendSample
 
-    // 部件温度显示模型（从 daemon 传来的传感器数据转换）
-    struct ComponentTempDisplay: Identifiable {
-        let id: String
-        let temp: Double
-    }
+    // 部件温度显示模型（从 daemon 传来的传感器数据转换；投影与 deglitch 在
+    // FanCtlAppCore.ComponentProjector，有执行级测试）
+    typealias ComponentTempDisplay = FanCtlAppCore.ComponentProjector.ComponentTempDisplay
 
     // 高占用进程（“谁在发热”面板用）
     typealias ProcessUsage = FanCtlAppCore.ProcessUsage
@@ -313,11 +311,11 @@ final class FanModel: ObservableObject {
         if let t = cfg.aiTargetTemp { aiTargetTemp = t }
         if let offsets = cfg.fanOffsets, offsets.count >= 2 {
             fanOffsets = [
-                max(-20, min(20, offsets[0])),
-                max(-20, min(20, offsets.count > 1 ? offsets[1] : 0))
+                FanConfigIntent.clampOffset(offsets[0]),
+                FanConfigIntent.clampOffset(offsets.count > 1 ? offsets[1] : 0)
             ]
         } else if let offsets = cfg.fanOffsets, offsets.count == 1 {
-            fanOffsets = [max(-20, min(20, offsets[0])), 0]
+            fanOffsets = [FanConfigIntent.clampOffset(offsets[0]), 0]
         } else {
             fanOffsets = [0, 0]
         }
@@ -828,29 +826,12 @@ final class FanModel: ObservableObject {
 
     // 部件行的坏读数防御（R82 续七）：与主卡同源的 deglitch——status.json 原子写瞬间
     // 个别读会截断（实测 cpuDie 8.4° vs 环境 30.5° 的坏读曾连发 45 拍），主卡有防、
-    // 最热列表没有 → 同份数据两个视图两种防线。逐部件独立计数（deglitchTemperature
-    // 的参数化惯例），复用 SMCCore 同一份纯函数。状态在行消失时清零。
-    private var hotspotHolds: [String: (glitch: Int, zero: Int, prev: Double)] = [:]
+    // 最热列表没有 → 同份数据两个视图两种防线。投影与逐部件 hold 状态在
+    // FanCtlAppCore.ComponentProjector（R89 下沉，有执行级测试）。
+    private var componentProjector = ComponentProjector()
 
     private func syncPanelDataFromSensors(_ sensors: SensorReadings) {
-        // 组装部件温度列表：坏读数经 deglitch（≤1 或骤降>30° 挡 3 拍），仍无效则该行
-        // 消失（原语义：传感器失效时不展示 0° 行）
-        var comps: [ComponentTempDisplay] = []
-        func add(_ id: String, _ raw: Double?) {
-            guard let raw, raw.isFinite else { hotspotHolds[id] = nil; return }
-            var g = hotspotHolds[id] ?? (0, 0, raw)
-            let shown = deglitchTemperature(StatusDefense.temperature(raw), prev: g.prev,
-                                            glitchHold: &g.glitch, zeroHold: &g.zero)
-            guard shown > 1 else { hotspotHolds[id] = nil; return }
-            hotspotHolds[id] = (g.glitch, g.zero, shown)
-            comps.append(ComponentTempDisplay(id: id, temp: shown))
-        }
-        add("CPU", sensors.cpuDie)
-        add("GPU", sensors.gpuDie)
-        add("SSD", sensors.ssd)
-        add("掌托", sensors.palmRest)
-        add("散热片", sensors.heatsink)
-        components = comps.sorted { $0.temp > $1.temp }
+        components = componentProjector.project(sensors)
     }
 
     // MARK: - 后台空转哨兵（R78，spinwatch → alerts.json → 清风通知）
@@ -932,8 +913,8 @@ final class FanModel: ObservableObject {
             UserDefaults.standard.set(cfg.palmCompensation, forKey: Self.palmCompensationKey)
         }
         if let offsets = cfg.fanOffsets {
-            let o0 = offsets.count > 0 ? max(-20, min(20, offsets[0])) : 0
-            let o1 = offsets.count > 1 ? max(-20, min(20, offsets[1])) : 0
+            let o0 = offsets.count > 0 ? FanConfigIntent.clampOffset(offsets[0]) : 0
+            let o1 = offsets.count > 1 ? FanConfigIntent.clampOffset(offsets[1]) : 0
             if fanOffsets != [o0, o1] { fanOffsets = [o0, o1] }
         }
         // 自定义曲线回填：外部修改 config.json（或 AI 优化落盘）后 App 侧展示与实际一致，
@@ -1065,7 +1046,7 @@ final class FanModel: ObservableObject {
         // v3.6.1：与 fanStates 构建侧的 id < 8 消毒对齐，防越界/无界 append
         guard fanIndex >= 0, fanIndex < 8 else { return }
         lastUserChange = Date()
-        let clamped = max(-20, min(20, offset))
+        let clamped = FanConfigIntent.clampOffset(offset)
         while fanOffsets.count <= fanIndex { fanOffsets.append(0) }
         fanOffsets[fanIndex] = clamped
         if let data = try? JSONEncoder().encode(fanOffsets) {
@@ -1097,7 +1078,8 @@ final class FanModel: ObservableObject {
     // 直方图口径比对，AIBaseline.hotRatio 是全天聚合口径，混用会错判"变热/变凉"）
     private struct AIOptimizeHot: Codable { var hotRatio: Double; var powerP50: Double? }
     private static let aiOptimizerHotKey = "aiOptimizerHotRatio"
-    private struct AIEffect { let days: Int; let beforeAvg: Double; let afterAvg: Double; let beforeHot: Double; let afterHot: Double }
+    // 聚合与文案在 FanCtlAppCore.AIEffectStats（时间加权口径/过滤纪律有执行级测试）
+    typealias AIEffect = AIEffectStats.AIEffect
 
     func applyAICurve() { applyAICurve(auto: false) }
 
@@ -1143,7 +1125,7 @@ final class FanModel: ObservableObject {
         if let data = try? JSONEncoder().encode(AIOptimizeHot(hotRatio: r.hotRatio, powerP50: r.powerP50)) {
             UserDefaults.standard.set(data, forKey: FanModel.aiOptimizerHotKey)
         }
-        if let ag = Self.aggregate(days) {
+        if let ag = AIEffectStats.aggregate(days, now: Date()) {
             saveBaseline(AIBaseline(date: DailyStats.today(), avgTemp: ag.avg, hotRatio: ag.hot))
         }
         withAnimation(.snappy) {
@@ -1184,22 +1166,8 @@ final class FanModel: ObservableObject {
                                   today: preloadedStats ?? ConfigStore.loadStats())
     }
 
-    private static func aggregate(_ days: [DailyStats], now: Date = Date()) -> (avg: Double, hot: Double)? {
-        // R57 审查 P1：过滤必须与 dataDayCount 同一条 isUsableDay —— 天数砍了、均温没砍，
-        // 就是「启用 3 天 · 均温 45°→61°」里两个数各自数不同的日子
-        let valid = days.filter { $0.tempCount > 0 && $0.isUsableDay(now: now) }
-        guard !valid.isEmpty else { return nil }
-        let tempSum = valid.reduce(0.0) { $0 + $1.tempSum }
-        let hotSeconds = valid.reduce(0.0) { $0 + $1.highTempSeconds }
-        // 时间加权口径（与 v2.6.2 起的 avgTemp/直方图一致）；旧数据无 tempSeconds
-        // 时回退"样本数×3s"估算（v2.6 前守护进程固定 3s 一拍）。
-        // 此前恒用 tempCount×3——正是 v2.6.2 在统计层消灭掉的固定 3s 假设
-        let secs = valid.reduce(0.0) { $0 + $1.tempSeconds }
-        if secs > 0 { return (tempSum / secs, hotSeconds / secs) }
-        let cnt = valid.reduce(0.0) { $0 + $1.tempCount }
-        return (tempSum / cnt, hotSeconds / (cnt * 3.0))
-    }
-
+    // 聚合在 FanCtlAppCore.AIEffectStats（R89 下沉：时间加权口径与 isUsableDay 过滤
+    // 纪律改由执行级测试守，此前只有源码静态门）。此处只留 I/O 编排。
     private func saveBaseline(_ b: AIBaseline) {
         if let d = try? JSONEncoder().encode(b) { UserDefaults.standard.set(d, forKey: Self.aiBaselineKey) }
     }
@@ -1221,7 +1189,7 @@ final class FanModel: ObservableObject {
         // R57 审查 P2：天数被新判据砍到 0 时不能再还给面板一份「均温已变」的效果卡
         //（「启用 0 天 · 均温 45°→61°」是自相矛盾的谎），此时只报 0 天、不给结论。
         guard days > 0 else { return (0, nil) }
-        guard let ag = Self.aggregate(after, now: now) else { return (days, nil) }
+        guard let ag = AIEffectStats.aggregate(after, now: now) else { return (days, nil) }
         return (days, AIEffect(days: days, beforeAvg: b.avgTemp,
                                afterAvg: ag.avg, beforeHot: b.hotRatio, afterHot: ag.hot))
     }
@@ -1229,13 +1197,8 @@ final class FanModel: ObservableObject {
     private func refreshAIStatus(preloadedDays: [DailyStats]? = nil) {
         let st = reoptimizeState(preloadedDays: preloadedDays)
         aiNudge = st.afterDays >= 3
-        if let e = st.effect {
-            let dAvg = e.beforeAvg - e.afterAvg
-            let arrow = dAvg >= 0 ? "↓" : "↑"
-            aiEffectText = "启用 \(e.days) 天 · 均温 \(Int(e.beforeAvg.rounded()))°→\(Int(e.afterAvg.rounded()))°（\(arrow)\(abs(Int(dAvg.rounded())))°）· 高温 \(Int((e.beforeHot*100).rounded()))%→\(Int((e.afterHot*100).rounded()))%"
-        } else {
-            aiEffectText = nil
-        }
+        // 文案拼装在 FanCtlAppCore.AIEffectStats.effectText（R89 下沉，输出有执行级断言）
+        aiEffectText = AIEffectStats.effectText(st.effect)
     }
 
     private func persistAIPresets() {
@@ -1346,31 +1309,9 @@ final class FanModel: ObservableObject {
     @Published var thermalHealthText: String? = nil
 
     func refreshThermalHealth(preloadedDays: [DailyStats]? = nil) {
-        let days = (preloadedDays ?? loadDaysWithToday()).filter { $0.avgPower > 1 && $0.tempCount > 0 }
-        guard days.count >= 14 else {
-            thermalHealthText = days.count >= 2
-                ? "散热趋势积累中（需约 2 周数据，已 \(days.count) 天）"
-                : nil
-            return
-        }
-        let recent = Array(days.suffix(7))
-        let prior = Array(days.prefix(days.count - 7).suffix(7))
-        func ratio(_ ds: [DailyStats]) -> Double {
-            let p = ds.reduce(0.0) { $0 + $1.avgPower }
-            let t = ds.reduce(0.0) { $0 + $1.avgTemp }
-            return p > 1 ? t / p : 0
-        }
-        let r1 = ratio(prior), r2 = ratio(recent)
-        guard r1 > 0.01 else { thermalHealthText = nil; return }
-        let change = (r2 - r1) / r1
-        if change > 0.15 {
-            thermalHealthText = String(format: "散热效率下降 %.0f%%（%.2f→%.2f °C/W），建议清灰或换硅脂",
-                                       change * 100, r1, r2)
-        } else if change < -0.15 {
-            thermalHealthText = String(format: "散热效率提升 %.0f%%（%.2f→%.2f °C/W）", -change * 100, r1, r2)
-        } else {
-            thermalHealthText = String(format: "散热稳定（%.2f °C/W，两周变化 %+.0f%%）", r2, change * 100)
-        }
+        // 判据与文案在 FanCtlAppCore.ThermalHealthText（R89 下沉：°C/W 比值、14 天门、
+        // ±15% 阈值、三段文案有执行级测试）；此处只留 I/O（读 days）
+        thermalHealthText = ThermalHealthText.text(days: preloadedDays ?? loadDaysWithToday())
     }
 
     // MARK: 登录启动

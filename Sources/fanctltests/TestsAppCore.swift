@@ -580,3 +580,182 @@ func testFanConfigIntent() {
     expectEqual(boost.envCompensation, false, "关闭环境补偿透传")
     expectEqual(boost.palmCompensation, true, "开启体感补偿透传")
 }
+
+// MARK: - R89 下沉第三刀：AI 效果聚合 / 散热健康文案 / 部件投影 / 面板格式化
+
+private func effectDay(_ date: String, tempSum: Double, tempSeconds: Double,
+                       tempCount: Double, highSeconds: Double) -> DailyStats {
+    var d = DailyStats(date: date)
+    d.tempSum = tempSum
+    d.tempSeconds = tempSeconds
+    d.tempCount = tempCount
+    d.highTempSeconds = highSeconds
+    return d
+}
+
+func testAIEffectStats() {
+    group("AIEffect 聚合与文案(R89)")
+    let now = Date(timeIntervalSince1970: 1_800_000_000) // 2027-01-15 前后，夹具日键全在过去
+    // 时间加权口径：avg = ΣtempSum/ΣtempSeconds，hot = Σhigh/Σsecs
+    let d1 = effectDay("2026-01-01", tempSum: 4500, tempSeconds: 100, tempCount: 33, highSeconds: 10)
+    let d2 = effectDay("2026-01-02", tempSum: 5500, tempSeconds: 100, tempCount: 34, highSeconds: 30)
+    let ag = AIEffectStats.aggregate([d1, d2], now: now)
+    expect(ag != nil, "有效两天给出聚合")
+    if let ag {
+        expectClose(ag.avg, 50.0, 1e-9, "时间加权均温 = (4500+5500)/200")
+        expectClose(ag.hot, 0.2, 1e-9, "高温占比 = (10+30)/200")
+    }
+    // 旧数据回退口径：tempSeconds=0 时用 tempCount×3s 估算（v2.6 前固定 3s 一拍）
+    let legacy1 = effectDay("2026-01-03", tempSum: 4500, tempSeconds: 0, tempCount: 100, highSeconds: 30)
+    let legacy2 = effectDay("2026-01-04", tempSum: 1500, tempSeconds: 0, tempCount: 50, highSeconds: 0)
+    let agl = AIEffectStats.aggregate([legacy1, legacy2], now: now)
+    if let agl {
+        expectClose(agl.avg, 40.0, 1e-9, "旧数据均温回退 ΣtempSum/ΣtempCount = 6000/150")
+        expectClose(agl.hot, 30.0 / 450.0, 1e-9, "旧数据高温回退 Σhigh/(Σcount×3)")
+    } else {
+        expect(false, "旧数据口径也要能聚合")
+    }
+    // 过滤纪律（R57 P1）：tempCount=0 的空日与"晚于今天"的未来日都不进聚合
+    let empty = effectDay("2026-01-05", tempSum: 0, tempSeconds: 0, tempCount: 0, highSeconds: 0)
+    let future = effectDay("2030-01-01", tempSum: 99000, tempSeconds: 100, tempCount: 99, highSeconds: 99)
+    let onlyBad = AIEffectStats.aggregate([empty, future], now: now)
+    expect(onlyBad == nil, "全部无效天返回 nil（不给结论卡）")
+    let withBad = AIEffectStats.aggregate([d1, empty, future], now: now)
+    if let withBad {
+        expectClose(withBad.avg, 45.0, 1e-9, "坏日被过滤后只按好日聚合")
+    } else {
+        expect(false, "夹具里至少 d1 可用")
+    }
+    // 文案：改善（↓）/ 恶化（↑）两枝 + nil 透传
+    let better = AIEffectStats.AIEffect(days: 5, beforeAvg: 50, afterAvg: 46.4,
+                                        beforeHot: 0.10, afterHot: 0.03)
+    expectEqual(AIEffectStats.effectText(better),
+                "启用 5 天 · 均温 50°→46°（↓4°）· 高温 10%→3%",
+                "改善枝文案（四舍五入 + ↓ 箭头）")
+    let worse = AIEffectStats.AIEffect(days: 9, beforeAvg: 45.5, afterAvg: 49.5,
+                                       beforeHot: 0.03, afterHot: 0.10)
+    expectEqual(AIEffectStats.effectText(worse),
+                "启用 9 天 · 均温 46°→50°（↑4°）· 高温 3%→10%",
+                "恶化枝文案（↑ 箭头）")
+    expect(AIEffectStats.effectText(nil) == nil, "effect 为 nil 时文案也是 nil（不展示半张卡）")
+}
+
+func testThermalHealthText() {
+    group("散热健康文案(R89)")
+    func healthDay(_ date: String, avgT: Double, power: Double) -> DailyStats {
+        var d = DailyStats(date: date)
+        d.tempCount = 100
+        d.tempSeconds = 300
+        d.tempSum = avgT * 300
+        d.powerSum = power * 10
+        d.powerCount = 10
+        return d
+    }
+    // 数据不足：0-1 天 nil；2-13 天积累中
+    expect(ThermalHealthText.text(days: []) == nil, "零天不展示")
+    expect(ThermalHealthText.text(days: [healthDay("2026-01-01", avgT: 50, power: 10)]) == nil,
+           "单天不展示")
+    expectEqual(ThermalHealthText.text(days: (1...5).map { healthDay("2026-01-0\($0)", avgT: 50, power: 10) }),
+                "散热趋势积累中（需约 2 周数据，已 5 天）",
+                "积累中提示带天数")
+    // 无效天（avgPower≤1 / tempCount=0）不计数：14 天里 1 天无效 → 积累中
+    var mixed: [DailyStats] = (1...13).map { healthDay("2026-01-\($0 < 10 ? "0\($0)" : "\($0)")", avgT: 50, power: 10) }
+    mixed.append(healthDay("2026-01-14", avgT: 50, power: 0.5)) // avgPower=0.5 被过滤
+    expect(ThermalHealthText.text(days: mixed)?.hasPrefix("散热趋势积累中") == true,
+           "avgPower≤1 的天不进 14 天门")
+    // 14 天稳定：同分布 → "散热稳定"
+    func stableDays(_ ts: [Double]) -> [DailyStats] {
+        ts.enumerated().map { healthDay("2026-01-\($0.offset + 1 < 10 ? "0\($0.offset + 1)" : "\($0.offset + 1)")",
+                                        avgT: $0.element, power: 10) }
+    }
+    let stable = ThermalHealthText.text(days: stableDays(Array(repeating: 50.0, count: 14)))
+    expect(stable?.hasPrefix("散热稳定") == true, "同分布 14 天给稳定态")
+    // 退化：后 7 天均温抬高 >15%（°C/W 比值上升）→ 建议
+    var degrading = Array(repeating: 50.0, count: 7) + Array(repeating: 60.0, count: 7)
+    let degrade = ThermalHealthText.text(days: stableDays(degrading))
+    expect(degrade?.hasPrefix("散热效率下降") == true, "温升 >15% 给下降态")
+    expect(degrade?.contains("建议清灰或换硅脂") == true, "下降态带清灰建议")
+    // 改善：后 7 天均温压低 >15%
+    degrading = Array(repeating: 60.0, count: 7) + Array(repeating: 50.0, count: 7)
+    let improve = ThermalHealthText.text(days: stableDays(degrading))
+    expect(improve?.hasPrefix("散热效率提升") == true, "温降 >15% 给提升态")
+    // 边界：前周功耗近零（r1 ≤ 0.01）→ nil（比值无意义）
+    let flat = stableDays(Array(repeating: 50.0, count: 14)).map { d -> DailyStats in
+        var m = d; m.powerSum = 0.05; return m   // avgPower=0.005 → 前后周比值全 0
+    }
+    expect(ThermalHealthText.text(days: flat) == nil, "比值底数不足给 nil（不给假结论）")
+}
+
+func testComponentProjector() {
+    group("部件投影 deglitch(R89)")
+    var p = ComponentProjector()
+    // 正常拍：按温度降序，CPU/GPU 必在，可选件缺省即无行
+    let rows1 = p.project(SensorReadings(cpuDie: 55, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    expectEqual(rows1.map(\.id), ["GPU", "CPU", "SSD"], "降序排列且缺省部件无行")
+    expectClose(rows1[0].temp, 70, 1e-9, "GPU 行温度直读")
+    // 骤降毛刺：>30° 骤降沿用上一拍值（最多 3 拍），行不消失
+    var rows = p.project(SensorReadings(cpuDie: 55, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    _ = rows
+    rows = p.project(SensorReadings(cpuDie: 20, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    let cpuAfterGlitch = rows.first { $0.id == "CPU" }?.temp
+    expectClose(cpuAfterGlitch ?? -1, 55, 1e-9, "骤降 35° 的坏读沿用上一拍（第 1 拍挡）")
+    // 坏读拍后恢复：正常值直接采信（glitchHold 归零）
+    rows = p.project(SensorReadings(cpuDie: 53, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    expectClose(rows.first { $0.id == "CPU" }?.temp ?? -1, 53, 1e-9, "恢复拍直接采信")
+    // 持续 ≤1（零读）：挡 3 拍后采信 0 → 该行仍 >1 不成立 → 行消失（原语义不展示 0° 行）
+    _ = p.project(SensorReadings(cpuDie: 0, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    _ = p.project(SensorReadings(cpuDie: 0, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    _ = p.project(SensorReadings(cpuDie: 0, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    rows = p.project(SensorReadings(cpuDie: 0, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    expect(rows.first { $0.id == "CPU" } == nil, "持续零读挡满 3 拍后行消失（不展示 0°）")
+    expect(rows.first { $0.id == "GPU" } != nil, "GPU 独立计数不受 CPU 毛刺影响")
+    // 非有限值：行消失且状态清零（下一拍从新值起算）
+    rows = p.project(SensorReadings(cpuDie: .nan, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    expect(rows.first { $0.id == "CPU" } == nil, "NaN 读数不展示也不崩")
+    rows = p.project(SensorReadings(cpuDie: 48, gpuDie: 70, ssd: 40, palmRest: nil, heatsink: nil))
+    expectClose(rows.first { $0.id == "CPU" }?.temp ?? -1, 48, 1e-9,
+                "状态清零后下一拍从新值起算（无旧 prev 牵连）")
+}
+
+func testPanelFormat() {
+    group("面板格式化(R89)")
+    // 完整中文时长（面板行）与磁贴紧凑变体刻意分立，钉住各自输出防替换漂移
+    expectEqual(PanelFormat.durationLong(42), "42 秒", "秒级")
+    expectEqual(PanelFormat.durationLong(65), "1 分钟", "分钟级")
+    expectEqual(PanelFormat.durationLong(3_860), "1 小时 4 分钟", "小时级完整表述")
+    expectEqual(PanelFormat.durationCompactCN(3_860), "1时4分", "磁贴紧凑不带空格")
+    expectEqual(PanelFormat.durationCompactCN(65), "1 分钟", "紧凑变体分钟以下与完整版一致")
+    expectEqual(PanelFormat.revolutionText(9_500), "9500 转", "万转以下直读")
+    expectEqual(PanelFormat.revolutionText(12_000), "1.2 万转", "万转一位小数")
+    expectEqual(PanelFormat.revsCompact(12_000), "1.2万", "磁贴转数无单位无空格")
+    expectEqual(PanelFormat.revsCompact(9_500), "9500", "磁贴转数千位分隔也不加")
+    // 倒计时：m:ss，过期钳 0:00
+    let now = Date(timeIntervalSince1970: 1_000_000)
+    expectEqual(PanelFormat.countdown(to: now + 95, now: now), "1:35", "m:ss")
+    expectEqual(PanelFormat.countdown(to: now - 5, now: now), "0:00", "过期钳零")
+    // 磁贴超紧凑时长：s/m/h
+    expectEqual(PanelFormat.compactDuration(45), "45s", "秒档")
+    expectEqual(PanelFormat.compactDuration(100), "2m", "分档四舍五入")
+    expectEqual(PanelFormat.compactDuration(6_000), "1.7h", "个位小时一位小数")
+    expectEqual(PanelFormat.compactDuration(40_000), "11h", "十小时以上整数")
+    // 千位分隔转速
+    expectEqual(PanelFormat.rpmText(2_858.4), "2,858", "千位分隔 + 取整")
+    expectEqual(PanelFormat.rpmText(28.5), "29", "普通四舍五入")
+    // 评测摘要：full 含目标/样本数/峰值，元组透传秒数
+    var m = AIControlMetrics(targetTemp: 80)
+    m.sampleCount = 120
+    m.activeSeconds = 3_600
+    m.highTempSeconds = 300
+    m.temperatureSum = 8_000
+    m.temperatureSquaredSum = 640_000
+    m.outputSum = 4_000
+    m.peakTemp = 88.5
+    m.maxOvershoot = 6
+    m.outputChangeCount = 12
+    let eval = PanelFormat.evaluationText(m)
+    expectClose(eval.seconds, 3_600, 1e-9, "评测秒数透传")
+    expectClose(eval.highSeconds, 300, 1e-9, "超温秒数透传")
+    expect(eval.full.contains("目标 80°，120 个样本"), "full 带目标与样本数")
+    expect(eval.full.contains("时长 1 小时 0 分钟"), "full 的时长走完整中文变体")
+    expect(eval.full.contains("调速 12 次"), "full 带调速次数")
+}

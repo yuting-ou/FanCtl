@@ -1,6 +1,7 @@
 // MonitorViews —— 监控面板共享视觉语言与三个监控视图。
 import SwiftUI
 import SMCCore
+import FanCtlAppCore
 
 // MARK: - 监控面板共享视觉语言
 // 趋势/最热 两个 tab 数据形态不同（时间序/部件排行），但必须说面板同一套设计语言：
@@ -252,38 +253,27 @@ struct ProcessHogView: View {
 struct TodayStatsView: View {
     let stats: DailyStats?
 
-    private static let timeFmt: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
-    }()
-    private static func duration(_ s: Double) -> String {
-        let m = Int(s) / 60
-        // R82 续六：中文界面不留 "2h30m" 这种英文字母时长（用户诉求：看得懂中文）
-        if m >= 60 { return "\(m / 60)时\(m % 60)分" }
-        if m >= 1 { return "\(m) 分钟" }
-        return "\(Int(s)) 秒"
-    }
-    private static func revs(_ r: Double) -> String {
-        r >= 10_000 ? String(format: "%.1f万", r / 10_000) : "\(Int(r))"
-    }
+    // 磁贴紧凑时长/转数（"X时Y分"/"X.X万"）与 "HH:mm" 时间在 FanCtlAppCore.PanelFormat
+    // （R89 与 PanelView 的完整变体收口同处，输出有执行级断言钉住零漂移）
 
     var body: some View {
         if let s = stats, s.date == DailyStats.today(), s.tempCount > 0 {
             VStack(spacing: 7) {
                 HStack(spacing: 8) {
                     tile(icon: "thermometer.high", label: "最高", value: "\(Int(s.maxTemp.rounded()))°",
-                         sub: Self.timeFmt.string(from: s.maxTempAt), color: MonitorStyle.color(s.maxTemp))
+                         sub: PanelFormat.timeHM.string(from: s.maxTempAt), color: MonitorStyle.color(s.maxTemp))
                     tile(icon: "thermometer.medium", label: "均温", value: "\(Int(s.avgTemp.rounded()))°",
                          sub: nil, color: MonitorStyle.color(s.avgTemp))
                 }
                 HStack(spacing: 8) {
-                    tile(icon: "flame", label: "高温累计", value: Self.duration(s.highTempSeconds),
+                    tile(icon: "flame", label: "高温累计", value: PanelFormat.durationCompactCN(s.highTempSeconds),
                          sub: "≥80°", color: s.highTempSeconds > 1 ? .orange : .green)
-                    tile(icon: "fanblades.fill", label: "风扇转数", value: Self.revs(s.revolutions),
+                    tile(icon: "fanblades.fill", label: "风扇转数", value: PanelFormat.revsCompact(s.revolutions),
                          sub: "转", color: .blue)
                 }
                 if s.quietSeconds > 60 {
                     HStack(spacing: 8) {
-                        tile(icon: "moon.fill", label: "静音时长", value: Self.duration(s.quietSeconds),
+                        tile(icon: "moon.fill", label: "静音时长", value: PanelFormat.durationCompactCN(s.quietSeconds),
                              sub: nil, color: .indigo)
                         tile(icon: "bolt.fill", label: "平均功耗", value: s.avgPower > 1 ? "\(Int(s.avgPower.rounded()))W" : "--",
                              sub: nil, color: .yellow)

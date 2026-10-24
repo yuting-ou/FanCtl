@@ -2,6 +2,7 @@
 import SwiftUI
 import Charts
 import SMCCore
+import FanCtlAppCore
 
 /// 面板内联胶囊（药丸形小标签）的统一横向内边距。此前 9/7/6/5 四种并存，
 /// 而它们会并排出现在同一行里——横向不一，胶囊就"高矮齐、宽窄不齐"，
@@ -275,10 +276,10 @@ struct ContentView: View {
     private var statsSection: some View {
         if let s = model.stats, s.date == DailyStats.today(), s.tempCount > 0 {
             Text("今日战报")
-            Text("最高 \(String(format: "%.1f", s.maxTemp))°C · \(Self.timeFmt.string(from: s.maxTempAt))")
+            Text("最高 \(String(format: "%.1f", s.maxTemp))°C · \(PanelFormat.timeHM.string(from: s.maxTempAt))")
             Text("平均温度 \(String(format: "%.1f", s.avgTemp))°C")
-            Text("高温 ≥80°C 累计 \(Self.duration(s.highTempSeconds))")
-            Text("风扇累计 \(Self.revolutionText(s.revolutions))")
+            Text("高温 ≥80°C 累计 \(PanelFormat.durationLong(s.highTempSeconds))")
+            Text("风扇累计 \(PanelFormat.revolutionText(s.revolutions))")
             if s.speedChanges > 0 {
                 Text("调速 \(Int(s.speedChanges)) 次（±3% 以上）")
             }
@@ -289,7 +290,7 @@ struct ContentView: View {
                 Text("过冲峰值 +\(Int(s.overshootPeak.rounded()))°（重载超出 AI 目标）")
             }
             if s.quietSeconds > 60 {
-                Text("静音/安静时长 \(Self.duration(s.quietSeconds))")
+                Text("静音/安静时长 \(PanelFormat.durationLong(s.quietSeconds))")
             }
         } else {
             Text("今日战报 · 统计中…")
@@ -306,22 +307,8 @@ struct ContentView: View {
         }
     }
 
-    private static let timeFmt: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm"
-        return f
-    }()
-
-    private static func duration(_ seconds: Double) -> String {
-        let m = Int(seconds) / 60
-        if m >= 60 { return "\(m / 60) 小时 \(m % 60) 分钟" }
-        if m >= 1 { return "\(m) 分钟" }
-        return "\(Int(seconds)) 秒"
-    }
-
-    private static func revolutionText(_ revs: Double) -> String {
-        revs >= 10_000 ? String(format: "%.1f 万转", revs / 10_000) : "\(Int(revs)) 转"
-    }
+    // 时长/转数/倒计时/评测摘要等格式化已收口 FanCtlAppCore.PanelFormat
+    // （R89：与 MonitorViews 的私有重复实现合一，输出有执行级断言钉住零漂移）
 
     // 在访达中定位日志/配置文件（供“关于”菜单直达诊断）
     private static func revealInFinder(_ url: URL) {
@@ -499,7 +486,7 @@ struct ContentView: View {
                     HStack(spacing: 8) {
                         Image(systemName: "bolt.fill")
                             .foregroundStyle(.orange)
-                        Text("冲刺中 · 剩余 \(Self.countdown(to: end, now: context.date))")
+                        Text("冲刺中 · 剩余 \(PanelFormat.countdown(to: end, now: context.date))")
                             .font(.callout.monospacedDigit().weight(.medium))
                         Spacer()
                         Button("结束") { model.endBoost(restore: true) }
@@ -514,7 +501,7 @@ struct ContentView: View {
                     HStack(spacing: 8) {
                         Image(systemName: "moon.fill")
                             .foregroundStyle(.indigo)
-                        Text("静音中 · 风扇≤\(Int(model.quietCapPercent))% · 剩余 \(Self.countdown(to: end, now: context.date))")
+                        Text("静音中 · 风扇≤\(Int(model.quietCapPercent))% · 剩余 \(PanelFormat.countdown(to: end, now: context.date))")
                             .font(.callout.monospacedDigit().weight(.medium))
                             .lineLimit(1).minimumScaleFactor(0.8)
                         Spacer()
@@ -576,30 +563,7 @@ struct ContentView: View {
         .animation(.smooth(duration: 0.3), value: model.quietEndDate)
     }
 
-    private static func countdown(to end: Date, now: Date) -> String {
-        let remain = max(0, Int(end.timeIntervalSince(now)))
-        return String(format: "%d:%02d", remain / 60, remain % 60)
-    }
-
-    // 磁贴用超紧凑时长：s/m/h 单字母后缀（"130h"、"1.6h"），完整表述在悬停 full 里
-    private static func compactDuration(_ seconds: Double) -> String {
-        if seconds < 90 { return String(format: "%.0fs", seconds) }
-        let minutes = seconds / 60
-        if minutes < 90 { return String(format: "%.0fm", minutes) }
-        let hours = minutes / 60
-        return String(format: hours >= 10 ? "%.0fh" : "%.1fh", hours)
-    }
-
-    // 评测摘要：磁贴行取原始秒数自行格式化；full 为悬停完整版（含峰值/调速次数等磁贴放不下的指标）
-    private static func evaluationText(_ m: AIControlMetrics) -> (seconds: Double, highSeconds: Double, full: String) {
-        let full = """
-        AI 评测（目标 \(Int(m.targetTemp))°，\(m.sampleCount) 个样本）
-        时长 \(duration(m.activeSeconds)) · 均温 \(String(format: "%.1f", m.averageTemp))° · 峰值 \(String(format: "%.1f", m.peakTemp))°
-        波动 \(String(format: "%.1f", m.temperatureStdDev))° · 最大过冲 +\(Int(m.maxOvershoot.rounded()))° · 平均输出 \(String(format: "%.0f", m.averageOutput))%
-        调速 \(m.outputChangeCount) 次 · 超温（≥目标+5°）累计 \(duration(m.highTempSeconds))
-        """
-        return (m.activeSeconds, m.highTempSeconds, full)
-    }
+    // 磁贴/评测摘要格式化在 FanCtlAppCore.PanelFormat（compactDuration/evaluationText）
 
     private var fanCard: some View {
         VStack(spacing: 10) {
@@ -971,7 +935,7 @@ struct ContentView: View {
             // 让"不介入"不再是空态——用户能看到系统此刻把风扇开到多少（统一数据条样式）
             if model.daemonAlive && !model.fans.isEmpty {
                 statStrip(model.fans.map { fan in
-                    (Self.rpmText(fan.actualRPM),
+                    (PanelFormat.rpmText(fan.actualRPM),
                      fan.id == 0 ? "左风扇 RPM" : "右风扇 RPM", nil)
                 })
                 .padding(.top, 2)
@@ -1156,13 +1120,13 @@ struct ContentView: View {
                !model.aiHighEffort,
                model.aiRecommendedTarget == nil || abs(model.aiRecommendedTarget! - model.aiTargetTemp) <= 0.5,
                model.decisionTrace == nil {   // v3.7：透镜行在场时让位（同为解释性内容，互斥防 216pt 裁剪）
-                let eval = Self.evaluationText(m)
+                let eval = PanelFormat.evaluationText(m)
                 statStrip([
-                    (Self.compactDuration(eval.seconds), "评测", nil),
+                    (PanelFormat.compactDuration(eval.seconds), "评测", nil),
                     ("\(Int(m.averageTemp.rounded()))°", "均温", nil),
                     (String(format: "%.1f°", m.temperatureStdDev), "波动", nil),
                     ("\(Int(m.averageOutput.rounded()))%", "均输出", nil),
-                    (Self.compactDuration(eval.highSeconds), "超温",
+                    (PanelFormat.compactDuration(eval.highSeconds), "超温",
                      m.highTempSeconds > 60 ? Color.orange : nil),
                 ])
                 .help(eval.full)
@@ -1176,13 +1140,7 @@ struct ContentView: View {
     // 一条 0-100% 轨道，紫色填充 = AI 实际输出，灰色刻度线 = 用户曲线基准。
     // 刻度线位置 = "用户期望转速"，填充条到紫色 = "AI 最终输出"，
     // 两者间距 = "AI 自适应修正量"（散热压不住则加码、散热好则放松）。
-    // 千位分隔转速文本（"2,858"），与 FanRow 同风格
-    private static func rpmText(_ rpm: Double) -> String {
-        let n = Int(rpm.rounded())
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: n)) ?? "\(n)"
-    }
+    // 千位分隔转速文本（"2,858"）在 FanCtlAppCore.PanelFormat.rpmText，与 FanRow 同风格
 
     // 统一数据条：单容器 + 发丝分隔线（苹果天气/股市同款语言），
     // 替代各处独立小盒子——盒群视觉碎，发丝分隔一体感强

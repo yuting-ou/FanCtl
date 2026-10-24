@@ -485,7 +485,10 @@ func testZeroTempDayStillCounts() {
     expectEqual([DailyStats(date: "2026-09-19")].dataDayCount(now: Date()), 0, "全零空账同样不算一天")
     var good3 = good; good3.date = "2026-09-18"
     expectEqual([good, good3].dataDayCount(now: Date()), 2, "正常路径不受影响")
-    // FanModel 属 App target（测试不编译它）⇒ 用源码级门钉住"天数一律走 dataDayCount"
+    // FanModel 属 App target（测试不编译它）⇒ 用源码级门钉住"天数一律走 dataDayCount"。
+    // R89：aggregate 本体已下沉 FanCtlAppCore.AIEffectStats（过滤纪律/时间加权口径/
+    // 旧数据回退由 testAIEffectStats 执行级守），本门只守接线：天数判据留在
+    // reoptimizeState、聚合必须走 AppCore、App 侧不得另立一把过滤尺。
     let fmRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     if let fm = try? String(contentsOfFile: fmRoot.appendingPathComponent("Sources/FanCtlApp/FanModel.swift").path,
@@ -495,11 +498,13 @@ func testZeroTempDayStillCounts() {
         expectEqual(fmCode.components(separatedBy: "after.dataDayCount(now: now)").count - 1, 1,
                     "AI 效果天数必须走 dataDayCount(now: now)（改回 after.count 即红：空日把「启用 N 天」喂虚）")
         // 形状洞（R57 审查 P3-1）：只数前缀的话，自挑一把尺子的写法照样绿 ⇒ 钉死
-        // 「App 只能注入同一次 now」；再钉住 aggregate 与天数同源（审查 A 路 P1）
+        // 「App 只能注入同一次 now」；聚合与天数同源（审查 A 路 P1）由同句 now 保证
         expect(!fmCode.contains("dataDayCount(now: ."),
                "App 侧不得注入字面量时刻（那等于自己挑一把让天数变好看的尺）")
-        expectEqual(fmCode.components(separatedBy: "isUsableDay(now: now)").count - 1, 1,
-                    "aggregate 的过滤必须走同一条 isUsableDay（少一处=天数与均温不同源，卡片自相矛盾）")
+        expectEqual(fmCode.components(separatedBy: "AIEffectStats.aggregate(after, now: now)").count - 1, 1,
+                    "聚合必须走 AIEffectStats.aggregate 且与天数同一次 now（在 FanModel 内重算即红：口径会分叉）")
+        expect(!fmCode.contains("isUsableDay"),
+              "App 侧不得另立 isUsableDay 过滤尺（过滤纪律随 aggregate 进 core，两把尺=天数与均温不同源）")
         expect(!fmCode.contains("AIEffect(days: after.count"),
               "AIEffect 不得再拿未过滤的行数当天数")
     } else {
