@@ -759,3 +759,85 @@ func testPanelFormat() {
     expect(eval.full.contains("时长 1 小时 0 分钟"), "full 的时长走完整中文变体")
     expect(eval.full.contains("调速 12 次"), "full 带调速次数")
 }
+
+// MARK: - R90 下沉第四刀：AI 基线推荐 / 自动优化节奏 / daemon 下线清态策略
+
+func testAIBaselineAdvisor() {
+    group("AI 基线推荐分档(R90)")
+    // 分档阈值：≤68→72（性能）；<73→76（均衡）；否则 80（静音）
+    expectEqual(AIBaselineAdvisor.target(forBaselineAverage: 60), 72, "凉基线给性能档")
+    expectEqual(AIBaselineAdvisor.target(forBaselineAverage: 68), 68.0 > 68 ? 76 : 72, "68 边界含在性能档（≤68）")
+    expectEqual(AIBaselineAdvisor.target(forBaselineAverage: 68.1), 76, "刚过 68 给均衡档")
+    expectEqual(AIBaselineAdvisor.target(forBaselineAverage: 72.9), 76, "73 边界含在均衡档（<73）")
+    expectEqual(AIBaselineAdvisor.target(forBaselineAverage: 73), 80, "≥73 给静音档")
+    expectEqual(AIBaselineAdvisor.target(forBaselineAverage: 85), 80, "热基线给静音档")
+    // 采样窗：30s 未满继续采样（nil），满了且样本非空才给推荐
+    expect(AIBaselineAdvisor.recommendation(baselineTemps: [70, 72], enteredAgo: 29.9) == nil,
+           "采样窗未满不给推荐")
+    expect(AIBaselineAdvisor.recommendation(baselineTemps: [], enteredAgo: 120) == nil,
+           "窗满但零样本（全被 hot>1 门挡掉）不给推荐")
+    expectEqual(AIBaselineAdvisor.recommendation(baselineTemps: [70, 72, 74], enteredAgo: 30),
+                76, "窗满给均温分档（(70+72+74)/3=72 → 76）")
+    expectEqual(AIBaselineAdvisor.recommendation(baselineTemps: [60], enteredAgo: 31),
+                72, "单样本同样成立")
+}
+
+func testAutoOptimizePolicy() {
+    group("自动优化节奏(R90)")
+    let ok = AutoOptimizePolicy.shouldRun(enabled: true, modeIsCurve: true,
+                                          sinceUserChange: 10, sinceLastCheck: 4000)
+    expect(ok, "开关开+曲线+两窗都过 → 跑")
+    // 前置条件
+    expect(!AutoOptimizePolicy.shouldRun(enabled: false, modeIsCurve: true,
+                                         sinceUserChange: 10, sinceLastCheck: 4000),
+           "开关关不跑")
+    expect(!AutoOptimizePolicy.shouldRun(enabled: true, modeIsCurve: false,
+                                         sinceUserChange: 10, sinceLastCheck: 4000),
+           "非曲线模式不跑（优化改的就是曲线）")
+    // 冷却窗边界（> 严格）
+    expect(!AutoOptimizePolicy.shouldRun(enabled: true, modeIsCurve: true,
+                                         sinceUserChange: 5, sinceLastCheck: 4000),
+           "用户 5s 内动过配置不打扰（>5 严格边界）")
+    expect(!AutoOptimizePolicy.shouldRun(enabled: true, modeIsCurve: true,
+                                         sinceUserChange: 10, sinceLastCheck: 3600),
+           "上次检查恰好 1h 不重查（>3600 严格边界）")
+    expectEqual(AutoOptimizePolicy.freshDataDays, 3, "数据门槛 = 3 天（钉死不漂移）")
+    // 数据门槛：无基线（首次启用）立即优化；有基线要 ≥3 天新数据
+    expect(AutoOptimizePolicy.needsOptimize(hasBaseline: false, daysSinceBaseline: 0),
+           "无基线首次启用立即优化")
+    expect(!AutoOptimizePolicy.needsOptimize(hasBaseline: true, daysSinceBaseline: 2),
+           "2 天新数据不够")
+    expect(AutoOptimizePolicy.needsOptimize(hasBaseline: true, daysSinceBaseline: 3),
+           "≥3 天新数据才再优化")
+}
+
+func testDaemonOfflinePolicy() {
+    group("daemon 下线清态策略(R90)")
+    // 三组互不重叠
+    expect(DaemonOfflinePolicy.clearedProjectionFields
+        .isDisjoint(with: DaemonOfflinePolicy.keptReadingFields),
+           "清态/读数两组不得重叠")
+    expect(DaemonOfflinePolicy.clearedPanelFields
+        .isDisjoint(with: DaemonOfflinePolicy.keptReadingFields),
+           "面板清态/读数两组不得重叠")
+    expectEqual(DaemonOfflinePolicy.clearedProjectionFields.count, 18, "投影清态 18 个")
+    expectEqual(DaemonOfflinePolicy.clearedPanelFields.count, 4, "面板清态 4 个")
+    expectEqual(DaemonOfflinePolicy.keptReadingFields.count, 12, "保留读数 12 个")
+    // 分类完备性（核心牙）：Mirror 列 StatusProjection 全部字段，
+    // == 清态 ∪ 读数 ∪ {changed}——新增投影字段不分类即红
+    var projector = StatusProjector()
+    let proj = projector.project(DaemonStatus(sensors: SensorReadings(cpuDie: 70, gpuDie: 60),
+                                              mode: .curve, appliedPercent: 50,
+                                              fans: [], timestamp: Date()))
+    let fieldNames = Set(Mirror(reflecting: proj).children.compactMap(\.label))
+    let classified = DaemonOfflinePolicy.clearedProjectionFields
+        .union(DaemonOfflinePolicy.keptReadingFields)
+        .union(["changed"])
+    expectEqual(fieldNames.subtracting(classified), Set<String>(),
+                "每个投影字段都必须在策略里分类（新字段不分类即红）")
+    expectEqual(classified.subtracting(fieldNames), Set<String>(),
+                 "策略里不得出现投影已不存在的字段名（删字段要连策略一起改）")
+    // 钉两条最容易被"顺手清掉"的读数：清了反而撒谎
+    expect(DaemonOfflinePolicy.keptReadingFields.contains("fans"), "末次转速是死态诚实表达，不清")
+    expect(DaemonOfflinePolicy.keptReadingFields.contains("hardwareProfile"), "机器画像不随 daemon 生死")
+}

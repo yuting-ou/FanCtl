@@ -570,6 +570,15 @@ final class FanModel: ObservableObject {
     /// refreshFromStatus 的面板可见段独立回填（learnedNow 的来源 ai-learn.json 是持久
     /// 知识，不随 daemon 生死失效）。这两段都在死态的 return 之后，所以死期间它们保持
     /// 清空，直到重开面板或 daemon 回来——清这两个只是让生死翻转瞬间不显示过期行。
+    /// 清/不清的完整策略在 FanCtlAppCore.DaemonOfflinePolicy（R90 下沉：单一真值 +
+    /// Mirror 执行级测试钉死分类完备性——新增投影字段不在策略里分类即红）；
+    /// TestsCore 有接线门钉住本函数体与清单一一对应。
+    ///
+    /// 回填：其中 20 个字段只由 refreshFromStatus 的 assign() 从 status.json 赋值，
+    /// daemon 回来即恢复；`components`/`learnedNow` 例外，它们由 syncPanelData /
+    /// refreshFromStatus 的面板可见段独立回填（learnedNow 的来源 ai-learn.json 是持久
+    /// 知识，不随 daemon 生死失效）。这两段都在死态的 return 之后，所以死期间它们保持
+    /// 清空，直到重开面板或 daemon 回来——清这两个只是让生死翻转瞬间不显示过期行。
     private func clearDaemonState() {
         controlReason = nil
         aiIntent = nil
@@ -706,15 +715,16 @@ final class FanModel: ObservableObject {
             assign()
         }
 
-        // #4: AI 目标推荐：首次进入 AI 且无学习数据时采样 30s 基线温度
+        // #4: AI 目标推荐：首次进入 AI 且无学习数据时采样 30s 基线温度。
+        // 采样窗与分档阈值在 FanCtlAppCore.AIBaselineAdvisor（R90 下沉，有执行级测试）
         if mode == .ai && learnedPoints == 0, let entered = aiModeEnteredAt {
             let hot = max(cpuTemp, gpuTemp)
             if hot > 1 { aiBaselineTemps.append(hot) }
-            if Date().timeIntervalSince(entered) >= 30 && !aiBaselineTemps.isEmpty {
-                let avg = aiBaselineTemps.reduce(0, +) / Double(aiBaselineTemps.count)
-                aiRecommendedTarget = avg <= 68 ? 72 : (avg < 73 ? 76 : 80)
-                // v3.6.2（F3）：推荐已产出即停止采样——原实现 learnedPoints==0 期间
-                // 每 12s 无限追加（学习停滞/daemon 离线时 O(n²) 增长）
+            if let rec = AIBaselineAdvisor.recommendation(
+                baselineTemps: aiBaselineTemps,
+                enteredAgo: Date().timeIntervalSince(entered)) {
+                aiRecommendedTarget = rec
+                // v3.6.2（F3）：推荐已产出即停止采样（O(n²) 增长的修法语义不变）
                 aiModeEnteredAt = nil
             }
         }
@@ -1142,12 +1152,17 @@ final class FanModel: ObservableObject {
     }
 
     private func maybeAutoOptimize() {
-        guard autoOptimize, mode == .curve else { return }
-        guard Date().timeIntervalSince(lastUserChange) > 5,
-              Date().timeIntervalSince(lastAutoOptCheck) > 3600 else { return }
+        // 节奏与数据门槛在 FanCtlAppCore.AutoOptimizePolicy（R90 下沉：5s 用户冷却/
+        // 1h 检查节流/无基线或 ≥3 天新数据才优化，均有执行级测试）；lastAutoOptCheck
+        // 的写入（状态副作用）留在本类型
+        guard AutoOptimizePolicy.shouldRun(
+            enabled: autoOptimize, modeIsCurve: mode == .curve,
+            sinceUserChange: Date().timeIntervalSince(lastUserChange),
+            sinceLastCheck: Date().timeIntervalSince(lastAutoOptCheck)) else { return }
         lastAutoOptCheck = Date()
         let st = reoptimizeState()
-        if loadBaseline() == nil || st.afterDays >= 3 {
+        if AutoOptimizePolicy.needsOptimize(hasBaseline: loadBaseline() != nil,
+                                            daysSinceBaseline: st.afterDays) {
             _ = applyAICurve(auto: true)
         }
     }

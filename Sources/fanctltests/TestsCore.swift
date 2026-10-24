@@ -3,6 +3,7 @@
 import Foundation
 import Darwin
 import SMCCore
+import FanCtlAppCore
 
 // MARK: - 曲线插值
 
@@ -1811,4 +1812,40 @@ func testRampMonitor() {
                 "A 10% · B 20% · C 30%", "超过 3 名截断")
     expect(RampMonitor.line([]) == nil, "空采样不显示空行")
     expect(RampMonitor.line([("A", 0.4)]) == nil, "全零占用不显示空行")
+}
+
+/// R90：clearDaemonState（FanModel，App target 编不到）的函数体必须与
+/// FanCtlAppCore.DaemonOfflinePolicy 的清单一一对应。策略本体（分类完备性）有
+/// Mirror 执行级测试（TestsAppCore.testDaemonOfflinePolicy）；这里守的是接线：
+/// 函数体不许清策略外的字段、不许漏清策略内的字段、不许顺手清掉"保留读数"。
+func testDaemonOfflineWiring() {
+    group("daemon 下线清态接线(R90)")
+    let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    guard let raw = try? String(contentsOfFile: root.appendingPathComponent("Sources/FanCtlApp/FanModel.swift").path,
+                                encoding: .utf8) else {
+        expect(false, "静态门读不到 FanModel.swift（源码缺席必须判红，不得空转）")
+        return
+    }
+    guard let start = raw.range(of: "private func clearDaemonState") else {
+        expect(false, "找不到 private func clearDaemonState（改名要连门一起改）")
+        return
+    }
+    let tail = String(raw[start.upperBound...])
+    let body = tail.range(of: "\n    private func ").map { String(tail[..<$0.lowerBound]) }
+        ?? tail.range(of: "\n    func ").map { String(tail[..<$0.lowerBound]) } ?? tail
+    // 与 comboBar 门同款切片终止保护：函数体必须包含第一条赋值，否则切片失配即红
+    expect(body.contains("controlReason = nil"), "clearDaemonState 切片有效（终止串失配=把别人的函数算进来）")
+    let flatBody = body.split(separator: "\n").map(String.init)
+        .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+        .joined().replacingOccurrences(of: " ", with: "")
+    for name in DaemonOfflinePolicy.clearedFields {
+        expectEqual(flatBody.components(separatedBy: "\(name)=").count - 1, 1,
+                    "clearDaemonState 必须清 \(name)（且只清一次）")
+    }
+    for name in DaemonOfflinePolicy.keptReadingFields {
+        expect(!flatBody.contains("\(name)="),
+               "clearDaemonState 不得清保留读数 \(name)（死态显示末次读数是有意设计）")
+    }
+    expectEqual(DaemonOfflinePolicy.clearedFields.count, 22, "清态全集 22 个（18 投影 + 4 面板）")
 }
