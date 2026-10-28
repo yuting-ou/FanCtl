@@ -1375,6 +1375,134 @@ func testThermalModel() {
     }
 }
 
+// MARK: - R89 热模型硬件突变证伪 + 前馈信任门（L4 记忆证伪 / L5 元学习）
+
+/// 构造"成熟且协方差已坍缩"的持久化模型（a/b 固定、P 极小）。
+/// P 极小 → RLS 增益极低 → 喂冲突样本时参数跟不上、预测误差持续——
+/// 这正是"换硅脂/清灰后旧记忆结构性地错"在运行时的形态，也是证伪机制
+/// 要抓的对象。用 JSON 构造而非喂样本收敛：确定性且免受收敛路径噪声影响。
+func matureModel(pGain: Double) -> ThermalModel {
+    let obj: [String: Any] = ["a": 25.0, "b": 8.0, "sampleCount": 250,
+                              "p11": pGain, "p12": 0.0, "p22": pGain]
+    return try! JSONDecoder().decode(ThermalModel.self,
+                                     from: JSONSerialization.data(withJSONObject: obj))
+}
+
+func testThermalModelFalsification() {
+    group("热模型证伪与信任门(R89)")
+
+    // 冲突样本物理：真实热阻翻倍（积灰/硅脂干涸）。模型旧参数预测
+    // y_pred = 25×0.6 − 8×1.0 = 7，真实 y = 50×0.6 − 8×1.0 = 22，
+    // temp = 25 + 22 = 47 → err = +15（恰好撞上 ±15 钳制，>12 高误差门）
+    let conflictTemp = 47.0
+
+    // ① 连击到限触发证伪：整模重置、计数留存、证据清零、打破连击的样本喂入新模型
+    do {
+        var m = matureModel(pGain: 1e-4)
+        var falsified = false
+        for _ in 0..<(ThermalModel.falsifyStreakLimit - 1) {
+            falsified = m.update(env: 25, power: 30, percent: 50, temp: conflictTemp)
+        }
+        expect(!falsified, "连击差一拍未到限，不证伪")
+        expect(m.highErrStreak == ThermalModel.falsifyStreakLimit - 1, "连击计数精确（得 \(m.highErrStreak)）")
+        expect(m.falsifiedCount == 0, "证伪前计数为零")
+        expect(m.sampleCount == 250 + ThermalModel.falsifyStreakLimit - 1, "证伪前样本继续累计")
+        falsified = m.update(env: 25, power: 30, percent: 50, temp: conflictTemp)
+        expect(falsified, "连击到限触发证伪")
+        expect(m.falsifiedCount == 1, "证伪计数跨重置留存")
+        expect(m.sampleCount == 1, "整模重置后打破连击的样本随即喂入新模型")
+        expect(m.errEma == nil && m.highErrStreak == 0, "证据链随重置清零")
+        expect(m.feedforwardTrusted, "无证据 = 信任（失败关闭方向 = 不改变现状）")
+        expect(m.minPower == 30 && m.maxPower == 30, "新模型记下打破连击样本的操作带")
+    }
+
+    // ② 未成熟模型不证伪（收敛期误差大是常态）：样本基数 < 200 时连击到限也不动。
+    // 用 JSON 直接构造"连击已越限但样本基数不足"的模型——喂样本路径构造不出来：
+    // 新模型先验对冲突样本 err=12 恰好不越门，且大协方差下 RLS 几拍拟合、连击自清
+    //（这正是证据机制的正确行为：证据度量的是"当前参数"的预测力，不是绝对物理）。
+    do {
+        let youngJSON = try! JSONSerialization.data(withJSONObject: [
+            "a": 25.0, "b": 8.0, "sampleCount": 150,
+            "p11": 1e-4, "p12": 0.0, "p22": 1e-4,
+            "highErrStreak": ThermalModel.falsifyStreakLimit + 5,
+        ] as [String: Any])
+        var young = try! JSONDecoder().decode(ThermalModel.self, from: youngJSON)
+        let did = young.update(env: 25, power: 30, percent: 50, temp: conflictTemp)
+        expect(!did, "样本基数不足（150<200）→ 连击越限也不证伪")
+        expect(young.falsifiedCount == 0, "未成熟模型证伪计数保持为零")
+        expect(young.highErrStreak >= ThermalModel.falsifyStreakLimit, "连击证据照记（证伪只是不触发）")
+        expect(young.sampleCount == 151, "样本照常累计（学习不被守卫打断）")
+    }
+
+    // ③ 连击滞回：8~12°C 带内保持，≤8°C 清零
+    do {
+        var h = matureModel(pGain: 1e-4)
+        for _ in 0..<50 { _ = h.update(env: 25, power: 30, percent: 50, temp: conflictTemp) }
+        expect(h.highErrStreak == 50, "高误差连击累计到 50")
+        _ = h.update(env: 25, power: 30, percent: 50, temp: 42)   // y=17，err=10 → 滞回带内
+        expect(h.highErrStreak == 50, "滞回带内连击保持（不增不清）")
+        _ = h.update(env: 25, power: 30, percent: 50, temp: 36)   // y=11，err=4 ≤8 → 清零
+        expect(h.highErrStreak == 0, "低误差清零连击")
+    }
+
+    // ④ 信任门（L5 消费判据）：errEma 破 10 不信，好样本洗回信任域自动恢复
+    do {
+        var t = matureModel(pGain: 1e-4)
+        for _ in 0..<40 { _ = t.update(env: 25, power: 30, percent: 50, temp: conflictTemp) }
+        expect(t.errEma! > ThermalModel.trustMaxErrEma, "误差证据累积超信任门槛（得 \(t.errEma!)）")
+        expect(!t.feedforwardTrusted, "证据超限 → 前馈不信任")
+        for _ in 0..<60 { _ = t.update(env: 25, power: 30, percent: 50, temp: 32) }  // err=0 好样本
+        expect(t.errEma! <= ThermalModel.trustMaxErrEma, "好样本把证据洗回信任域（得 \(t.errEma!)）")
+        expect(t.feedforwardTrusted, "证据恢复 → 前馈自动再信任")
+    }
+
+    // ⑤ 升级兼容：旧持久化数据无证据字段 → nil/0/0 + 信任（升级前行为不变）
+    do {
+        let legacy = #"{"a":25,"b":5,"sampleCount":100,"p11":100,"p12":0,"p22":100}"#
+            .data(using: .utf8)!
+        let old = try! JSONDecoder().decode(ThermalModel.self, from: legacy)
+        expect(old.errEma == nil && old.highErrStreak == 0 && old.falsifiedCount == 0,
+               "旧模型证据字段缺省 nil/0/0")
+        expect(old.feedforwardTrusted, "旧数据无证据 → 信任（升级前行为不变）")
+        expect(ThermalModel().feedforwardTrusted, "新模型无证据 → 信任")
+    }
+
+    // ⑥ 证据字段 Codable 往返 + resetIfUnusable 不抹证伪计数
+    do {
+        var e = matureModel(pGain: 1e-4)
+        for _ in 0..<30 { _ = e.update(env: 25, power: 30, percent: 50, temp: conflictTemp) }
+        let back = try! JSONDecoder().decode(ThermalModel.self, from: JSONEncoder().encode(e))
+        expect(back == e, "证据字段随模型 Codable 往返")
+        expect(back.highErrStreak == 30 && back.falsifiedCount == 0 && back.errEma != nil,
+               "往返后证据保真")
+        let stuckJSON = #"{"a":25,"b":1.0,"sampleCount":300,"falsifiedCount":3}"#.data(using: .utf8)!
+        var s = try! JSONDecoder().decode(ThermalModel.self, from: stuckJSON)
+        var why: String? = nil
+        expect(s.resetIfUnusable(reason: &why), "b 贴地模型可重置")
+        expect(s.falsifiedCount == 3, "resetIfUnusable 不抹证伪计数（诊断证据）")
+    }
+
+    // ⑦ 接线静态门：模型测试过了不算数——引擎没消费等于功能没做
+    do {
+        // TestsAI.swift 在 <root>/Sources/fanctltests/ → 上溯三层是仓库根（R47 同法）
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        guard let src = try? String(contentsOfFile:
+                root.appendingPathComponent("Sources/SMCCore/ControlEngine.swift").path,
+                encoding: .utf8) else {
+            expect(false, "静态门读不到 ControlEngine.swift（源码缺席必须判红，不得空转）")
+            return
+        }
+        expect(src.contains("let modelPct = feedTrustNow"), "引擎前馈按信任门准入")
+        expect(src.contains("if thermalModel.update(env: env, power: pw, percent: baseTarget, temp: temp) {"),
+               "引擎喂样本并接住证伪返回值")
+        expect(src.contains("thermalFeedTrusted: effectiveConfig.mode == .ai ? thermalModel.feedforwardTrusted : nil"),
+               "信任门状态下发 status（仅 AI 模式表态）")
+        expect(src.contains("thermalModelFalsified: thermalModel.falsifiedCount > 0"),
+               "证伪计数下发 status（从未发生写 nil）")
+    }
+}
+
 
 func testNightAndEnv() {
     group("夜间与环境补偿")

@@ -43,6 +43,27 @@ public struct ThermalModel: Codable {
     // 需要多少样本才采信（数据不足时预测返回 nil）
     public static let minSamples = 30
 
+    // MARK: R89 硬件突变证伪 + 前馈信任门（L4 跨会话记忆的证伪面 / L5 元学习）
+    //
+    // 记忆的风险是"记错"：换硅脂/清灰/挪动散热环境之后，旧参数结构性地错，
+    // λ=0.999 的慢遗忘要数千样本才能忘掉——期间前馈持续误导控制（错误记忆比没有更糟）。
+    // 证据链（全部确定性阈值，纯函数可测）：
+    //   errEma        滚动平均绝对预测误差（α=0.05，约 20 样本窗口）
+    //   highErrStreak 高误差连击：|err| > 12°C 记一拍，≤ 8°C 清零（滞回防抖），中间保持
+    // 证伪判据：成熟模型（sampleCount ≥ 200，收敛期误差大是常态，不误伤）
+    //   连击 ≥ 120 → 判定热环境已变，整模重置重新辨识；falsifiedCount 留存事件证据。
+    // 信任门（L5 消费侧）：errEma > 10°C → feedforwardTrusted=false，引擎回退纯查表前馈；
+    //   证据恢复（≤10）自动再信任；errEma 为 nil（旧持久化数据无此字段）→ 信任，
+    //   即升级前行为不变（失败关闭的方向 = 不改变现状）。
+    public private(set) var errEma: Double?
+    public private(set) var highErrStreak: Int = 0
+    public private(set) var falsifiedCount: Int = 0
+    public static let falsifyMinSamples = 200    // 判伪的最低证据基数
+    public static let falsifyStreakLimit = 120   // 高误差连击上限
+    public static let errHighThreshold = 12.0    // °C：单拍"结构性错误"门槛
+    public static let errRecoverThreshold = 8.0  // °C：连击清零门槛（滞回）
+    public static let trustMaxErrEma = 10.0      // °C：前馈信任门槛
+
     // MARK: 预测采信域（闭环辨识的物理有效性）
     // percent 是控制器对 power/temp 的反馈输出——回归量与被控量相关（闭环辨识），
     // a/b 只在被采样覆盖的操作带内可辨识；带外外推的参数偏差经 predictedPercent
@@ -60,21 +81,43 @@ public struct ThermalModel: Codable {
     // 在线更新：样本 (env, power, percent, temp)
     // 误差 e = (env + a·power − b·percent) − temp；梯度下降使 |e| 最小化。
     // 学习率随样本数衰减：前期快速收敛，后期缓慢微调（散热系统缓慢漂移的适应）。
-    public mutating func update(env: Double, power: Double, percent: Double, temp: Double) {
+    // 返回 true = 本拍触发了硬件突变证伪（模型已整模重置），调用方负责记日志。
+    @discardableResult
+    public mutating func update(env: Double, power: Double, percent: Double, temp: Double) -> Bool {
         guard env.isFinite, power.isFinite, percent.isFinite, temp.isFinite,
-              power >= 0, percent >= 0, percent <= 100 else { return }
-        // 采信域随样本扩张（只扩不缩：单点 band 即可拦住明显外推）
-        minPower = min(minPower ?? power, power)
-        maxPower = max(maxPower ?? power, power)
-        minEnv = min(minEnv ?? env, env)
-        maxEnv = max(maxEnv ?? env, env)
+              power >= 0, percent >= 0, percent <= 100 else { return false }
         // 归一化特征：power/50、percent/50（尺度 ~1，数值稳定）
         let x1 = power / 50.0
         let x2 = -percent / 50.0
         let y = temp - env
-        // RLS 增益向量 k = P·x / (λ + xᵀ·P·x)
+        // R89 证据链（先于参数更新：证据必须度量"旧参数对当前观测的预测力"，
+        // 用更新后的参数算误差等于自我宽赦）。误差与 RLS 同源同钳制（±15°C）。
+        let preErr = max(-15, min(15, y - (a * x1 + b * x2)))
+        let absErr = Swift.abs(preErr)
+        errEma = errEma.map { $0 * 0.95 + absErr * 0.05 } ?? absErr
+        // 连击滞回（12/8 双门槛防抖：8~12°C 之间保持既有连击，不增不清）
+        if absErr > Self.errHighThreshold { highErrStreak += 1 }
+        else if absErr <= Self.errRecoverThreshold { highErrStreak = 0 }
+        // 硬件突变证伪：成熟模型（收敛期误差大是常态，不误伤）+ 连击到限
+        // → 旧参数结构性地错且 λ=0.999 的慢遗忘改不动它 → 整模重置重新辨识。
+        // falsifiedCount 跨重置留存（诊断证据）；打破连击的这枚样本随即喂入
+        // 全新协方差的新模型（重置不是丢弃观测，是丢弃记忆）。
+        var falsified = false
+        if sampleCount >= Self.falsifyMinSamples, highErrStreak >= Self.falsifyStreakLimit {
+            let savedCount = falsifiedCount + 1
+            self = ThermalModel()
+            falsifiedCount = savedCount
+            falsified = true
+        }
+        // 采信域随样本扩张（只扩不缩：单点 band 即可拦住明显外推）。
+        // 置于证伪之后——重置后的新模型同样要记下本样本的操作带
+        minPower = min(minPower ?? power, power)
+        maxPower = max(maxPower ?? power, power)
+        minEnv = min(minEnv ?? env, env)
+        maxEnv = max(maxEnv ?? env, env)
+        // RLS 增益向量 k = P·x / (λ + xᵀ·P·x)——对当前（可能已重置的）状态计算
         let denom = lambda + p11 * x1 * x1 + 2 * p12 * x1 * x2 + p22 * x2 * x2
-        guard denom.isFinite, denom > 1e-9 else { return }
+        guard denom.isFinite, denom > 1e-9 else { return falsified }
         let k1 = (p11 * x1 + p12 * x2) / denom
         let k2 = (p12 * x1 + p22 * x2) / denom
         // 参数更新（误差钳制 ±15°C：异常样本不把参数大幅推离物理域）
@@ -116,6 +159,15 @@ public struct ThermalModel: Codable {
                 transientB = max(1, min(100, newB))
             }
         }
+        return falsified
+    }
+
+    // R89 L5 元学习·前馈信任门：由滚动误差证据决定模型预测是否参与前馈。
+    // errEma > 10°C = 预测力已被数据证伪 → 引擎回退纯查表前馈（消费侧见 ControlEngine）。
+    // nil（旧持久化数据/新模型，尚无证据）→ 信任 = 保持升级前行为（失败关闭不改变现状）。
+    public var feedforwardTrusted: Bool {
+        guard let e = errEma else { return true }
+        return e <= Self.trustMaxErrEma
     }
 
     /// 影子/诊断用稳态反解：同一采信域，但 need ≤ 0 时返回 **0** 而不是 nil。
@@ -181,7 +233,10 @@ public struct ThermalModel: Codable {
     public mutating func resetIfUnusable(reason: inout String?) -> Bool {
         guard sampleCount >= Self.minSamples, b <= 2.5 else { return false }
         reason = String(format: "热模型 b=%.2f 未收敛（样本 %d），已重置辨识", b, sampleCount)
+        // R89：falsifiedCount 是诊断证据，不随重置消失
+        let savedCount = falsifiedCount
         self = ThermalModel()
+        falsifiedCount = savedCount
         return true
     }
 }
@@ -191,10 +246,13 @@ public struct ThermalModel: Codable {
 extension ThermalModel: Equatable {
     public static func == (lhs: ThermalModel, rhs: ThermalModel) -> Bool {
         lhs.a == rhs.a && lhs.b == rhs.b && lhs.sampleCount == rhs.sampleCount
+            && lhs.errEma == rhs.errEma && lhs.highErrStreak == rhs.highErrStreak
+            && lhs.falsifiedCount == rhs.falsifiedCount
     }
     private enum CodingKeys: String, CodingKey {
         case a, b, sampleCount, p11, p12, p22, lambda
         case minPower, maxPower, minEnv, maxEnv
+        case errEma, highErrStreak, falsifiedCount
     }
 
     public init(from decoder: Decoder) throws {
@@ -210,6 +268,10 @@ extension ThermalModel: Equatable {
         maxPower = try c.decodeIfPresent(Double.self, forKey: .maxPower)
         minEnv = try c.decodeIfPresent(Double.self, forKey: .minEnv)
         maxEnv = try c.decodeIfPresent(Double.self, forKey: .maxEnv)
+        // R89 证据链：旧版本无此记录 → nil/0/0（无证据 = 信任，升级前行为不变）
+        errEma = try c.decodeIfPresent(Double.self, forKey: .errEma)
+        highErrStreak = try c.decodeIfPresent(Int.self, forKey: .highErrStreak) ?? 0
+        falsifiedCount = try c.decodeIfPresent(Int.self, forKey: .falsifiedCount) ?? 0
         // lambda 是 let，用默认值
     }
 
@@ -226,6 +288,9 @@ extension ThermalModel: Equatable {
         try c.encodeIfPresent(maxPower, forKey: .maxPower)
         try c.encodeIfPresent(minEnv, forKey: .minEnv)
         try c.encodeIfPresent(maxEnv, forKey: .maxEnv)
+        try c.encodeIfPresent(errEma, forKey: .errEma)
+        try c.encode(highErrStreak, forKey: .highErrStreak)
+        try c.encode(falsifiedCount, forKey: .falsifiedCount)
     }
 }
 

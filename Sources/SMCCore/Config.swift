@@ -404,6 +404,11 @@ public struct DaemonStatus: Codable {
     public var thermalModelUsable: Bool?
     public var thermalModelB: Double?
     public var thermalModelSamples: Int?
+    // R89：热模型 L4/L5 可见性——feedTrusted=前馈信任门当前态（errEma 证据），
+    // falsified=历史证伪次数（0 = 从未，写 nil 不写 0：与"字段缺席=旧 daemon"可区分）。
+    // 两者均只诊断不旋钮，App 展示"记忆健康"，控制行为不在 App 侧消费。
+    public var thermalFeedTrusted: Bool?
+    public var thermalModelFalsified: Int?
     /// R38：产生这份 status 的 daemon 版本串（如 "4.2.3 (94)"）。诊断包此前只能靠
     /// "App plist 版本 + daemon 二进制 mtime"推断装的是什么，遇到"App 已升级、daemon
     /// 留在旧版"这种半途状态就只能猜。旧 daemon 不写此字段 → 解码为 nil。
@@ -440,6 +445,8 @@ public struct DaemonStatus: Codable {
                 thermalModelUsable: Bool? = nil,
                 thermalModelB: Double? = nil,
                 thermalModelSamples: Int? = nil,
+                thermalFeedTrusted: Bool? = nil,
+                thermalModelFalsified: Int? = nil,
                 daemonVersion: String? = nil) {
         self.sensors = sensors
         self.mode = mode
@@ -484,6 +491,9 @@ public struct DaemonStatus: Codable {
         self.thermalModelUsable = thermalModelUsable
         self.thermalModelB = thermalModelB
         self.thermalModelSamples = thermalModelSamples
+        // R89：F9 同族——Optional 字段必须显式赋值
+        self.thermalFeedTrusted = thermalFeedTrusted
+        self.thermalModelFalsified = thermalModelFalsified
     }
 
     // 旧版便利初始化（保持源码兼容）
@@ -523,6 +533,7 @@ public struct DaemonStatus: Codable {
         case hardwareProfile
         case calibrating
         case thermalModelUsable, thermalModelB, thermalModelSamples
+        case thermalFeedTrusted, thermalModelFalsified
         case daemonVersion
         case cpuTemp, gpuTemp
     }
@@ -577,6 +588,14 @@ public struct DaemonStatus: Codable {
         thermalModelUsable = try container.decodeIfPresent(Bool.self, forKey: .thermalModelUsable)
         thermalModelB = try container.decodeIfPresent(Double.self, forKey: .thermalModelB)
         thermalModelSamples = try container.decodeIfPresent(Int.self, forKey: .thermalModelSamples)
+        // R89：falsified 来自组可写目录的 JSON——负值/超大一律当 nil（不进展示层）
+        thermalFeedTrusted = try container.decodeIfPresent(Bool.self, forKey: .thermalFeedTrusted)
+        if let f = try container.decodeIfPresent(Int.self, forKey: .thermalModelFalsified),
+           f >= 0, f <= 10_000 {
+            thermalModelFalsified = f
+        } else {
+            thermalModelFalsified = nil
+        }
         // R38：版本串来自组可写目录里的 JSON——限长 64 且只收可打印 ASCII（含换行/控制
         // 字符或超长的一律当没有），否则一条被改写的 status.json 就能往展示层塞文本
         if let v = try container.decodeIfPresent(String.self, forKey: .daemonVersion),
@@ -623,6 +642,8 @@ public struct DaemonStatus: Codable {
         try container.encodeIfPresent(thermalModelUsable, forKey: .thermalModelUsable)
         try container.encodeIfPresent(thermalModelB, forKey: .thermalModelB)
         try container.encodeIfPresent(thermalModelSamples, forKey: .thermalModelSamples)
+        try container.encodeIfPresent(thermalFeedTrusted, forKey: .thermalFeedTrusted)
+        try container.encodeIfPresent(thermalModelFalsified, forKey: .thermalModelFalsified)
         try container.encodeIfPresent(daemonVersion, forKey: .daemonVersion)
         // 同时写旧字段，保证回滚到旧版本 App/daemon 时也能读
         try container.encode(sensors.cpuDie, forKey: .cpuTemp)

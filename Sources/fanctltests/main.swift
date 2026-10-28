@@ -504,6 +504,18 @@ func testOffsetsAndReadings() {
         expect(back2.thermalModelUsable == false && back2.thermalModelB == 1.0
                && back2.thermalModelSamples == 2576, "热模型诊断字段往返")
         expect(back.thermalModelUsable == nil, "旧 status 无热模型字段 → nil")
+        // R89：信任门/证伪计数往返 + 旧 status 无字段 → nil；负值 falsified 解码侧消毒为 nil
+        let st3 = DaemonStatus(sensors: SensorReadings(cpuDie: 60, gpuDie: 50),
+                               mode: .ai, appliedPercent: 20, fans: [],
+                               thermalFeedTrusted: false, thermalModelFalsified: 3)
+        let back3 = try! dec2.decode(DaemonStatus.self, from: try! enc2.encode(st3))
+        expect(back3.thermalFeedTrusted == false && back3.thermalModelFalsified == 3,
+               "热模型信任门/证伪字段往返")
+        expect(back.thermalFeedTrusted == nil && back.thermalModelFalsified == nil,
+               "旧 status 无信任门/证伪字段 → nil")
+        let hostile = #"{"sensors":{"cpuDie":60,"gpuDie":50},"mode":"ai","appliedPercent":20,"fans":[],"timestamp":"2026-07-31T10:00:00Z","thermalModelFalsified":-5}"#.data(using: .utf8)!
+        let hs = try dec.decode(DaemonStatus.self, from: hostile)
+        expect(hs.thermalModelFalsified == nil, "负值证伪计数消毒为 nil（不进展示层）")
         expect(back.baseTargetPercent == nil && back.safetyFloorPercent == nil,
                "旧状态目标分解字段缺省兼容")
         let legacy = #"{"cpuTemp":70,"gpuTemp":55,"mode":"curve","appliedPercent":45,"fans":[],"timestamp":"2026-07-31T10:00:00Z"}"#.data(using: .utf8)!
@@ -777,6 +789,7 @@ testAIController()
 testAIIdleComponentPowerBaseline()
 testAnchorProbing()
 testThermalModel()
+testThermalModelFalsification()   // R89：L4 硬件突变证伪 + L5 前馈信任门
 testShadowFFModelInverse()
 testShadowFFModelZeroRecorded()
 testShadowFFLedgerMath()
@@ -901,6 +914,8 @@ let minAssertions = 6071
 // R23 测试基建：第二道门槛——distinct group 数。断言总数可被循环刷量虚高
 // （如 expectPersonalityOrdered 单次产 ~816 条），删掉整段测试但保留循环类断言时
 // 总数不降、覆盖却净损；group 数是粗粒度结构量，删函数即少一个 group，刷不出来。
+// 5877=R89 实测 5885/131（L4 硬件突变证伪 + L5 前馈信任门，+35 断言 +1 组；
+// CI 按惯例较本机少 ~2 环境相关断言，下限再让 6 条漂移余量）
 let minGroups = 139
 if failures == 0 {
     if checks < minAssertions {

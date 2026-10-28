@@ -2763,6 +2763,8 @@ func testStatusSummaryCoverage() {
     a.thermalModelUsable = true
     a.thermalModelB = 1.2
     a.thermalModelSamples = 312
+    a.thermalFeedTrusted = true       // R89：信任门/证伪计数与既有热模型诊断字段同门差分
+    a.thermalModelFalsified = 2
     a.daemonVersion = "4.2.9 (100)"
     a.decisionTrace = DecisionTrace(target: 74, temp: 70, error: -4, learned: 40,
                                     idle: false, hysteresisHold: true, guardSeconds: 3)
@@ -2791,6 +2793,10 @@ func testStatusSummaryCoverage() {
                               // 两段（不是 reason——R46 审查修正过这句）
         "thermalModelUsable", "thermalModelB", "thermalModelSamples",
                               // 模型参数每拍漂移，纳入等于每拍强写；诊断字段容许 ≤10s 陈旧
+        "thermalFeedTrusted",   // R89：随样本证据漂移（errEma 连续量），纳入等于学习期每拍强写；
+                                // 且控制消费在引擎内同拍同源，status 只是展示，容许 ≤10s 陈旧
+        "thermalModelFalsified",  // R89：只增不减的罕见计数器，变化当拍必伴随大量字段变化
+                                  //（样本数/参数全变），单列无增量信号；展示语义"曾经证伪过"
     ]
     let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
     let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
@@ -2824,8 +2830,8 @@ func testStatusSummaryCoverage() {
         tested += 1
         if statusChangeSummary(decoded) == baseSummary { missed.append(key) }
     }
-    expectEqual(keys.count, 35, "status.json 顶层键数=35（新增字段必须在本门或 summaryFree 里表态）")
-    expectEqual(tested, 24, "实际被差分的键数=24（= 35 键 − 11 条有理由的豁免；对不上即有人改名单）")
+    expectEqual(keys.count, 37, "status.json 顶层键数=37（新增字段必须在本门或 summaryFree 里表态）")
+    expectEqual(tested, 24, "实际被差分的键数=24（= 37 键 − 13 条有理由的豁免；对不上即有人改名单）")
     // R46 审查修正（门的关键盲区）：JSON 键来自夹具，A/B 都留 nil 的键会被 encodeIfPresent
     // 省略、根本不进差分——"新增字段必须表态"因此有洞。改成用 Mirror 枚举**存储属性**：
     // 每个存储属性要么被差分过、要么在豁免名单、要么显式列进下面的"夹具未填"名单。
