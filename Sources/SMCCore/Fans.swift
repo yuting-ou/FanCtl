@@ -670,11 +670,27 @@ public final class TemperatureSensors {
         return v
     }
 
-    public var cpuTemperature: Double { checkRescan(); return trackedMax(cpuKeys, track: &cpuTrack) }
+    /// 芯片族热点读数的**物理下限**。既有有效性过滤是 `>1 && <120`，只管"像不像个温度"，
+    /// 管不住"整族一起读出 8.4°C"这种坏读（真机 R91 实测：同一拍 cpuDie 8.425 而
+    /// gpuDie 45.1、环境 26.5；面板 CPU 行就此显示 8°，两族一起坏时 rawTemp 掉到环境
+    /// 以下、攒满 90s 就是 105 次"偏低失真"交还）。发热源不可能比最凉的周边还冷 12°C
+    /// ——判据直接复用 `StatsSampler.tempPlausible`（统计口径/趋势图早就在用这一条，
+    /// 12° 余量同源），让读数层/控制层/统计层对同一个数说同一句话。
+    /// 参照用**上一拍**的环境谷值：谷值是长窗口最小值、只随候选变冷而瞬时下探，
+    /// 所以冷房间里门限自己就打开（环境 10° → 下限 ≈0），不会把真实低温判废。
+    /// 判废返回 0=无有效读数（与"读数无效必须保持 0、不能伪造兜底值"同一条纪律）；
+    /// 温度族（CPU/GPU）之外的键不经过此门——SSD/电池各自喂独立托底，不在本轮动它们。
+    private func dieHotspot(_ v: Double) -> Double {
+        guard v > 1 else { return 0 }
+        let env = ambientValley > 5 ? ambientValley : nil
+        return StatsSampler.tempPlausible(v, envTemp: env) ? v : 0
+    }
+
+    public var cpuTemperature: Double { checkRescan(); return dieHotspot(trackedMax(cpuKeys, track: &cpuTrack)) }
     // CPU 核心平均温度（全扫时更新，快速路径沿用上次值）。用于 UI 对比其他软件的"核心平均"显示。
     // 控制决策仍用 cpuTemperature（热点 max），不使用此值。
-    public var cpuAverageTemperature: Double { checkRescan(); _ = trackedMax(cpuKeys, track: &cpuTrack); return cpuTrack.lastAverage }
-    public var gpuTemperature: Double { checkRescan(); return trackedMax(gpuKeys, track: &gpuTrack) }
+    public var cpuAverageTemperature: Double { checkRescan(); _ = trackedMax(cpuKeys, track: &cpuTrack); return dieHotspot(cpuTrack.lastAverage) }
+    public var gpuTemperature: Double { checkRescan(); return dieHotspot(trackedMax(gpuKeys, track: &gpuTrack)) }
     public var nandTemperature: Double { checkRescan(); return trackedMax(nandKeys, track: &nandTrack) }
     // 电池温度：3s 控制级缓存——电池托底与环境代理同读此值，每拍最多读一次
     // （电池热质量大，秒级温度变化远小于托底滞回带宽，短缓存不引入控制风险）
@@ -787,15 +803,17 @@ public final class TemperatureSensors {
     public func sensorReadings() -> SensorReadings {
         checkRescan()
         // 一次 trackedMax 调用同时更新 max 和 lastAverage，避免重复 SMC 读
-        let cpuMax = trackedMax(cpuKeys, track: &cpuTrack)
-        let cpuAvg = cpuTrack.lastAverage
+        let cpuMax = dieHotspot(trackedMax(cpuKeys, track: &cpuTrack))
+        let cpuAvg = dieHotspot(cpuTrack.lastAverage)
         // v3.4.5（2B）：GPU 读数先落本地变量——三元两侧各写一次 gpuTemperature
         // 会在 gpu ≤1°C（读失败）时对 gpuKeys 做两次全量 trackedMax 扫描
         let gpuT = gpuTemperature
         let gpu = gpuT > 1 ? gpuT : cpuMax
         let palm = palmRestTemperature > 1 ? palmRestTemperature : nil
         // R82 续八：展示值剔除物理不可能键（阈值 = 发热核心 + 10°）。先走一遍
-        // heatsinkTemperature（10s 全扫 + 逐键记录，读取预算与旧版完全一致）
+        // heatsinkTemperature（10s 全扫 + 逐键记录，读取预算与旧版完全一致）。
+        // 阈值取**过物理下限之后**的核心温度：两族都不可信时阈值只剩 10°，散热片行
+        // 就此隐藏——没有可信核心做参照就无法担保那个数，宁可隐藏不虚造。
         _ = heatsinkTemperature
         let hsRaw = heatsinkDisplayTemperature(implausibleAbove: max(cpuMax, gpuT) + 10)
         let hs = hsRaw > 1 ? hsRaw : nil

@@ -221,10 +221,13 @@ public struct FanMCP {
             ["id": f.id, "actualRPM": num(f.actualRPM, 0), "targetRPM": num(f.targetRPM, 0),
              "minRPM": num(f.minRPM, 0), "maxRPM": num(f.maxRPM, 0)] as [String: Any]
         }
+        // 芯片族 0 = 无有效读数哨兵（读失败/物理下限判废都写 0）。报成 0.0°C 会让
+        // AI 助手念出"CPU 0 度"——缺失就说缺失，与 cpuAverage/ssd 的 nil 口径对齐。
+        let die: (Double) -> Double? = { $0 > 1 && $0.isFinite ? $0 : nil }
         out["sensors"] = [
-            "cpuDie": num(s.sensors.cpuDie, 1),
+            "cpuDie": num(die(s.sensors.cpuDie), 1),
             "cpuAverage": num(s.sensors.cpuAverage, 1),
-            "gpuDie": num(s.sensors.gpuDie, 1),
+            "gpuDie": num(die(s.sensors.gpuDie), 1),
             "ssd": num(s.sensors.ssd, 1),
             "palmRest": num(s.sensors.palmRest, 1),
             "heatsink": num(s.sensors.heatsink, 1),

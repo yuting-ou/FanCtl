@@ -318,13 +318,18 @@ do {
     let sensors = try TemperatureSensors(smc: smc)
 
     let counts = sensors.sensorCounts
+    // `0` 是"无有效读数"哨兵（读失败与 R91 芯片族物理下限判废都写 0），照原样印成
+    // "0.0°C" 等于把"读不到"报成"冰点级低温"——与 DiagnosticReport 的温度渲染同一条口径。
+    func tempLine(_ label: String, _ v: Double) -> String {
+        v.isFinite && v > 1 ? String(format: "%@: %.1f°C", label, v) : "\(label): 无有效读数（哨兵 0）"
+    }
     print("传感器: CPU x\(counts.cpu), GPU x\(counts.gpu), SSD x\(counts.nand), 电池 x\(counts.batt), 掌托 x\(counts.palm), 散热片 x\(counts.heatsink), 其他 x\(counts.other)")
-    print(String(format: "CPU 热点: %.1f°C", sensors.cpuTemperature))
-    print(String(format: "GPU 热点: %.1f°C", sensors.gpuTemperature))
-    if counts.nand > 0 { print(String(format: "SSD 热点: %.1f°C", sensors.nandTemperature)) }
-    if counts.batt > 0 { print(String(format: "电池温度: %.1f°C", sensors.batteryTemperature)) }
-    if counts.palm > 0 { print(String(format: "掌托温度: %.1f°C", sensors.palmRestTemperature)) }
-    if counts.heatsink > 0 { print(String(format: "散热片温度: %.1f°C", sensors.heatsinkTemperature)) }
+    print(tempLine("CPU 热点", sensors.cpuTemperature))
+    print(tempLine("GPU 热点", sensors.gpuTemperature))
+    if counts.nand > 0 { print(tempLine("SSD 热点", sensors.nandTemperature)) }
+    if counts.batt > 0 { print(tempLine("电池温度", sensors.batteryTemperature)) }
+    if counts.palm > 0 { print(tempLine("掌托温度", sensors.palmRestTemperature)) }
+    if counts.heatsink > 0 { print(tempLine("散热片温度", sensors.heatsinkTemperature)) }
     if let w = sensors.systemPowerWatts { print(String(format: "整机功耗: %.1f W", w)) }
     print("风扇数量: \(fans.fanCount)")
     for st in fans.allStates() {

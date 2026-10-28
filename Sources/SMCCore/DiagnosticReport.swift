@@ -82,7 +82,8 @@ public enum DiagnosticReport {
     }
     private static func n(_ v: Int?) -> String { v.map(String.init) ?? "—" }
     /// 温度渲染：`0` 是传感器无有效读数时 daemon 写的**哨兵**（ControlEngine 在
-    /// sensorUnavailable/sensorImplausible 两分支直接构造 cpuDie:0, gpuDie:0），
+    /// sensorUnavailable/sensorImplausible/sensorBelowAmbient 两分支直接构造 cpuDie:0,
+    /// gpuDie:0；R91 起读数层物理下限判废也走同一个 0），
     /// 照原样出数等于把"读不到"报成"冰点级低温"——诊断包最坏的一种谎。
     private static func t(_ v: Double?) -> String {
         guard let v, v.isFinite else { return "—" }

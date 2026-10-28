@@ -1193,6 +1193,52 @@ func testSensorsMock() {
     expectEqual(ts3.sensorCounts.palm, 1, "F0Ac 不被误计入掌托（前缀 F0A 已删；回归则=2）")
 }
 
+// R91：芯片族（CPU/GPU）热点读数的物理下限。既有有效性过滤 `>1 && <120` 只管"像不像
+// 一个温度"，管不住"整族一起读出 8.4°C"——真机 4.2.66 实测同一拍 cpuDie 8.425 而
+// gpuDie 45.1、环境代理 26.5。后果有两层：面板 CPU 行显示 8°（用户读作"温度读不到"），
+// 以及两族一起坏时 rawTemp 掉到环境以下、攒满 90s 就是本机日志里 105 次"偏低失真"交还。
+// 判据不新造：复用 `StatsSampler.tempPlausible`（统计口径与趋势图已在用的同一条 12° 余量）。
+func testDieReadoutFloor() {
+    group("芯片族物理下限(R91)")
+    // ①一族坏读、另一族正常：坏读落 0（=无有效读数），控制输入由正常族承担
+    do {
+        let smc = MockSMC()
+        smc.set("Tp01", 60); smc.set("Tg01", 45); smc.set("Ts0P", 26)
+        let ts = try! makeTemperatureSensors(smc: smc, clock: { Date() })
+        expectEqual(ts.ambientEstimate(now: Date()), 26, "前提：环境谷值 26 已建立（不是 0）")
+        // 下限 = 谷值−12 = 14：14.5° 过得了环境下限、过不了 15° 绝对下限。
+        // 这条钉住"参照用的是环境谷值"——少了它，把 env 写死成 nil 也全绿（审查实测）。
+        smc.set("Tp01", 14.5)
+        expectEqual(ts.cpuTemperature, 14.5, "14.5° 在环境 26° 下是可信读数（绝对下限会误杀它）")
+        smc.set("Tp01", 8.425)                       // CPU 族整族坏读
+        expectEqual(ts.cpuTemperature, 0, "CPU 族坏读判为无有效读数（而非 8.4°）")
+        expectEqual(ts.gpuTemperature, 45, "GPU 族不受影响（下限只掐物理不可能的那一侧）")
+        let r = ts.sensorReadings()
+        expectEqual(r.cpuDie, 0, "status 的 cpuDie 落 0（面板渲染成占位）")
+        expectEqual(r.maxTemp, 45, "控制输入改由 GPU 承担，不再掉到环境以下")
+    }
+    // ②冷房间自适应：谷值随环境自己下探，门限不是写死的"室温 15°"
+    do {
+        let smc = MockSMC()
+        smc.set("Tp01", 11); smc.set("Ts0P", 10)
+        let ts = try! makeTemperatureSensors(smc: smc, clock: { Date() })
+        _ = ts.ambientEstimate(now: Date())          // 谷值 10 → 下限 = 10−12，物理上全开
+        expectEqual(ts.cpuTemperature, 11, "环境 10° 时芯片 11° 是真实读数，不得判废")
+    }
+    // ③无环境参照退回 15° 绝对下限（tempPlausible 的 nil 分支），且高温侧一律采信
+    do {
+        let smc = MockSMC()
+        smc.set("Tp01", 12)                          // 只有 CPU 键，没有环境候选
+        let ts = try! makeTemperatureSensors(smc: smc, clock: { Date() })
+        expectEqual(ts.cpuTemperature, 0, "无参照且 <15° 判废（真机 cpuDie≈8.4 的形态）")
+        expectEqual(ts.sensorReadings().cpuAverage, nil, "全扫期坏读不得进核心均温")
+        smc.set("Tp01", 20)
+        expectEqual(ts.cpuTemperature, 20, "无参照但 ≥15° 采信")
+        smc.set("Tp01", 95)
+        expectEqual(ts.cpuTemperature, 95, "高温侧一律采信（92° 兜底吃 rawTemp，上界不许动）")
+    }
+}
+
 
 // MARK: - 每日统计采样器（跨天归档逻辑，原 daemon 内联）
 
@@ -1397,7 +1443,7 @@ func testControlEngine() {
         }
         expectEqual(smc.lastWrite("F0Md"), 0, "卡死确认交还系统")
         let st = ConfigStore.loadStatus()
-        expectEqual(st?.faultReason, .sensorImplausible, "故障原因 sensorImplausible")
+        expectEqual(st?.faultReason, .sensorImplausible, "故障原因 sensorImplausible（卡死专用）")
         expect(st?.reason == nil, "故障期 reason 置 nil")
         smc.set("Tp01", 65)   // 读数复活
         clock.advance(30)
@@ -1488,7 +1534,10 @@ func testControlEngine() {
         expect(col.logs.contains { $0.contains("学习数据保留") }, "日志声明保留语义")
     }
 
-    // —— 场景 10：读数偏低型合理性门（max 比环境冷 12° 持续 90s → 交还，恢复自动接管） ——
+    // —— 场景 10：芯片族整族坏读 → 读数层判废，5 拍走"不可用"交还（R91 改判） ——
+    // 旧行为：坏读 15° 直接喂进 rawTemp，掉到环境(35)以下 → 攒 90s 判"偏低失真"交还，
+    // 横幅还说"传感器卡死"。现在 `dieHotspot` 在读数层就把物理不可能的芯片族读数
+    // 判成无有效读数（0），交还照旧、更快（5 拍），且归因说真话。
     do {
         envDirs.append(engineTestEnv())
         ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
@@ -1499,16 +1548,59 @@ func testControlEngine() {
         engine.beat()   // 谷值建立（电池 35 = 环境参照）+ 正常接管
         expectEqual(smc.lastWrite("F0Md"), 1, "正常接管")
         smc.set("Tp01", 15)   // max=15 < 35−12=23：物理不可能（发热源比环境冷 20°）
-        // 前 3 拍被骤降毛刺剔除 hold，之后偏低计数累计 30 拍（90s）判失真
         for _ in 0..<40 { clock.advance(3); engine.beat()
             if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) } }
-        expectEqual(smc.lastWrite("F0Md"), 0, "偏低失真 90s 交还系统")
-        expect(ConfigStore.loadStatus()?.faultReason == .sensorImplausible, "故障原因 sensorImplausible")
-        smc.set("Tp01", 60)   // 恢复合理区间（对称消抖：90s 合理读数才解除，防边界抖动拍打）
-        for _ in 0..<32 { clock.advance(3); engine.beat()
+        expectEqual(smc.lastWrite("F0Md"), 0, "整族坏读交还系统")
+        expect(ConfigStore.loadStatus()?.faultReason == .sensorUnavailable, "坏读归因'不可用'")
+        expect(!col.logs.contains(where: { $0.contains("判定读数失真") }),
+               "坏读不再喂给偏低失真门（回归则该日志出现）")
+        expect(ConfigStore.loadStatus()?.sensors.cpuDie == 60,
+               "坏读数不写进 status（读失败分支沿用上一拍好值，面板不见 15° 假数）")
+        smc.set("Tp01", 60)   // 读数恢复
+        for _ in 0..<3 { clock.advance(3); engine.beat()
             if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) } }
         expectEqual(smc.lastWrite("F0Md"), 1, "读数恢复自动接管")
         expect(ConfigStore.loadStatus()?.controlFault != true, "故障解除")
+    }
+
+    // —— 场景 10b：环境参照过期后的偏低失真门（读数层失去谷值时，引擎这条网还在） ——
+    // 谷值候选全部退出 (5,45) 窗且持续 >1h → `ambientValley` 判废归零，读数层退回 15°
+    // 绝对下限：20° 这种"比最近合理环境还冷 15°"的读数放行了，偏低门用冻结的
+    // `lastPlausibleEnvTemp` 把它接住。这条是 EVOLUTION R73 记的"三条故障路径与红线
+    // 只测了交还、没测怎么触发"里偏低门那一格的覆盖。
+    do {
+        envDirs.append(engineTestEnv())
+        ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+        let smc = makeFanSMC(); smc.set("Tp01", 60); smc.set("TB0t", 35); smc.set("PSTR", 30)
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        engine.beat()                       // 谷值 35 建立
+        smc.set("TB0t", 4)                  // 候选跌出 (5,45) 窗（4° 也不触发电池托底）
+        for _ in 0..<6 { clock.advance(700); engine.beat() }   // 无候选 >1h → 谷值归零
+        expect(ConfigStore.loadStatus()?.envTemp == nil,
+               "前提：环境参照已过期（不成立则下面全测的是别的东西）")
+        smc.set("Tp01", 20)                 // 过得了 15° 绝对下限，过不了"环境 35−12"
+        for _ in 0..<40 { clock.advance(3); engine.beat()
+            if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) } }
+        expectEqual(smc.lastWrite("F0Md"), 0, "环境参照过期后偏低门仍交还")
+        expect(ConfigStore.loadStatus()?.faultReason == .sensorBelowAmbient,
+               "故障原因 sensorBelowAmbient（与卡死分开）")
+        expect(col.logs.contains(where: { $0.contains("判定读数失真，交还系统调度（热点 20.0° / 环境参照 35") }),
+               "失真日志同时带热点与环境参照（只带一个就没法归因）")
+        // 卡死与偏低同拍：卡死更具体，横幅必须以它为准（少这条，三元优先级反着写也全绿）
+        for _ in 0..<110 {
+            smc.set("PSTR", smc.values["PSTR"]!.value == 30 ? 45 : 30)   // 功耗波动 15W
+            clock.advance(3); engine.beat()
+            if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) }
+        }
+        expect(ConfigStore.loadStatus()?.faultReason == .sensorImplausible,
+               "两门同拍时卡死优先（读数冻结 450s＋功耗波动 ≥10W）")
+        smc.set("Tp01", 60)                 // 读数复活：偏低衰减 90s 解除
+        for _ in 0..<35 { clock.advance(3); engine.beat()
+            if let tg = smc.lastWrite("F0Tg") { smc.set("F0Ac", tg) } }
+        expect(col.logs.contains(where: { $0.contains("偏低失真解除，重新接管（热点 60.0°") }),
+               "解除日志也带当时的热点读数")
     }
 
     // —— 场景 11：启停抑制武装 → 战报 aiCyclingGuards 计数（接线层回归） ——

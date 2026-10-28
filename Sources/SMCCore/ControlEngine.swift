@@ -562,7 +562,9 @@ public final class ControlEngine {
         if wasStuck && !stuckDetector.faulted {
             hooks.log("温度读数恢复变化，传感器卡死解除，重新接管")
         }
-        if let env = valleyEnv ?? lastPlausibleEnvTemp, env.isFinite, env > 5, rawTemp < env - 12 {
+        let gateEnv: Double? = (valleyEnv ?? lastPlausibleEnvTemp)
+            .flatMap { $0.isFinite && $0 > 5 ? $0 : nil }
+        if let env = gateEnv, rawTemp < env - 12 {
             if !fastConfigApply { belowAmbientSeconds = min(90, belowAmbientSeconds + actualInterval) }
         } else if !fastConfigApply {
             belowAmbientSeconds = max(0, belowAmbientSeconds - actualInterval)
@@ -570,15 +572,22 @@ public final class ControlEngine {
         // 双阈值锁存（审查 N1/N2）：≥90s 触发、衰减到 0 才解除。累计钳顶 90 使恢复
         // 恒为 90s 合理读数（否则恢复延迟 = 故障时长，长故障后"读数已好仍挂故障横幅"）；
         // 锁存消除边界抖动的逐拍 Md/状态翻转。
+        // 两个数值必须进日志：只写"低于环境"无法归因——是芯片族整族读到坏数，
+        // 还是环境代理本身偏高把正常空闲芯片判成失真，两种情形修法相反（R91 实测两者
+        // 在本机都出现过：cpuDie 8.4° 而 gpuDie 45°，env 26.5°）。
         if !belowAmbientFaulted, belowAmbientSeconds >= 90 {
             belowAmbientFaulted = true
-            hooks.log("温度读数低于环境 12°C 持续 90s，判定读数失真，交还系统调度")
+            hooks.log("温度读数低于环境 12°C 持续 90s，判定读数失真，交还系统调度"
+                + "（热点 \(String(format: "%.1f", rawTemp))° / 环境参照 \(gateEnv.map { String(format: "%.1f", $0) } ?? "无")°）")
         }
         if belowAmbientFaulted, belowAmbientSeconds <= 0 {
             belowAmbientFaulted = false
-            hooks.log("温度读数恢复合理区间 90s，偏低失真解除，重新接管")
+            hooks.log("温度读数恢复合理区间 90s，偏低失真解除，重新接管（热点 \(String(format: "%.1f", rawTemp))°）")
         }
         if stuckDetector.faulted || belowAmbientFaulted {
+            // 两类传感器故障各有各的判据，横幅按实际那一条说话（卡死优先：它更具体）
+            let sensorFaultReason: ControlFaultReason =
+                stuckDetector.faulted ? .sensorImplausible : .sensorBelowAmbient
             if forcedModeActive {
                 fans.restoreAutoAll()
                 forcedModeActive = false
@@ -587,7 +596,7 @@ public final class ControlEngine {
             if var status = lastStatus {
                 status.timestamp = hooks.now()
                 status.controlFault = true
-                status.faultReason = .sensorImplausible
+                status.faultReason = sensorFaultReason
                 status.reason = nil
                 status.aiIntent = nil
                 status.appliedPercent = forcedModeActive ? status.appliedPercent : 0
@@ -598,7 +607,7 @@ public final class ControlEngine {
                 let s = DaemonStatus(sensors: SensorReadings(cpuDie: 0, gpuDie: 0),
                                      mode: config.mode, appliedPercent: 0, fans: [],
                                      timestamp: hooks.now(),
-                                     controlFault: true, faultReason: .sensorImplausible,
+                                     controlFault: true, faultReason: sensorFaultReason,
                                      daemonVersion: hooks.daemonVersion)
                 ConfigStore.saveStatus(s)
                 lastStatus = s

@@ -636,7 +636,12 @@ public enum ControlFaultReason: String, Codable, Equatable {
     case fanStateReadFailed
     case smcWriteFailed
     case fanFeedbackMismatch
-    case sensorImplausible   // 温度读数疑似卡死：功耗波动 ≥10W 而读数 5 分钟纹丝不动
+    /// 温度读数卡死：功耗波动 ≥10W 而读数 5 分钟纹丝不动。
+    /// rawValue 沿用历史 `sensorImplausible`——导出列与旧 status 跨期可比。
+    case sensorImplausible
+    /// 温度读数偏低失真：发热源比环境代理还冷 12°C 以上，物理上不成立，判坏读。
+    /// 与卡死是两类故障，此前共用一条文案，横幅把"读到烂数"说成"传感器卡死"。
+    case sensorBelowAmbient
 
     public var displayName: String {
         switch self {
@@ -645,6 +650,7 @@ public enum ControlFaultReason: String, Codable, Equatable {
         case .smcWriteFailed: return "SMC 写入失败"
         case .fanFeedbackMismatch: return "风扇实际转速未跟随目标"
         case .sensorImplausible: return "温度读数疑似失真（传感器卡死）"
+        case .sensorBelowAmbient: return "温度读数疑似失真（低于环境）"
         }
     }
 }

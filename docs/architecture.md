@@ -116,7 +116,7 @@ fanmcp   → 仅 SMCCore（MCP 服务器：温度/转速转述 status.json，意
 1. raw ≥92° → 全速（`FanPipeline.failsafeTemp`）
 2. SSD 78° 危急 → 100%（含 manual）；70° 警告 → 60%（curve/ai）
 3. 电池 48° 危急 → 100%（含 manual）；45° 警告 → 60%（curve/ai）
-4. 传感器连续 5 拍失败 / 卡死 / 偏低失真 → 交还系统（`.sensorUnavailable/.sensorImplausible`）
+4. 传感器连续 5 拍失败 / 卡死 / 偏低失真 → 交还系统（`.sensorUnavailable/.sensorImplausible/.sensorBelowAmbient`）
 5. 退出/睡眠/看门狗重启 → 无条件恢复系统调度
 6. 运行时上界：AI 有效目标 ≤84°（低于兜底释放线 88°，防振荡）
 

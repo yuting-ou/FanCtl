@@ -34,9 +34,10 @@ func testFanMCP() {
         return h
     }
 
-    func makeStatus(envTemp: Double? = 28.17, powerWatts: Double? = 33.44) -> DaemonStatus {
+    func makeStatus(envTemp: Double? = 28.17, powerWatts: Double? = 33.44,
+                   cpuDie: Double = 68.034, gpuDie: Double = 48.7) -> DaemonStatus {
         DaemonStatus(
-            sensors: SensorReadings(cpuDie: 68.034, cpuAverage: 52.87, gpuDie: 48.7,
+            sensors: SensorReadings(cpuDie: cpuDie, cpuAverage: 52.87, gpuDie: gpuDie,
                                     ssd: 42.2, palmRest: 44.3, heatsink: 66.6,
                                     otherHotspots: ["Te06": 51.68]),
             mode: .ai, appliedPercent: 64, appliedPercents: [64, 64],
@@ -211,6 +212,16 @@ func testFanMCP() {
         expect(j["powerWatts"] is NSNull, "NaN 功耗 → null（不炸 JSON）")
         expect(j["envTemp"] is NSNull, "NaN 环境温度 → null")
     } else { expect(false, "NaN status 也应返回合法 JSON") }
+
+    // status：0 = 无有效读数哨兵（读失败/R91 芯片族物理下限判废），必须报 null 而不是 0.0°C。
+    // 报 0.0 等于让 AI 助手念出"CPU 0 度"——此刻 GPU 正在承载控制、controlFault 还是 nil。
+    hooks = makeHooks(loadStatus: { makeStatus(cpuDie: 0, gpuDie: 45.1) })
+    let srvSentinel = FanMCP(version: "test", hooks: hooks)
+    if let j = callTool(srvSentinel, "fanctl_status", [:]).json {
+        let s = j["sensors"] as? [String: Any]
+        expect(s?["cpuDie"] is NSNull, "cpuDie 哨兵 0 → null（不谎报 0.0°C）")
+        expectEqual(s?["gpuDie"] as? Double, 45.1, "正常族照常出数（判废不影响另一族）")
+    } else { expect(false, "哨兵 status 也应返回合法 JSON") }
 
     // MARK: 意图面（真实 ConfigStore + 临时目录）
 
