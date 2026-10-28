@@ -118,6 +118,26 @@ public struct ThermalModel: Codable {
         }
     }
 
+    /// 影子/诊断用稳态反解：同一采信域，但 need ≤ 0 时返回 **0** 而不是 nil。
+    /// 为什么必须分开：need≤0 的物理含义是"模型认为该功耗/目标下不需要风"，
+    /// 这是一个有效预测，必须能与实际输出配对——否则最关键的"模型说 0、控制律给 40%"
+    /// 会被影子账本记成"无模型样本"，把偏差藏起来。
+    /// 控制路径继续用 predictedPercent：那里的 nil 是 R33 防止 .some(0) 短路
+    /// `learned ?? curve ?? seed` 的语义，不能改。
+    /// 不含 transient 短窗修正：影子量的是稳态反解，瞬态保守量属于控制前馈。
+    public func predictedPercentIncludingZero(for env: Double, power: Double,
+                                              targetTemp: Double) -> Double? {
+        guard sampleCount >= Self.minSamples, b > 2.5 else { return nil }
+        guard env.isFinite, power.isFinite, targetTemp.isFinite else { return nil }
+        if let lo = minPower, let hi = maxPower,
+           power < lo - Self.bandMarginPower || power > hi + Self.bandMarginPower { return nil }
+        if let lo = minEnv, let hi = maxEnv,
+           env < lo - Self.bandMarginEnv || env > hi + Self.bandMarginEnv { return nil }
+        let need = (env + a * power / 50.0 - targetTemp) / (b / 50.0)
+        guard need.isFinite else { return nil }
+        return max(0, min(100, need))
+    }
+
     // 预测"把温度压到 target 所需的风量百分比"；数据不足/参数未收敛返回 nil。
     // 门槛 b > 2.5（物理 0.05°C/%——100% 风量至少应降 5°C，更小说明模型未拟合好，
     // 预测会因除以小 b 产生超大前馈）

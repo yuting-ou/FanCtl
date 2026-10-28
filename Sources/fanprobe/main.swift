@@ -71,6 +71,23 @@ if CommandLine.arguments.contains("--report") {
     exit(0)
 }
 
+// 第一性原理 Phase 1 `--shadow`：影子前馈账本只读摘要。
+// 与 --report 的分工：report 说"现在是什么状态"，shadow 说"稳态反解模型与现行控制律
+// 在真实工况下差多少"——这是"把热模型升为前馈主通道"的前提证据。
+// 只读承诺同源：readOnly 加载，不写任何文件；无 SMC 依赖，daemon 没跑也能看。
+if CommandLine.arguments.contains("--shadow") {
+    if let l = ConfigStore.loadShadowFF(readOnly: true) {
+        print(ShadowFFReport.text(l))
+    } else if FileManager.default.fileExists(atPath: FanCtlPaths.shadowFFFile.path) {
+        // 文件在场但解不出 ≠ 没有数据。只读模式不备份损坏文件，所以必须把区别说出来，
+        // 否则"损坏"会被用户读成"还没开始采"。
+        print("影子前馈账本: 文件在场但解不出（损坏或跨版本）：\(FanCtlPaths.shadowFFFile.path)")
+    } else {
+        print("影子前馈账本: 尚无数据（daemon 未以 AI 模式运行，或 shadow-ff.json 尚未落盘）")
+    }
+    exit(0)
+}
+
 // R82 续 `--zh-scan`：进程名汉化覆盖度体检。扫两份"会出现在清风界面上的名字"——
 //   ① 当前全部运行进程的可执行路径（ps 只读列举）
 //   ② 本机已装 App（/Applications、/System/Applications、CoreServices、~/Applications）的主程序

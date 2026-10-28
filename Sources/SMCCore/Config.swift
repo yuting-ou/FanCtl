@@ -1126,6 +1126,9 @@ public enum FanCtlPaths {
     // 4.0.1（4.1-A1）：dt 账本独立持久化——生命周期 = 控制律版本，与评测指标
     // （目标档位切换即重置）解耦。控制律结构变更时手动删除本文件重攒（EVOLUTION 记账）。
     public static var dtLedgerFile: URL { supportDir.appendingPathComponent("dt-ledger.json") }
+    // 第一性原理 Phase 1：影子前馈账本。与 dt-ledger 同哲学——生命周期 = 控制律版本，
+    // 不随目标档/启动清零；替换控制律前手动删除重攒，避免旧律残差混入判读。
+    public static var shadowFFFile: URL { supportDir.appendingPathComponent("shadow-ff.json") }
     public static var modelFile: URL { supportDir.appendingPathComponent("thermal-model.json") }
     public static var resetLearnFlag: URL { supportDir.appendingPathComponent("reset-learn.flag") }
     public static var exitReasonFile: URL { supportDir.appendingPathComponent("exit-reason.flag") }

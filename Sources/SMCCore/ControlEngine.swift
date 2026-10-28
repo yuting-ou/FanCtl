@@ -89,12 +89,16 @@ public final class ControlEngine {
     // 4.0.1（4.1-A1）：dt 账本独立于评测指标——生命周期 = 控制律版本，用户切换
     // 目标档位不再清零。落盘 dt-ledger.json（60s 节流 + 睡眠/退出全量落盘）
     public private(set) var dtLedger: DTLedgerState
+    // 第一性原理 Phase 1：影子前馈账本。只读测量（不参与任何控制决策/写入），
+    // 生命周期同 dt-ledger：跨启动、跨目标档累计，控制律结构变更时手动删文件重攒。
+    public private(set) var shadowFF: ShadowFFLedger
     var aiMetricsUserTarget: Double? = nil   // 评测的用户目标基准（有效目标随环境/夜间漂移，不能用作重置判据）
     var thermalModel: ThermalModel
     // public private(set)：落盘重试语义需要被引擎测试观察（同 thermalLearn/aiMetrics 惯例）
     public private(set) var learnDirty = false
     public private(set) var modelDirty = false
     public private(set) var dtLedgerDirty = false
+    public private(set) var shadowFFDirty = false
     // R35：落盘失败的边沿日志标志（静默降级可以，静默失效不可以）
     var persistenceFailedLogged = false
     var envCompLogged = false
@@ -200,6 +204,8 @@ public final class ControlEngine {
                                                                          userTargetTemp: cfgUserTarget)
         // 4.0.1（4.1-A1）：dt 账本独立加载（不随下方评测指标重置判据清零）
         self.dtLedger = ConfigStore.loadDTLedger() ?? DTLedgerState()
+        // 第一性原理 Phase 1：影子账本同哲学——独立加载，不参与任何重置判据
+        self.shadowFF = ConfigStore.loadShadowFF() ?? ShadowFFLedger()
         // 评测账本跨启动重置判据：持久化的"用户目标"（v2.9 起单独存，
         // targetTemp 已改为随环境/夜间漂移的有效目标，不能再用作比对）
         let savedUserTarget = aiMetrics.userTargetTemp ?? aiMetrics.targetTemp
@@ -323,6 +329,7 @@ public final class ControlEngine {
         if !ConfigStore.saveModel(thermalModel) { modelDirty = true; failed.append("model") }
         if !ConfigStore.saveAIMetrics(aiMetrics) { failed.append("ai-metrics") }
         if !ConfigStore.saveDTLedger(dtLedger) { dtLedgerDirty = true; failed.append("dt-ledger") }
+        if !ConfigStore.saveShadowFF(shadowFF) { shadowFFDirty = true; failed.append("shadow-ff") }
         if !failed.isEmpty {
             hooks.log("落盘失败(\(failed.joined(separator: ", ")))：数据保留待重试")
         }
@@ -605,6 +612,13 @@ public final class ControlEngine {
         var curveTargetPercent: Double? = nil  // 当前温度下用户曲线的期望值（AI 模式展示"曲线基准"）
         var hysteresisHold = false             // v3.7 决策透镜：本拍写入被迟滞带保持
         var learnedNow: Double? = nil          // v3.7 透镜：当前温度学习查表值
+        // Phase 1 影子候选：必须在学习块之前冻结（学习块会用本拍 baseTarget 更新
+        // 学习表/热模型；之后才查会让候选被待评样本拟合，MAE 系统性偏小）。
+        // 模型/查表 × 当前/目标四路；当前温度是主判据（与实际输出同一工作点）。
+        var shadowModelNow: Double? = nil
+        var shadowTableNow: Double? = nil
+        var shadowModelTarget: Double? = nil
+        var shadowTableTarget: Double? = nil
         var guardArmedThisBeat = false         // v3.1 启停抑制本拍武装（战报计数用）
         var overshootNow: Double? = nil        // v3.2 本拍温度超出 AI 有效目标的量（战报过冲峰值用）
         // AI 实际控制的"目标温度"（电池+省电时控制器会放宽 +4°）。学习窗口与"压不住"检测
@@ -658,6 +672,18 @@ public final class ControlEngine {
                 let modelPct = thermalModel.predictedPercent(for: envTemp ?? 25,
                                                              power: powerWatts ?? 0,
                                                              targetTemp: aiTargetEff)
+                // 影子候选冻结（学习块之前）：模型@当前/目标 + 查表@当前/目标。
+                // 查表用只读入口，不改功耗档滞回；模型用含 0 的反解（need≤0 也是预测）。
+                if let env = envTemp, let p = powerWatts {
+                    shadowModelNow = thermalModel.predictedPercentIncludingZero(
+                        for: env, power: p, targetTemp: temp)
+                    shadowModelTarget = thermalModel.predictedPercentIncludingZero(
+                        for: env, power: p, targetTemp: aiTargetEff)
+                }
+                shadowTableNow = thermalLearn.percentReadOnly(
+                    for: temp, onBattery: onBattery, powerWatts: powerWatts)
+                shadowTableTarget = thermalLearn.percentReadOnly(
+                    for: aiTargetEff, onBattery: onBattery, powerWatts: powerWatts)
                 let feedPct: Double? = {
                     switch (learnedPct, modelPct) {
                     case let (l?, m?): return max(l, m)
@@ -893,6 +919,11 @@ public final class ControlEngine {
                 appliedPercent = shapedBase
             }
 
+            // 影子采样的稳态门要用"上一拍"基准，而下方学习块会把 prev* 推进到本拍——
+            // 先冻结一份，否则影子门等于拿本拍和本拍比（恒稳态，假绿）
+            let shadowPrevTemp = prevSmoothedTemp
+            let shadowPrevBase = prevBaseTarget
+
             // 热经验学习（仅正常拍、基础模式决策时）
             // 排除 .manual：手动模式的输出是用户意图，不反映"该温度需要多少风量"的热物理，
             // 记入会污染学习数据（如散热测试 100% 会让 AI 切回后每次升温前馈都拉回 100%）
@@ -1010,6 +1041,10 @@ public final class ControlEngine {
             // 此前 probe 后不交还，SMC 被钉在过期强制 RPM 上（status 却报"已交还"），
             // 且周期按拍数（idle 20s/拍时 6 分钟才探一次）。
             let controlBlocked = writeHealth.faulted || feedbackHealth.faulted
+            // 影子账本的"实际"必须是真写下去的值：全风扇读失败/本拍写失败/故障试探期
+            // 都不算。writeHealth 的 fault 要连续失败才置位（单拍失败不 fault），
+            // 故这里用本拍局部结果，而不是只看 faulted。
+            var appliedWriteSucceeded = false
             if controlBlocked {
                 let probeDue = hooks.now().timeIntervalSince(lastProbeTime) >= 30
                 if probeDue, probeVerifyLoops <= 0 {
@@ -1082,10 +1117,41 @@ public final class ControlEngine {
                 // 避免 daemon"以为在控制"而风扇实际无人管的静默故障
                 writeHealth.record(loopSuccess: !loopWriteFailed)
                 forcedModeActive = true
+                appliedWriteSucceeded = !loopWriteFailed && !fanStates.isEmpty
                 // v3.6.1：恢复正常写路径时清掉残留的验证计数——故障在验证期内自愈
                 //（controlBlocked 转 false）时计数器无人复位，会残留 1-2 拍，
                 // 下次故障期先空耗拍数做"伪验证"再走交还分支
                 probeVerifyLoops = 0
+            }
+
+            // 第一性原理 Phase 1：影子前馈采样。只读——不参与决策、不写硬件。
+            // 放在写扇之后：只有"真写下去了"的拍才算实际输出（全风扇读失败/写失败/
+            // 故障试探排除）。actual 取 appliedPercent 而非 AIController.output：
+            //   ① 积分可能被 slew/迟滞带挡在带内、并未施加（0-4% 差属执行器策略）；
+            //   ② appliedPercent 是偏移前的基础施加值，与学习/模型同一百分比域。
+            // 不再按"目标 ±2°"筛样本：现行 AI 常在目标下方 5-10° 稳定，那个窗恰好
+            // 排除最有信息量的稳态点。主判据用"模型@当前温度"（与实际输出同一工作点），
+            // 目标偏差记进账本由报告明示。候选已在 AI 分支、学习块之前冻结。
+            if effectiveConfig.mode == .ai, !fastConfigApply, aiPercent != nil,
+               !quietActive, !decision.ssdGuard, !decision.batteryGuard, !decision.failsafeActive,
+               !writeHealth.faulted, !feedbackHealth.faulted, appliedWriteSucceeded {
+                let steady: Bool
+                if let prevT = shadowPrevTemp, let prevBase = shadowPrevBase {
+                    steady = LearningGate.isSteady(
+                        temp: temp, prevTemp: prevT,
+                        baseTarget: baseTarget, prevBase: prevBase,
+                        shapedBase: shapedBase, dt: actualInterval)
+                } else {
+                    steady = false   // 首拍无历史：计入 considered/notSteady，不静默消失
+                }
+                shadowFF.consider(
+                    temp: temp, target: aiTargetEff,
+                    env: envTemp, power: powerWatts,
+                    actual: appliedPercent,
+                    modelNow: shadowModelNow, tableNow: shadowTableNow,
+                    modelTarget: shadowModelTarget, tableTarget: shadowTableTarget,
+                    steady: steady, now: hooks.now())
+                shadowFFDirty = true
             }
 
             // AI 评测只记录真实接管、无安全覆盖、无静音封顶、反馈健康的样本。
@@ -1188,6 +1254,9 @@ public final class ControlEngine {
                 if !ConfigStore.saveAIMetrics(aiMetrics) { failed.append("ai-metrics") }
                 if dtLedgerDirty {
                     if ConfigStore.saveDTLedger(dtLedger) { dtLedgerDirty = false } else { failed.append("dt-ledger") }
+                }
+                if shadowFFDirty {
+                    if ConfigStore.saveShadowFF(shadowFF) { shadowFFDirty = false } else { failed.append("shadow-ff") }
                 }
                 if failed.isEmpty {
                     persistenceFailedLogged = false

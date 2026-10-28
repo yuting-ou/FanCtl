@@ -135,6 +135,26 @@ public struct ThermalLearn: Equatable {
         return percent(for: temp)
     }
 
+    /// 只读场景查表（影子测量/诊断专用）：与 mutating 版同源选桶（同一份
+    /// powerBand 滞回函数），但**不更新** lastPowerBand。
+    /// 为什么必须单独开一个：影子采样承诺零控制副作用，而同一拍里已经有一次
+    /// mutating 查询（learnedNow）更新了滞回状态；若这里再走一次 mutating 版，
+    /// 虽然同功耗下通常幂等，但它把"测量"变成了"参与控制状态演化"。
+    public func percentReadOnly(for temp: Double, onBattery: Bool, powerWatts: Double?) -> Double? {
+        let band: String
+        if let pw = powerWatts, pw.isFinite, pw >= 0 {
+            band = Self.powerBand(for: pw, previous: lastPowerBand)
+        } else {
+            band = "unknown"
+        }
+        let key = "\(onBattery ? "battery" : "ac")-\(band)"
+        if let buckets = scenarioBuckets[key],
+           let learned = percent(for: temp, output: buckets.output, samples: buckets.samples) {
+            return learned
+        }
+        return percent(for: temp)
+    }
+
     private func percent(for temp: Double, output: [Double], samples: [Int]) -> Double? {
         let b = TempHistogram.bucketIndex(for: temp)
         var result: Double?
@@ -539,6 +559,21 @@ extension ConfigStore {
         guard let data = try? JSONEncoder().encode(ledger) else { return false }
         do {
             try data.write(to: FanCtlPaths.dtLedgerFile, options: .atomic)
+            return true
+        } catch { return false }
+    }
+
+    /// 第一性原理 Phase 1：影子前馈账本（损坏备份协议与 learn/ai-metrics/dt-ledger 同源）。
+    public static func loadShadowFF(readOnly: Bool = false) -> ShadowFFLedger? {
+        loadCorruptionAware(ShadowFFLedger.self, from: FanCtlPaths.shadowFFFile, name: "shadow-ff",
+                            readOnly: readOnly)
+    }
+
+    @discardableResult
+    public static func saveShadowFF(_ ledger: ShadowFFLedger) -> Bool {
+        guard let data = try? JSONEncoder().encode(ledger) else { return false }
+        do {
+            try data.write(to: FanCtlPaths.shadowFFFile, options: .atomic)
             return true
         } catch { return false }
     }
