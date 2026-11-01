@@ -2939,3 +2939,43 @@ TTL 类读数不随拍数缩放，量级不受影响。
 关注 Pkg idle 列（负载态它是 0.01/s 的"已醒核"口径，不是真实空闲成本）；③ 展示 TTL
 放宽候选若立项，验收标准=量具一无展示键臂（933/分）与全量臂之间的读数落点 + App
 展示陈旧不超既有 10s 心跳语义。
+
+## R95（4.2.72(168)）：覆盖率门——llvm-cov 挂上自带 harness，接进 CI
+
+**结论（可行性实测，不猜）**：llvm-cov 与自带 harness（无 XCTest 的 executable
+target）**完全兼容**。链路：`swift build --enable-code-coverage`（debug）→ 直接跑
+`.build/debug/fanctltests`（LLVM_PROFILE_FILE 指到 .build/debug/codecov/）→
+`xcrun llvm-profdata merge` → `xcrun llvm-cov report`。工具链零额外依赖（Xcode 自带
+llvm-cov/llvm-profdata，CI 的 macos-26 runner 同构）。本地全流程实测 7s（增量构建）。
+
+**基线数字（2026-11-02 实测，行覆盖 = llvm-cov report 的 Lines 列）**：
+- `ControlEngine.swift`：**95.37%**（1533 行，71 行未覆盖）
+- SMCCore 模块（剔 `Driver/` 真硬件落地层——依赖图设计上被 MockSMC 替代）：**94.95%**
+  （7445 行，377 未覆盖）
+- 全仓 TOTAL（含 AppCore/Driver 等）：95.32%；最薄弱的合法豁免区：`Driver/SMCDriver.swift`
+  24%（真 IOKit，mock 按设计不触达）、`SpinKillGuard.swift` 62%、`HardwareProfile.swift` 70%。
+
+**门**：`scripts/coverage-gate.sh`（repo 资产）+ ci.yml 新步骤（跑在 release 回归测试
+之后，PR 也生效）。两道门槛：ControlEngine ≥94.5%、SMCCore 剔 Driver ≥94.0%——
+余量 ≤1pp（实测有 ±0.03pp 的跑间波动，门槛余量覆盖 30 倍）：**只防实质覆盖回退
+（删测试/跳路径），不做刷数字的虚荣门**。变异验证：CE_FLOOR=99 与 CORE_FLOOR=99
+各跑一次，均 exit 1 精确报出跌破项。
+
+**取舍记录**：① 覆盖率门用 debug 构建（release 优化会合并行，数字口径不稳）；与
+release 回归测试是两个构建目录，CI 多 ~2 分钟。② 门槛按"文件/模块"而非全仓 TOTAL
+设——用户点名的两个承重点（ControlEngine 决策管线、SMCCore 核心）单独钉住，
+FanCtlApp 的 SwiftUI 视图层不设门（Snapshot/compare 体系才是它的量具）。③ 行覆盖而非
+分支覆盖：分支覆盖对 Swift 的 guard/可选链展开噪声大，行覆盖与本项目"断言数契约门"
+的粗粒度哲学一致。
+
+**诚实边界**：覆盖率是必要不充分条件——95% 不代表关键路径被测（幸存者偏差要靠
+变异验证补），R92-R95 的门体系里它是"防删测试"的那一道，与 minAssertions/minGroups
+语义互补（断言数防"删"，覆盖率防"空转"——测试还在但不再触达目标代码）。
+
+**记账**：VERSION `4.2.71(167)` → **`4.2.72(168)`**（门禁轮，无 daemon 行为变化）；
+断言/组数不变（6153/153，本轮无测试增删），契约门槛 6147/145 不动。
+
+**交接口**：① 覆盖率门槛调整必须跟实测走（抬门原则与断言数门一致：每轮实测后回填）；
+② 若未来 Driver/ 进入 mock 之外的测试路径，把 `--ignore-filename-regex` 的豁免收窄；
+③ coverage-gate.sh 的门槛变量（CE_FLOOR/CORE_FLOOR）设计为环境变量可覆盖——
+变异验证用 `CE_FLOOR=99 scripts/coverage-gate.sh`，预期 exit 1。

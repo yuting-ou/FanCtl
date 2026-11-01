@@ -25,6 +25,12 @@
 
 ## 本版变更要点
 
+- 4.2.72：**覆盖率门接进 CI（无 daemon 行为变化）**。llvm-cov 挂上自带测试 harness
+  实测可行：`scripts/coverage-gate.sh` + CI 新步骤，ControlEngine 行覆盖 ≥94.5%
+  （实测 95.37%）、SMCCore 模块剔真硬件 Driver 层 ≥94.0%（实测 94.95%）。只防
+  实质覆盖回退（删测试/测试还在但不再触达目标代码），余量 ≤1pp 不做虚荣门；
+  门槛抬高可变异验证（CE_FLOOR=99 → exit 1）。
+
 - 4.2.71：**能效基线量具（无 daemon 行为变化）**。fanctld 稳态成本第一次有了数字：
   真机规模 SMC 读数量具（热态 1753 读/分 ≈29.2/秒，冷态 1403；展示键占 47%）进 CI
   常驻，任何"逐拍全扫"回潮即红；系统级量具 `scripts/energy-baseline.sh`（powermetrics

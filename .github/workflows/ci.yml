@@ -24,6 +24,12 @@ jobs:
       - name: 运行回归测试（失败即中断）
         run: swift run -c release --disable-sandbox fanctltests
 
+      # R95：覆盖率门（llvm-cov × 自带 harness，debug 插桩构建与上面 release 测试
+      # 互不影响）。门槛：ControlEngine ≥94.5% / SMCCore 剔 Driver ≥94.0%（行覆盖）。
+      # 门槛与实测余量 ≤1pp：只防实质覆盖回退，不做虚荣门。细节见 scripts/coverage-gate.sh。
+      - name: 覆盖率门（llvm-cov）
+        run: bash scripts/coverage-gate.sh
+
       # 断言数提取 + 契约下限：再跑一次（全绿状态下很快，增量缓存），
       # 断言数低于下限 = 有测试被删/跳过 → 红灯，徽章不发 success。
       # v3.6.1 修复：此步骤原无 pipefail（v3.4.1 的假绿修复漏掉了这里），
