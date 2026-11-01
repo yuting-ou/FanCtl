@@ -414,6 +414,14 @@ public struct DaemonStatus: Codable {
     /// 留在旧版"这种半途状态就只能猜。旧 daemon 不写此字段 → 解码为 nil。
     /// 解码侧限长 64 字符：status.json 在组可写目录里，超长串会被 App 直接渲染。
     public var daemonVersion: String?
+    /// R93：status.json 的 **schema 代际**（与 daemonVersion 的产品版本正交——它标识
+    /// 文件格式那一代）。nil = 版本化之前的旧档（schema 至今 add-only：新字段全是
+    /// Optional、未知键被忽略，旧档照常解出，nil 不构成错误）；未来若出现破坏性格式
+    /// 变更（改语义/删字段），解码侧按它分派迁移。daemon 经 init 默认参数每拍写入
+    /// currentSchemaVersion。
+    public var schemaVersion: Int?
+    /// 当前 status schema 代际。1 = 首个显式版本（4.2.70 起 daemon 落盘）。
+    public static let currentSchemaVersion = 1
     public var cpuTemp: Double { sensors.cpuDie }
     public var gpuTemp: Double { sensors.gpuDie }
 
@@ -447,7 +455,11 @@ public struct DaemonStatus: Codable {
                 thermalModelSamples: Int? = nil,
                 thermalFeedTrusted: Bool? = nil,
                 thermalModelFalsified: Int? = nil,
-                daemonVersion: String? = nil) {
+                daemonVersion: String? = nil,
+                // R93：默认写当前 schema 代际——daemon 的三处构造点无需各自传参（默认参数
+                // 即接线，F9 的"漏赋值"形态在这里结构性不可达）；显式传 nil 仅用于测试
+                // 构造旧档夹具
+                schemaVersion: Int? = DaemonStatus.currentSchemaVersion) {
         self.sensors = sensors
         self.mode = mode
         self.appliedPercent = appliedPercent
@@ -494,6 +506,8 @@ public struct DaemonStatus: Codable {
         // R89：F9 同族——Optional 字段必须显式赋值
         self.thermalFeedTrusted = thermalFeedTrusted
         self.thermalModelFalsified = thermalModelFalsified
+        // R93：同上（F9 同族）
+        self.schemaVersion = schemaVersion
     }
 
     // 旧版便利初始化（保持源码兼容）
@@ -535,6 +549,7 @@ public struct DaemonStatus: Codable {
         case thermalModelUsable, thermalModelB, thermalModelSamples
         case thermalFeedTrusted, thermalModelFalsified
         case daemonVersion
+        case schemaVersion
         case cpuTemp, gpuTemp
     }
 
@@ -604,6 +619,14 @@ public struct DaemonStatus: Codable {
         } else {
             daemonVersion = nil
         }
+        // R93：schema 代际同样来自组可写目录——负值/超界（>1e6）当 nil，按"未版本化
+        // 旧档"处理（与 daemonVersion 守卫同型；上界 1e6 宽到任何真实代际都放行，
+        // 只拦恶意/损坏值）。类型不符（如字符串）同理：decodeIfPresent 抛错 → nil
+        schemaVersion = {
+            guard let sv = try? container.decodeIfPresent(Int.self, forKey: .schemaVersion),
+                  sv >= 1, sv <= 1_000_000 else { return nil }
+            return sv
+        }()
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -645,6 +668,7 @@ public struct DaemonStatus: Codable {
         try container.encodeIfPresent(thermalFeedTrusted, forKey: .thermalFeedTrusted)
         try container.encodeIfPresent(thermalModelFalsified, forKey: .thermalModelFalsified)
         try container.encodeIfPresent(daemonVersion, forKey: .daemonVersion)
+        try container.encodeIfPresent(schemaVersion, forKey: .schemaVersion)
         // 同时写旧字段，保证回滚到旧版本 App/daemon 时也能读
         try container.encode(sensors.cpuDie, forKey: .cpuTemp)
         try container.encode(sensors.gpuDie, forKey: .gpuTemp)

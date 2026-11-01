@@ -2797,6 +2797,9 @@ func testStatusSummaryCoverage() {
                                 // 且控制消费在引擎内同拍同源，status 只是展示，容许 ≤10s 陈旧
         "thermalModelFalsified",  // R89：只增不减的罕见计数器，变化当拍必伴随大量字段变化
                                   //（样本数/参数全变），单列无增量信号；展示语义"曾经证伪过"
+        "schemaVersion",       // R93：schema 代际常量，daemon 生命周期内不变；跨版本那一刻
+                               // daemonVersion 同拍必变（已在摘要）。夹具经便利 init 构造，
+                               // 此键为 nil 未编码进 JSON（存储属性在场）
     ]
     let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
     let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601

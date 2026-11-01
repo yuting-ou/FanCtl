@@ -157,8 +157,19 @@ public enum DiagnosticReport {
         } else {
             daemonVer = "未自报（旧版 daemon，或该值被改/被拒收）"
         }
+        // R93：status schema 代际（文件格式那一代，与产品版本正交）。缺席 = 版本化之前
+        // 的旧档——"新 App + 旧 daemon"升级窗口的签名之一，issue 里一眼可辨；无 status
+        // 时不占位（"无从判断"语义已由 daemonVer 表达）
+        let schemaSeg: String
+        if let sv = s?.schemaVersion {
+            schemaSeg = " · status schema v" + String(sv)
+        } else if s != nil {
+            schemaSeg = " · status schema 未版本化（旧 daemon）"
+        } else {
+            schemaSeg = ""
+        }
         out.append("装机: App " + appVer
-                   + " · daemon " + daemonVer + " · " + daemonWhen + stale)
+                   + " · daemon " + daemonVer + " · " + daemonWhen + stale + schemaSeg)
 
         let profile: String = s.flatMap { $0.hardwareProfile }?.oneLine
             ?? "未知（daemon 未运行或状态未落盘）"

@@ -547,3 +547,137 @@ func testDaemonVersionField() {
     expectEqual(written?.daemonVersion, "9.9.9 (1)", "故障分支的 status 也带自报版本")
     try? FileManager.default.removeItem(at: dir)
 }
+
+/// R93：`status.schemaVersion` —— status.json 的 **schema 代际**（文件格式那一代，
+/// 与 daemonVersion 的产品版本正交），用于协商与诊断。跨进程 JSON 契约四件事照 R38
+/// 的锁法：往返不丢、旧档（缺字段）解为 nil 且常规字段照常解出（不误判为空）、
+/// 未来档（含未知字段）被忽略未知键照读不崩、篡改值当 nil；再加行为级接线——
+/// daemon 落盘的每一拍（正常拍 + 故障拍）真带当前代际。
+func testSchemaVersionField() {
+    group("status schema 版本（R93）")
+    let enc = JSONEncoder()
+    let dec = JSONDecoder()
+    dec.dateDecodingStrategy = .iso8601
+    enc.dateEncodingStrategy = .iso8601
+
+    // ① init 默认参数即接线（F9 同族的镜像：这次要的是"默认必带"，漏写在默认参数处
+    // 结构性不可达）；显式 nil 仅用于构造旧档夹具
+    let st = DaemonStatus(sensors: SensorReadings(cpuDie: 70, gpuDie: 55), mode: .ai,
+                          appliedPercent: 40, fans: [], daemonVersion: "4.2.70 (166)")
+    expectEqual(st.schemaVersion, DaemonStatus.currentSchemaVersion,
+                "init 默认参数写当前代际")
+    let legacyShaped = DaemonStatus(sensors: SensorReadings(cpuDie: 70, gpuDie: 55), mode: .ai,
+                                     appliedPercent: 40, fans: [], schemaVersion: nil)
+    expectEqual(legacyShaped.schemaVersion, nil, "显式 nil 被尊重（构造旧档用）")
+
+    // ② 往返不丢 + 基线常规字段同批解出（防"整包失败蒙对"）
+    guard let data = try? enc.encode(st),
+          let back = try? dec.decode(DaemonStatus.self, from: data) else {
+        expect(false, "status 往返可编解码"); return
+    }
+    expectEqual(back.schemaVersion, 1, "schemaVersion 往返不丢")
+    expectEqual(back.daemonVersion, "4.2.70 (166)", "基线：常规字段同批解出")
+    expect(back.sensors.cpuDie == 70 && back.mode == .ai, "基线：sensors/mode 同批解出")
+
+    // ③ 旧 daemon 夹具 A（史前形态：顶层 cpuTemp/gpuTemp，缺一切新字段）
+    //    → 解码成功、schemaVersion nil、cpuTemp 经兼容路径落进 sensors（不误判为空）、
+    //    缺失的新字段各有明确默认（nil），无崩溃
+    let legacyA = "{\"cpuTemp\":70,\"gpuTemp\":55,\"mode\":\"ai\",\"appliedPercent\":40,"
+        + "\"fans\":[],\"timestamp\":\"2026-09-23T10:00:00Z\"}"
+    if let d = legacyA.data(using: .utf8), let old = try? dec.decode(DaemonStatus.self, from: d) {
+        expectEqual(old.schemaVersion, nil, "史前档 schemaVersion 解为 nil（未版本化）")
+        expectClose(old.sensors.cpuDie, 70, 0.001, "史前档 cpuTemp 走兼容路径进 sensors")
+        expectEqual(old.daemonVersion, nil, "史前档 daemonVersion 默认 nil")
+        expectEqual(old.thermalFeedTrusted, nil, "史前档 R89 字段默认 nil")
+        expectEqual(old.appliedPercent, 40, "史前档常规字段有值（不误判为空）")
+    } else {
+        expect(false, "史前档应能解码（不崩溃）")
+    }
+
+    // ④ 旧 daemon 夹具 B（sensors 形态、4.2.68 版本：有 daemonVersion、缺 schemaVersion）
+    //    → 精确对应"新 App + 旧 daemon"升级窗口：新字段 nil，其余照常
+    let legacyB = "{\"sensors\":{\"cpuDie\":68.5,\"gpuDie\":52},\"mode\":\"ai\","
+        + "\"appliedPercent\":42,\"fans\":[],\"timestamp\":\"2026-11-01T10:00:00Z\","
+        + "\"daemonVersion\":\"4.2.68 (164)\"}"
+    if let d = legacyB.data(using: .utf8), let old = try? dec.decode(DaemonStatus.self, from: d) {
+        expectEqual(old.schemaVersion, nil, "升级窗口：旧 daemon 的档 schemaVersion 为 nil")
+        expectEqual(old.daemonVersion, "4.2.68 (164)", "升级窗口：旧 daemon 自报版本保留")
+        expectClose(old.sensors.cpuDie, 68.5, 0.001, "升级窗口：常规读数照常")
+    } else {
+        expect(false, "升级窗口旧档应能解码")
+    }
+
+    // ⑤ 未来夹具（schemaVersion 2 + 两个未知键，含嵌套对象）→ 未知键忽略、不崩，
+    //    schemaVersion 保留 2 供诊断（新 App 读到未来代际不吞不炸）
+    let future = "{\"sensors\":{\"cpuDie\":70,\"gpuDie\":55},\"mode\":\"ai\","
+        + "\"appliedPercent\":40,\"fans\":[],\"timestamp\":\"2027-01-01T00:00:00Z\","
+        + "\"schemaVersion\":2,\"aiCliffMeter\":3.5,\"futureBlock\":{\"a\":1,\"b\":[2,3]}}"
+    if let d = future.data(using: .utf8), let next = try? dec.decode(DaemonStatus.self, from: d) {
+        expectEqual(next.schemaVersion, 2, "未来代际保留（诊断可见）")
+        expectEqual(next.appliedPercent, 40, "未知键被忽略，已知字段照常解出")
+    } else {
+        expect(false, "含未知字段的未来档应能解码（add-only 契约）")
+    }
+
+    // ⑥ 篡改守卫（status.json 在组可写目录）：负值 / 0 / 超界 / 类型不符 → 当 nil
+    func decodedSchema(_ raw: String) -> Int? {
+        let json = "{\"sensors\":{\"cpuDie\":70,\"gpuDie\":55},\"mode\":\"ai\","
+            + "\"appliedPercent\":40,\"fans\":[],\"timestamp\":\"2026-09-23T10:00:00Z\","
+            + "\"schemaVersion\":" + raw + "}"
+        guard let d = json.data(using: .utf8) else { return nil }
+        return (try? dec.decode(DaemonStatus.self, from: d))?.schemaVersion
+    }
+    expectEqual(decodedSchema("1"), 1, "基线：常规值可解出")
+    expectEqual(decodedSchema("-1"), nil, "负值当污染处理")
+    expectEqual(decodedSchema("0"), nil, "0 不是合法代际（从 1 起）")
+    expectEqual(decodedSchema("1000001"), nil, "超界值当污染处理")
+    expectEqual(decodedSchema("\"one\""), nil, "类型不符当污染处理")
+
+    // ⑦ 行为级接线：daemon 落盘的 status 真带当前代际（正常拍 + 传感器故障拍两条路）
+    let envDir = engineTestEnv()
+    defer {
+        try? FileManager.default.removeItem(at: envDir)
+        FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    }
+    ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+    let clock = FakeClock()
+    let collector = EngineCollector()
+    // 正常拍
+    let smcOK = makeFanSMC(); smcOK.set("Tp01", 60); smcOK.set("PSTR", 30)
+    let engineOK = makeEngine(smc: smcOK, clock: clock, collector: collector,
+                              daemonVersion: "9.9.9 (1)")
+    engineOK.beat()
+    expectEqual(ConfigStore.loadStatus()?.schemaVersion, DaemonStatus.currentSchemaVersion,
+                "正常拍的落盘 status 带 schema 代际")
+    // 故障拍（启动即温度读失败 → 最小 status 构造分支）
+    let smcBad = makeFanSMC(); smcBad.set("PSTR", 30); smcBad.set("Tp01", 0)
+    let engineBad = makeEngine(smc: smcBad, clock: clock, collector: collector,
+                               daemonVersion: "9.9.9 (1)")
+    engineBad.beat()
+    let faultWritten = ConfigStore.loadStatus()
+    expectEqual(faultWritten?.controlFault, true, "前提：这一拍确实走了传感器故障分支")
+    expectEqual(faultWritten?.schemaVersion, DaemonStatus.currentSchemaVersion,
+                "故障分支的 status 也带 schema 代际")
+
+    // ⑧ 诊断包露出：装机行能看到代际；旧档标"未版本化"（升级窗口签名）
+    var verStatus = st
+    let repNext = DiagnosticReport.lines(DiagnosticReport.Input(
+        generatedAt: Date(timeIntervalSince1970: 1_700_000_000), status: verStatus,
+        statusAgeSeconds: 4, learn: ThermalLearn(), metrics: AIControlMetrics(targetTemp: 74),
+        ledger: DTLedgerState(), model: ThermalModel(), stats: DailyStats(date: "2026-11-02"),
+        configPresent: true, lastGoodPresent: true, exitReason: nil, logReadable: true,
+        installedAppVersion: "4.2.70 (166)",
+        daemonBinaryInstalledAt: Date(timeIntervalSince1970: 1_699_000_000)))
+    expect(repNext.contains(where: { $0.contains("status schema v1") }),
+           "诊断包装机行带 schema 代际")
+    verStatus.schemaVersion = nil
+    let repOld = DiagnosticReport.lines(DiagnosticReport.Input(
+        generatedAt: Date(timeIntervalSince1970: 1_700_000_000), status: verStatus,
+        statusAgeSeconds: 4, learn: ThermalLearn(), metrics: AIControlMetrics(targetTemp: 74),
+        ledger: DTLedgerState(), model: ThermalModel(), stats: DailyStats(date: "2026-11-02"),
+        configPresent: true, lastGoodPresent: true, exitReason: nil, logReadable: true,
+        installedAppVersion: "4.2.70 (166)",
+        daemonBinaryInstalledAt: Date(timeIntervalSince1970: 1_699_000_000)))
+    expect(repOld.contains(where: { $0.contains("status schema 未版本化") }),
+           "旧档标未版本化（升级窗口签名）")
+}

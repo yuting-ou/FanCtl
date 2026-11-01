@@ -298,6 +298,10 @@ private let summaryExempt: [String: String] = [
     "thermalModelSamples": "模型样本计数，慢观察量",
     "thermalFeedTrusted": "信任门内部诊断量（R89），翻转罕见",
     "thermalModelFalsified": "证伪计数（R89），只增罕见",
+    // R93：daemon 生命周期内恒为常量（init 默认参数=当前代际），不随拍变化；
+    // 跨版本变化的那一刻 daemonVersion 同拍必变（R38 已进摘要）——单独纳入只会
+    // 让每拍摘要变长，不会让任何一拍提前落盘
+    "schemaVersion": "schema 代际常量（R93）；跨版本时 daemonVersion 同拍必变",
     "sensors.cpuAverage": "展示用慢变量（核心均温），取整噪声不敏感",
     "sensors.otherHotspots": "动态键字典：主热点已由 cpuDie/gpuDie 通道覆盖",
 ]
@@ -313,8 +317,8 @@ func testStatusSummaryChecklist() {
     for child in Mirror(reflecting: status.sensors).children {
         if let l = child.label { fields.insert("sensors.\(l)") }
     }
-    expect(fields.count >= 43,
-           "DaemonStatus 全集抠出 \(fields.count) 个字段，不应少于 43（36 顶层 + 7 sensors 子字段；Mirror 失效要判红）")
+    expect(fields.count >= 44,
+           "DaemonStatus 全集抠出 \(fields.count) 个字段，不应少于 44（37 顶层 + 7 sensors 子字段；Mirror 失效要判红）")
 
     // ② 覆盖集：statusChangeSummary 源码里实际引用的 s.xxx / s.sensors.xxx。
     // 两个独立正则：一级名（s.mode / s.fans.map 都归到字段名 mode/fans——

@@ -2842,3 +2842,42 @@ R77 给 wake() 建的"源码抠取↔手写声明"双向门只防"复位了没�
 表态，没有第三条路；② 抠取器认 `x = …` 与 `x.method(…)` 两种形态，若未来出现
 `self.x = …` 形态的复位需要扩 `extractedMembers`；③ 后续第 3-6 步（schemaVersion/
 能效基线/覆盖率门/beat 相位拆分）按架构评估落地计划推进，见本轮用户指令。
+
+## R93（4.2.70(166)）：status.json 显式 schema 代际——协商与诊断的第一块砖
+
+**动机（架构评估落地第 3 步）**：status.json 至今没有格式版本号。schema 事实上一直是
+add-only（新字段全 Optional、未知键被忽略），但"没有版本号"意味着：① 读者无法区分
+"旧 daemon 写的档"与"被改写/损坏的档"；② 未来若出现破坏性变更（改语义/删字段），
+解码侧没有分派依据，只能靠猜。daemonVersion（R38）回答"哪一版产品写的"，
+schemaVersion 回答"哪一代格式写的"——两者正交。
+
+**实现**：`DaemonStatus.schemaVersion: Int?` + `currentSchemaVersion = 1`。接线方式选
+**init 默认参数**（= 当前代际）而非三处构造点各自传参：daemon 的构造点零改动，
+F9 形态（"漏赋值"）在默认参数处结构性不可达；显式传 nil 仅用于测试构造旧档。
+解码守卫与 daemonVersion 同型（组可写目录防注入）：负值/0/超界(>1e6)/类型不符当 nil。
+诊断包装机行露出：`status schema v1` / `status schema 未版本化（旧 daemon）`——
+升级窗口签名一眼可辨。
+
+**升级窗口行为（新 App + 旧 daemon）**：字段缺席 → 解码为 nil（未版本化），全部走既有
+Optional 降级路径，与 4.2.68 行为逐比特一致——schemaVersion 本身不被任何控制/展示逻辑
+消费（纯诊断），它的缺席不触发任何降级分支。反方向（旧 App + 新 daemon）：schemaVersion
+是未知键，被解码器忽略，旧 App 行为不变。未来档（schemaVersion=2 + 未知字段）当前 App
+照常解出已知字段、保留代际号供诊断。四形态（旧档史前 cpuTemp 形态/旧档 sensors 形态/
+未来档/篡改档）都有夹具钉死（testSchemaVersionField）。
+
+**既有门的连锁反应（都是门在正确工作）**：R92 门 C 的 Mirror 全集因新字段自动扩到 44，
+豁免登记 schemaVersion（理由：daemon 生命周期内恒为常量，跨版本时 daemonVersion 同拍
+必变且已在摘要）；R46 手写差分门同样要求表态（夹具经便利 init 构造，此键未编码进 JSON，
+落进"未差分也未豁免"名单）；root 脚本门禁要求 RELEASE-NOTES 补 4.2.70 要点行。
+
+**变异验证（M4）**：把 init 默认参数改成 nil（= daemon 写不出代际号的形态）→ 五条断言
+红（init 默认/往返/正常拍落盘/故障拍落盘/诊断包露出），还原后全绿。
+
+**记账**：VERSION `4.2.69(165)` → **`4.2.70(166)`**；断言 6125 → **6150 / 152 组**
+（+25 断言 +1 组）；契约门槛双源 6119 → **6144**（组数门 143 → 144；沿用 −6/−8）。
+
+**交接口**：① 未来 schema 破坏性变更时：抬 `currentSchemaVersion`，解码侧按
+`schemaVersion` 分派迁移（先例：ShadowFFLedger.version 的版本门）；② schemaVersion
+进豁免登记的理由依赖"跨版本时 daemonVersion 同拍必变"——若未来出现 daemon 热重载
+schema 的形态（不换进程换格式），该理由失效，须重新表态；③ 便利 init（cpuTemp/gpuTemp
+形态）刻意不设 schemaVersion（nil = 旧档构造器语义），别"顺手补上"。
