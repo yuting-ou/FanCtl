@@ -2979,3 +2979,64 @@ FanCtlApp 的 SwiftUI 视图层不设门（Snapshot/compare 体系才是它的�
 ② 若未来 Driver/ 进入 mock 之外的测试路径，把 `--ignore-filename-regex` 的豁免收窄；
 ③ coverage-gate.sh 的门槛变量（CE_FLOOR/CORE_FLOOR）设计为环境变量可覆盖——
 变异验证用 `CE_FLOOR=99 scripts/coverage-gate.sh`，预期 exit 1。
+
+## R96（方案轮，不抬版本）：beat() 五相位拆分方案——只设计不动手
+
+**现状解剖**（方案的地基，行号为 4.2.72 实测）：`beat()` = L365–1438，**1074 行**，
+是全仓最大函数。真实相位图（比旧注释编号更细）：
+
+| 相位 | 行段 | 内容 | 备注 |
+|---|---|---|---|
+| 序章 | 365–390 | 心跳/挂起判定/dt 钳制（FanDt 同源）/loopCount | |
+| 配置门控 | 392–468 | 热加载配置 + boost 超时 + passive/校准门 → effectiveConfig | R77 已抽 3 个子阶段 |
+| **采集** | 470–619 | 传感器读数 + rawTemp 有效性 + 电池/功耗/环境/夜间 + 卡死门/偏低门 | **含两条早退路径**（L508 温度失败、L618 传感器故障：都走"最小 status + 调度 + return"） |
+| **决策** | 621–797 | AI 管线（曲线锚定/查表/模型前馈+信任门/影子候选冻结）+ FanPipeline.decide + reason 解析 + 托底边沿日志 | 影子候选必须在学习块前冻结（L626 注释，吃过亏） |
+| **执行** | 799–949 | fanStates 读取 + 失联收割 + 反馈健康 + 写循环（writeHealth/probe）+ appliedPercents + 影子基准冻结 | 校准采样（L835+）与执行交错 |
+| 学习/账本 | 950–1247 | 稳态门学习 + 热模型辨识 + 影子采样 + dt 账本 + aiMetrics 评测 + 压不住/全力散热窗口 | 六条件稳态门注释 25 行 |
+| 统计 | 1248–1301 | 每日统计累计 + 60s 节流落盘（6 个 save，门 B ⑤ 钉住） | |
+| **落盘** | 1302–1410 | DaemonStatus 构造（60+ 字段）+ 变化感知摘要 + 心跳/强写 | 两条早退路径各有最小落盘变体 |
+| **调度** | 1411–1438 | computeNextInterval + scheduleNext + 功耗采样间隔 + prevRawTemp（必须在读取之后更新，L1433 注释） | R77 已抽 computeNextInterval |
+
+**方案 A（推荐）——三轮增量抽取，沿用 R77「单拍阶段抽取」既有模式**：
+- 第 1 轮（采集+调度，风险最低）：`acquireSample() -> SampleOutcome`（枚举：
+  ok(Sample 值类型：readings/rawTemp/onBattery/powerWatts/valleyEnv/envTemp/nightActive)
+  / tempFail / sensorFault(原因)），早退路径留在 beat() 编排层（它们本质是"降级编排"
+  不是采集）；`scheduleNextBeat()` 把 setPowerInterval+prevRawTemp 收进调度阶段。
+- 第 2 轮（决策）：`computeDecision(sample:effectiveConfig:kind:) -> BeatDecision`，
+  纯读输入（Sample + 引擎只读状态：thermalLearn/thermalModel/aiController），
+  输出含 decision/aiPercent/aiIntent/curveTarget/shadow 四候选/迟滞标记。
+- 第 3 轮（执行+学习+落盘）：`applyOutputs(decision:) -> ApplyResult`、
+  `recordLearning(sample:decision:apply:)`、`persistStatus(sample:decision:apply:)`
+  （早退路径复用 persistStatus 的最小变体）。
+- 每轮独立提交、独立全绿；`fastConfigApply` 显式参数化为 `BeatKind{normal,fastApply}`
+  传给每个阶段函数（现在它以 if 形式散布在全部 5 个相位里）。
+
+**方案 B（否决）**：一次性大爆炸抽取 + BeatContext 全量上下文值类型。终态更干净，
+但 1074 行 × 60 个状态字段一次过，任何一处读写顺序变动都是静默行为漂移——
+与本项目"每轮可验证"的门禁哲学相悖。
+
+**风险点（按危害排序，全部来自实测行段）**：
+1. **fastConfigApply 语义分叉**：贯穿全部相位（dt 不推进 L372、AI 跳过 L674、
+   反馈只记命令 L824、统计跳过、调度强制 2s L1431）。漏掉任何一处 = 拖滑块行为回归。
+2. **三条退出路径**：线性拆分（采集→…→调度）天然破坏两条早退（它们跳过决策/执行
+   但仍要落盘+调度）。SampleOutcome 枚举 + 降级编排留在 beat() 是唯一保行为形态。
+3. **隐式顺序不变量**：影子候选先冻结再学习（L626/L946）、prevSmoothedTemp 两路互斥
+   不双推（L835）、prevRawTemp 在 computeNextInterval 读取之后更新（L1433）、
+   learnDirty 由学习写而落盘节流读（门 B ⑤）。拆分时每个不变量要在编排层留名注释。
+4. **60 字段共享态的读写顺序**：拆分不改共享态（那是门 A 的领域），但搬代码可能
+   意外改变读写顺序（如 lastAIOutput 的 fast-apply 读路径）。防线 = 全量测试 +
+   R92 三门 + 覆盖率门不降。
+5. **测试锚点**：测试直接摸 engine.aiController.output 等内部——阶段函数必须仍是
+   ControlEngine 的私有方法（不能抽成自由函数），否则 6153 断言大面积搬家。
+   **返工信号**：某轮需要 >200 行测试改动 = 边界切错了，停下来重切（测试是规格，
+   行为保持重构不该动规格）。
+
+**验收标准**（未来执行轮的 DoD）：断言数**逐比特不变**（6153/153，这是最强行为保持
+信号——门槛与实测都零漂移）；覆盖率门两数字不降；R92 三门全绿；beat() 编排层
+≤200 行；对一个抽出的阶段做 1 次变异验证。
+
+**收益**：每相位可独立单测（决策相位将接近纯函数）；R94 量具可加每相位 µs 计时；
+后续功能改动不再在 1074 行里找位置。
+
+**记账**：纯方案轮——零代码/零测试改动，VERSION 不动（4.2.72(168)），断言门槛不动。
+方案落地为 R97+ 的执行轮，按"三轮三提交"推进。
