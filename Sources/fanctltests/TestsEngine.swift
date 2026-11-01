@@ -325,6 +325,77 @@ func testSMCReadBudget() {
     expect(perMin <= 500, "热态 1 分钟控制路径 SMC 读 ≤500（得 \(perMin)；旧双缓存+每拍全扫 >600）")
 }
 
+// R94：真机规模 SMC 读数量具（能效基线的进程内半边）。1C 预算门用缩比键表（10 CPU/
+// 5 other），乘出到真机不可信——本量具按真机 hardwareProfile 实测键规模（Mac14,10 /
+// M2 Pro：CPU 54 / GPU 10 / SSD 9 / 电池 3 / 掌托 8 / 散热片 46 / 其他 110，共 240
+// 温度键 + PSTR + 2 风扇）构造 MockSMC，跑**完整引擎拍**（含风扇 Ac/Tg、PSTR 功耗、
+// status 写盘路径），三臂各测一分钟（20 拍 × 3s，真机 loopInterval=3）：
+//   热态（CPU 追踪键 ≥65 → 5s 重扫档，worst case）/ 冷态（15s 档，典型空载）/
+//   无展示键（other/heatsink/palm 从 SMC 拿掉 = 削减候选的收益上界）
+// 产出读数/分 →（÷60）读数/秒 →（÷20）读数/拍，与 powermetrics 的唤醒数互证。
+func testRealShapeSMCReadBudget() {
+    group("真机规模 SMC 读数量具（R94）")
+    func realShapeSMC(hot: Bool, displayKeys: Bool) -> MockSMC {
+        let smc = MockSMC()
+        // CPU 54 键（Tp 前缀）：热态 Tp01..Tp06 = 66..71（top-4 追踪键 ≥65 → 5s 重扫档）
+        for i in 1...54 {
+            let v = (hot && i <= 6) ? Double(65 + i) : Double(45 + i % 10)
+            smc.set(String(format: "Tp%02d", i), v)
+        }
+        for i in 1...10 { smc.set(String(format: "Tg%02d", i), 52) }    // GPU 10（<65 → 15s 档）
+        for i in 1...9 { smc.set(String(format: "TH%02d", i), 40) }     // SSD 9（TH 前缀）
+        for i in 1...3 { smc.set(String(format: "TB%02d", i), 30) }     // 电池 3
+        if displayKeys {
+            for i in 1...8 { smc.set(String(format: "Ts%02d", i), 33) }         // 掌托 8
+            for i in 1...46 { smc.set(String(format: "Th%02d", i), 42) }        // 散热片 46
+            // 其他 110：T 开头 4 字符、前缀不与已归类集合相撞（TQ×99 + TZ×11）
+            for i in 1...99 { smc.set(String(format: "TQ%02d", i), 50) }
+            for i in 1...11 { smc.set(String(format: "TZ%02d", i), 50) }
+        }
+        smc.set("PSTR", 30)                                              // 功耗键（真机 hasPowerKey）
+        smc.set("FNum", 2, type: "ui8 ")                                 // 真机 fanCount=2
+        for i in 0...1 {
+            smc.set("F\(i)Md", 0, type: "ui8 ")
+            smc.set("F\(i)Ac", 1500); smc.set("F\(i)Mn", 1200)
+            smc.set("F\(i)Mx", 5000); smc.set("F\(i)Tg", 1500)
+        }
+        return smc
+    }
+    func oneMinute(smc: MockSMC) -> Int {
+        let env = engineTestEnv()
+        defer {
+            try? FileManager.default.removeItem(at: env)
+            FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+        }
+        ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 70, envCompensation: false))
+        seedLearnTable()
+        let clock = FakeClock()
+        let col = EngineCollector()
+        let engine = makeEngine(smc: smc, clock: clock, collector: col)
+        engine.beat()   // 热身拍：建追踪/展示缓存（稳态口径，不含启动一次性成本）
+        let reads0 = smc.reads.count
+        for _ in 0..<20 {                    // 20 拍 × 3s = 60s
+            clock.advance(3)
+            engine.beat()
+        }
+        return smc.reads.count - reads0
+    }
+    let hot = oneMinute(smc: realShapeSMC(hot: true, displayKeys: true))
+    let cold = oneMinute(smc: realShapeSMC(hot: false, displayKeys: true))
+    let noDisplay = oneMinute(smc: realShapeSMC(hot: true, displayKeys: false))
+    print("  📊 R94 真机规模读数/分：热态 \(hot)（\(Double(hot)/60.0)/s，\(Double(hot)/20.0)/拍）"
+        + " · 冷态 \(cold) · 无展示键 \(noDisplay)")
+    // 预算门：真机规模热态 ≤2400/分。首跑实测 1753（=29.2 读/s、87.65 读/拍；冷态
+    // 1403、无展示键 933），预算 = 实测 +37% 余量。1C 缩比门"真机等比 >2000"的预言
+    // 在此兑现为真值（1753 略低于等比外推，热态重扫与展示 TTL 的错拍摊薄了乘数）。
+    // 任何乘数回潮（热态逐拍全扫：单 CPU 族 54×20=1080 就过六成预算）即红
+    expect(hot <= 2400, "真机规模热态 SMC 读 ≤2400/分（得 \(hot)，即 \(Double(hot)/60.0)/s）")
+    expect(cold <= hot, "冷态不高于热态（15s 档放宽；得 冷\(cold) 热\(hot)）")
+    // 削减候选的收益上界：展示键（other 110 + heatsink 46 + palm 8，10s TTL）合计贡献
+    // hot−noDisplay 次读/分。记录用（无断言——削减决策见 EVOLUTION R94，本轮不动算法）
+    expect(noDisplay < hot, "无展示键臂必须更低（否则量具自身失效）：\(noDisplay) vs \(hot)")
+}
+
 // v3.4.1 DoD-3：Mn/Mx 静态缓存——allStates 二次调用 Mn/Mx 零读（Ac/Tg 仍每拍读）；
 // invalidateFanLimits 后恢复重读；PSTR 2s 缓存同拍复用。
 func testFanLimitsCache() {

@@ -25,6 +25,13 @@
 
 ## 本版变更要点
 
+- 4.2.71：**能效基线量具（无 daemon 行为变化）**。fanctld 稳态成本第一次有了数字：
+  真机规模 SMC 读数量具（热态 1753 读/分 ≈29.2/秒，冷态 1403；展示键占 47%）进 CI
+  常驻，任何"逐拍全扫"回潮即红；系统级量具 `scripts/energy-baseline.sh`（powermetrics
+  + osascript 提权）可复现。本机基线：CPU 2.3ms/s（≈0.23% 单核）、RSS 10.4MB 稳定、
+  负载态唤醒 0.37 次/s——fanctld 不构成发热/功耗的可感知来源，无可削项（详见
+  EVOLUTION R94；空闲态唤醒成本待空闲机复测）。
+
 - 4.2.70：**status.json 显式 schema 版本号（协商与诊断，字段只增不改语义）**。daemon
   落盘的 status 新增 `schemaVersion`（当前恒为 1）：与 daemon 自报的产品版本正交，标识
   文件格式代际；诊断包装机行同报（旧档标"未版本化"）。升级窗口（新 App + 旧 daemon）
