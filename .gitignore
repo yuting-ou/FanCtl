@@ -9,3 +9,7 @@ dist/
 # ZCode 本机会话产物（代码索引/工具配置），不入库
 .codebase-memory/
 .zcodeignore
+
+# video-agent 插件运行残留（与本仓库无关）
+.video_agent/
+
