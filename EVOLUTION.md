@@ -3040,3 +3040,45 @@ FanCtlApp 的 SwiftUI 视图层不设门（Snapshot/compare 体系才是它的�
 
 **记账**：纯方案轮——零代码/零测试改动，VERSION 不动（4.2.72(168)），断言门槛不动。
 方案落地为 R97+ 的执行轮，按"三轮三提交"推进。
+
+## R97（执行轮，不抬版本）：beat() 拆分第 1 轮——采集 + 调度相位抽出
+
+**方案修正（动手前停手核对出两处方案与代码不符，用户批准后按修正执行）**：
+① 采集相位早退路径实为**三条**——方案表漏数 smooth 坏读 hold（原 L514–524，
+最小 status + 原间隔调度 + return），SampleOutcome 定为 4 分支（ok/tempFail/
+badReadHold/sensorFault(原因)）；② Sample 字段清单漏 `temp`（平滑温度，决策相位
+全程以它为准而非 rawTemp），补上后共 8 字段（readings/rawTemp/temp/onBattery/
+powerWatts/valleyEnv/envTemp/nightActive）。
+
+**落地形态**：新增 `BeatKind{normal,fastApply}`（Bool 只留 beat() 入口边界并推导
+一次，阶段函数单轨收 kind）；`acquireSample(kind:actualInterval:) -> SampleOutcome`
+（105 行）与 `scheduleNextBeat(kind:rawTemp:appliedPercents:fanStates:onBattery:
+effectiveMode:)`（29 行）均为 ControlEngine 私有方法（风险点 5：不抽自由函数）。
+三条早退的 lastStatus 读写与 scheduleNext 直调全部留在编排层；故障的即时安全反应
+（restoreAutoAll/清 lastWrittenRPM/计数与日志）随判定收在 acquireSample 内，执行
+顺序与抽取前逐比特一致。`effectiveConfig.mode` 是 beat() 局部量（boost 过期/passive/
+校准可语义化为 auto），抽出的调度函数读不到，参数化传入——方案原文未写明该签名
+细节。prevRawTemp「computeNextInterval 读取之后更新」注释随代码搬入。
+
+**行数**：beat() 1074 → 980（-94）；acquireSample 105 + scheduleNextBeat 29。
+编排层（beat 本体）距终态 DoD ≤200 行尚远，第 2/3 轮（决策/执行+学习+落盘）继续。
+
+**验收（逐项实跑）**：① 断言 6153/153 逐比特不变（改前基线 = 改后 = 还原后三轮
+实测）；② 覆盖率门通过且微升：ControlEngine 95.49%（基线 95.37，门槛 94.5）、
+SMCCore 剔 Driver 94.98%（基线 94.95，门槛 94.0）——抽取让被执行行更紧凑；
+③ R92 三门 + R93 schemaVersion 夹具在套件内全绿；④ 测试零改动。
+
+**变异验证（两次，结果诚实记录）**：
+- 变异 a（badReadHold 调度间隔 currentLoopInterval→LOOP_INTERVAL_DEFAULT）：**跑不红**
+  （6153 全绿）。该边界无测试保护——套件无引擎级 glitch-hold 调度间隔断言（坏读
+  hold 仅有 smooth() 单元测试与 fuzz 不变量覆盖）。挂账为测试债。
+- 变异 b（决策相位输入 sample.temp→sample.rawTemp）：**跑不红**（6153 全绿）。
+  该边界无测试保护——精确决策输出断言全部是首拍/恒温场景（smooth 首拍直通、
+  恒温即收敛，temp≡rawTemp），变温场景（如 70→85 反馈失配锁存测试）只断言
+  粗粒度不变量（故障锁存/不崩溃），平滑差异穿不透断言网。挂账为测试债。
+  两条测试债的候选补法：hold 拍调度间隔断言（引擎级 glitch 场景）+ 变温第 2 拍
+  曲线查表值断言（assertion 数将相应 +2，下轮提案，未经批准不动）。
+
+**记账**：行为保持重构——VERSION 不动（4.2.72(168)），断言门槛不动，RELEASE-NOTES
+无用户可见变化不新增。刻意未做：第 2 轮（决策相位 computeDecision）与第 3 轮
+（执行+学习+落盘），及上两条测试债的补充断言。

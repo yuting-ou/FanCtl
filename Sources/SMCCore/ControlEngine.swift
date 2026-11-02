@@ -34,6 +34,40 @@ public let LOOP_INTERVAL_STABLE: TimeInterval = 5.0
 public let LOOP_INTERVAL_COOL: TimeInterval = 10.0
 public let LOOP_INTERVAL_IDLE: TimeInterval = 20.0
 
+/// 单拍种类（R97，R96 方案 A 第 4 条）：fastApply = 拖滑块/配置即写触发的即效拍。
+/// 阶段函数统一从 kind 推导语义分叉（不推进 dt 基准/故障门不计时/不跑统计/调度固定
+/// 2s 跟进拍），不再各自接收 fastConfigApply: Bool——Bool 只留在 beat() 入口边界
+/// 并在此推导一次，防 Bool/枚举双轨漂移。
+enum BeatKind {
+    case normal
+    case fastApply
+    var isFastApply: Bool { self == .fastApply }
+}
+
+/// 采集相位产物（R97 方案 A 第 1 轮）：ok = 本拍输入快照；三个故障/降级分支只携带
+/// 判定结果——降级落盘 + 调度是编排决策，留在 beat()（R96 风险点 2 修正：早退路径
+/// 实为三条，含 smooth 坏读 hold，方案表原文漏数）。
+enum SampleOutcome {
+    case ok(Sample)
+    case tempFail
+    case badReadHold
+    case sensorFault(ControlFaultReason)
+}
+
+/// 本拍输入快照：采集相位的全部下游消费字段。temp 是 controller.smooth() 的输出——
+/// 决策相位（曲线查表/学习查表/评测记账）以平滑温度为准；valleyEnv（谷值环境，物理
+/// 量测）与 envTemp（生效环境 = override ?? 谷值）分开携带，学习/统计相位两者都用。
+struct Sample {
+    let readings: SensorReadings
+    let rawTemp: Double
+    let temp: Double
+    let onBattery: Bool
+    let powerWatts: Double?
+    let valleyEnv: Double?
+    let envTemp: Double?
+    let nightActive: Bool
+}
+
 public final class ControlEngine {
 
     // MARK: - 环境注入（生产由 main.swift 接线，测试用 Mock/Fake）
@@ -365,6 +399,9 @@ public final class ControlEngine {
     public func beat(fastConfigApply: Bool = false) {
         touchHeartbeat()   // 看门狗心跳：主队列仍在处理事件即为存活信号
         if isSuspendedForSleep { return }
+        // R97：Bool 只停留在入口边界，阶段函数一律收 kind（单轨推导，防双轨漂移）。
+        // beat() 体内未抽取相位的 fastConfigApply 直读留待第 2/3 轮随抽取一并切换。
+        let kind: BeatKind = fastConfigApply ? .fastApply : .normal
         let loopStart = hooks.now()
         // 计算本拍实际经过时间（正常拍）。fastConfigApply 不推进时间基准，
         // 因此 AI dt 和统计采样反映的是真实控制周期，不受配置抖动干扰。
@@ -467,22 +504,15 @@ public final class ControlEngine {
             }
         }
 
-        // 2. 读温度（完整传感器集合）
-        let sensorReadings = sensors.sensorReadings()
-        let rawTemp = sensorReadings.maxTemp
-
-        if !rawTemp.isFinite || rawTemp <= 1 {
-            tempFailCount += 1
-            if tempFailCount >= 5 {
-                if forcedModeActive {
-                    hooks.log("温度读取连续失败，恢复系统自动调度并进入安全故障状态")
-                    fans.restoreAutoAll()
-                    forcedModeActive = false
-                    lastWrittenRPM.removeAll()
-                }
-            } else {
-                hooks.log("温度读取失败（第 \(tempFailCount) 次），暂不改变当前风扇输出")
-            }
+        // 2. 采集相位（R97 抽取）：读数/平滑/电源/环境/夜间 + 卡死门/偏低门。
+        // 三条降级早退是"降级编排"而非采集（R96 风险点 2 修正：实为三条，含 smooth
+        // 坏读 hold）——lastStatus 读写与 scheduleNext 留在本层；故障的即时安全反应
+        //（交还系统/清写入账）随判定收在 acquireSample 内，执行顺序与抽取前逐比特一致。
+        let sample: Sample
+        switch acquireSample(kind: kind, actualInterval: actualInterval) {
+        case .ok(let s):
+            sample = s
+        case .tempFail:
             if var status = lastStatus {
                 status.timestamp = hooks.now()
                 status.controlFault = true
@@ -507,11 +537,7 @@ public final class ControlEngine {
             }
             scheduleNext(interval: LOOP_INTERVAL_DEFAULT)
             return
-        }
-        tempFailCount = 0
-
-        // 温度平滑
-        guard let temp = controller.smooth(rawTemp: rawTemp) else {
+        case .badReadHold:
             // v2.6.2：坏读 hold 拍（最多 3 拍，间隔最长 20s → 60s 无 status 更新）也写一次
             // 最小 status（旧值 + 新时间戳），否则 App 的 30s 存活阈值会误判 daemon 下线
             if var status = lastStatus {
@@ -521,80 +547,7 @@ public final class ControlEngine {
             }
             scheduleNext(interval: currentLoopInterval)
             return
-        }
-
-        // 3. 计算并应用目标
-        let onBattery = hooks.onBattery()
-        let powerWatts = sensors.systemPowerWatts
-        if onBattery != lastOnBattery {
-            if lastOnBattery != nil {
-                hooks.log(onBattery ? "切换到电池供电" : "切换到电源供电")
-            }
-            lastOnBattery = onBattery
-        }
-
-        // v8 环境温度 + 夜间判断（上移到合理性门之前：偏低门需要环境参照）。
-        // 谷值（物理量测）与 override（用户设定）分开取：偏低门参照只用谷值——
-        // override 偏高 13°+ 时会把正常空闲芯片误判失真（审查 P2-2）
-        let valleyEnv = sensors.ambientEstimate(now: hooks.now(), cpu: rawTemp)
-        let envTemp = config.envTempOverride ?? valleyEnv
-        // 读数偏低期 rawTemp 失真会让谷值的"贴近芯片"检查判 nil——保留最近合理谷值给偏低门
-        if let e = valleyEnv { lastPlausibleEnvTemp = e }
-        let hour = Calendar.current.component(.hour, from: hooks.now())
-        let nightActive = hour >= 22 || hour < 8
-        if let env = envTemp, config.envCompensation {
-            let off = FanPipeline.envOffset(envTemp: env, enabled: true)
-            if abs(off) >= 1, !envCompLogged {
-                hooks.log("环境温度补偿: 环境 \(String(format: "%.0f", env))°C → 偏移 \(String(format: "%+.1f", off))°")
-                envCompLogged = true
-            }
-        }
-
-        // v2.8/v3.0 传感器物理一致性门（两类故障模式）：
-        //   卡死门：功耗波动 ≥10W 而热点读数 5 分钟逐位不变——真实传感器必有 LSB 抖动；
-        //   偏低门（v3.0）：芯片（发热源）不可能比环境冷 12°C——实测出现过 cpuDie 8.4° vs
-        //     环境 30.5°；当 max 恰好取到偏低读数时 AI 会误判冰凉停转风扇、92° 兜底失明。
-        // 计时按秒累计/衰减（对称消抖 90s）——按拍计数在 idle 20s 间隔下确认窗会膨胀到
-        // 600s（审查 P1）；fast apply 拍不计时（currentLoopInterval 会虚增，且用户拖动
-        // 滑块期间冻结判定无副作用）。判失真 → 交还系统，读数恢复 90s 后自动接管。
-        let wasStuck = stuckDetector.faulted
-        if stuckDetector.record(rawTemp: rawTemp, powerWatts: powerWatts, now: hooks.now()) {
-            hooks.log("温度传感器疑似卡死: \(String(format: "%.1f", rawTemp))°C 持续 \(Int(StuckSensorDetector.minDuration / 60)) 分钟无任何变化而功耗波动 ≥\(Int(StuckSensorDetector.minPowerSwing))W，交还系统调度")
-        }
-        if wasStuck && !stuckDetector.faulted {
-            hooks.log("温度读数恢复变化，传感器卡死解除，重新接管")
-        }
-        let gateEnv: Double? = (valleyEnv ?? lastPlausibleEnvTemp)
-            .flatMap { $0.isFinite && $0 > 5 ? $0 : nil }
-        if let env = gateEnv, rawTemp < env - 12 {
-            if !fastConfigApply { belowAmbientSeconds = min(90, belowAmbientSeconds + actualInterval) }
-        } else if !fastConfigApply {
-            belowAmbientSeconds = max(0, belowAmbientSeconds - actualInterval)
-        }
-        // 双阈值锁存（审查 N1/N2）：≥90s 触发、衰减到 0 才解除。累计钳顶 90 使恢复
-        // 恒为 90s 合理读数（否则恢复延迟 = 故障时长，长故障后"读数已好仍挂故障横幅"）；
-        // 锁存消除边界抖动的逐拍 Md/状态翻转。
-        // 两个数值必须进日志：只写"低于环境"无法归因——是芯片族整族读到坏数，
-        // 还是环境代理本身偏高把正常空闲芯片判成失真，两种情形修法相反（R91 实测两者
-        // 在本机都出现过：cpuDie 8.4° 而 gpuDie 45°，env 26.5°）。
-        if !belowAmbientFaulted, belowAmbientSeconds >= 90 {
-            belowAmbientFaulted = true
-            hooks.log("温度读数低于环境 12°C 持续 90s，判定读数失真，交还系统调度"
-                + "（热点 \(String(format: "%.1f", rawTemp))° / 环境参照 \(gateEnv.map { String(format: "%.1f", $0) } ?? "无")°）")
-        }
-        if belowAmbientFaulted, belowAmbientSeconds <= 0 {
-            belowAmbientFaulted = false
-            hooks.log("温度读数恢复合理区间 90s，偏低失真解除，重新接管（热点 \(String(format: "%.1f", rawTemp))°）")
-        }
-        if stuckDetector.faulted || belowAmbientFaulted {
-            // 两类传感器故障各有各的判据，横幅按实际那一条说话（卡死优先：它更具体）
-            let sensorFaultReason: ControlFaultReason =
-                stuckDetector.faulted ? .sensorImplausible : .sensorBelowAmbient
-            if forcedModeActive {
-                fans.restoreAutoAll()
-                forcedModeActive = false
-                lastWrittenRPM.removeAll()
-            }
+        case .sensorFault(let sensorFaultReason):
             if var status = lastStatus {
                 status.timestamp = hooks.now()
                 status.controlFault = true
@@ -617,6 +570,15 @@ public final class ControlEngine {
             scheduleNext(interval: LOOP_INTERVAL_DEFAULT)
             return
         }
+        // 3. 计算并应用目标（采集快照展开为本相位沿用局部量，下游零改动）
+        let sensorReadings = sample.readings
+        let rawTemp = sample.rawTemp
+        let temp = sample.temp
+        let onBattery = sample.onBattery
+        let powerWatts = sample.powerWatts
+        let valleyEnv = sample.valleyEnv
+        let envTemp = sample.envTemp
+        let nightActive = sample.nightActive
 
         var aiPercent: Double? = nil
         var aiIntent: AIIntent? = nil
@@ -1408,8 +1370,137 @@ public final class ControlEngine {
         // 即使变化感知跳过磁盘写入，也保留内存中的最新状态，供传感器故障路径立即标注原因。
         lastStatus = status
 
-        // 6. 计算下一循环间隔并重排定时器
-        if !fastConfigApply {
+        // 6. 调度相位（R97 抽取）：下一循环间隔 + 功耗采样间隔 + prevRawTemp。
+        // 三条降级早退不进本函数——它们直调 scheduleNext，不碰 setPowerInterval/prevRawTemp（既有语义）。
+        scheduleNextBeat(kind: kind, rawTemp: rawTemp, appliedPercents: appliedPercents,
+                         fanStates: fanStates, onBattery: onBattery,
+                         effectiveMode: effectiveConfig.mode)
+    }
+
+    // MARK: - 单拍阶段抽取（R77 起：把 beat() 里自包含的阶段搬出，见各方法注释）
+
+    /// 采集相位（R97 自 beat() 抽出，R96 方案 A 第 1 轮）：传感器读数 → rawTemp 有效性 →
+    /// 平滑 → 电源/功耗/环境/夜间 → 卡死门/偏低门。产出本拍输入快照（Sample）或故障判定；
+    /// 三条降级路径的落盘 + 调度是编排决策，留在 beat()（本函数不碰 lastStatus、不调
+    /// scheduleNext）。故障的即时安全反应（restoreAutoAll/清 lastWrittenRPM/故障计数与
+    /// 日志）随判定留在本函数——与抽取前的执行顺序逐比特一致。
+    /// 引擎态读写原样保留在本函数：tempFailCount/lastOnBattery/lastPlausibleEnvTemp/
+    /// envCompLogged/stuckDetector/belowAmbientSeconds/belowAmbientFaulted + controller 平滑态。
+    /// 入参 actualInterval/fastApply 语义（kind）来自序章：偏低门计时按秒累计、fast 拍不计时。
+    private func acquireSample(kind: BeatKind, actualInterval: TimeInterval) -> SampleOutcome {
+        // 读温度（完整传感器集合）
+        let sensorReadings = sensors.sensorReadings()
+        let rawTemp = sensorReadings.maxTemp
+
+        if !rawTemp.isFinite || rawTemp <= 1 {
+            tempFailCount += 1
+            if tempFailCount >= 5 {
+                if forcedModeActive {
+                    hooks.log("温度读取连续失败，恢复系统自动调度并进入安全故障状态")
+                    fans.restoreAutoAll()
+                    forcedModeActive = false
+                    lastWrittenRPM.removeAll()
+                }
+            } else {
+                hooks.log("温度读取失败（第 \(tempFailCount) 次），暂不改变当前风扇输出")
+            }
+            return .tempFail
+        }
+        tempFailCount = 0
+
+        // 温度平滑
+        guard let temp = controller.smooth(rawTemp: rawTemp) else {
+            return .badReadHold
+        }
+
+        // 电源与功耗读数
+        let onBattery = hooks.onBattery()
+        let powerWatts = sensors.systemPowerWatts
+        if onBattery != lastOnBattery {
+            if lastOnBattery != nil {
+                hooks.log(onBattery ? "切换到电池供电" : "切换到电源供电")
+            }
+            lastOnBattery = onBattery
+        }
+
+        // v8 环境温度 + 夜间判断（上移到合理性门之前：偏低门需要环境参照）。
+        // 谷值（物理量测）与 override（用户设定）分开取：偏低门参照只用谷值——
+        // override 偏高 13°+ 时会把正常空闲芯片误判失真（审查 P2-2）
+        let valleyEnv = sensors.ambientEstimate(now: hooks.now(), cpu: rawTemp)
+        let envTemp = config.envTempOverride ?? valleyEnv
+        // 读数偏低期 rawTemp 失真会让谷值的"贴近芯片"检查判 nil——保留最近合理谷值给偏低门
+        if let e = valleyEnv { lastPlausibleEnvTemp = e }
+        let hour = Calendar.current.component(.hour, from: hooks.now())
+        let nightActive = hour >= 22 || hour < 8
+        if let env = envTemp, config.envCompensation {
+            let off = FanPipeline.envOffset(envTemp: env, enabled: true)
+            if abs(off) >= 1, !envCompLogged {
+                hooks.log("环境温度补偿: 环境 \(String(format: "%.0f", env))°C → 偏移 \(String(format: "%+.1f", off))°")
+                envCompLogged = true
+            }
+        }
+
+        // v2.8/v3.0 传感器物理一致性门（两类故障模式）：
+        //   卡死门：功耗波动 ≥10W 而热点读数 5 分钟逐位不变——真实传感器必有 LSB 抖动；
+        //   偏低门（v3.0）：芯片（发热源）不可能比环境冷 12°C——实测出现过 cpuDie 8.4° vs
+        //     环境 30.5°；当 max 恰好取到偏低读数时 AI 会误判冰凉停转风扇、92° 兜底失明。
+        // 计时按秒累计/衰减（对称消抖 90s）——按拍计数在 idle 20s 间隔下确认窗会膨胀到
+        // 600s（审查 P1）；fast apply 拍不计时（currentLoopInterval 会虚增，且用户拖动
+        // 滑块期间冻结判定无副作用）。判失真 → 交还系统，读数恢复 90s 后自动接管。
+        let wasStuck = stuckDetector.faulted
+        if stuckDetector.record(rawTemp: rawTemp, powerWatts: powerWatts, now: hooks.now()) {
+            hooks.log("温度传感器疑似卡死: \(String(format: "%.1f", rawTemp))°C 持续 \(Int(StuckSensorDetector.minDuration / 60)) 分钟无任何变化而功耗波动 ≥\(Int(StuckSensorDetector.minPowerSwing))W，交还系统调度")
+        }
+        if wasStuck && !stuckDetector.faulted {
+            hooks.log("温度读数恢复变化，传感器卡死解除，重新接管")
+        }
+        let gateEnv: Double? = (valleyEnv ?? lastPlausibleEnvTemp)
+            .flatMap { $0.isFinite && $0 > 5 ? $0 : nil }
+        if let env = gateEnv, rawTemp < env - 12 {
+            if !kind.isFastApply { belowAmbientSeconds = min(90, belowAmbientSeconds + actualInterval) }
+        } else if !kind.isFastApply {
+            belowAmbientSeconds = max(0, belowAmbientSeconds - actualInterval)
+        }
+        // 双阈值锁存（审查 N1/N2）：≥90s 触发、衰减到 0 才解除。累计钳顶 90 使恢复
+        // 恒为 90s 合理读数（否则恢复延迟 = 故障时长，长故障后"读数已好仍挂故障横幅"）；
+        // 锁存消除边界抖动的逐拍 Md/状态翻转。
+        // 两个数值必须进日志：只写"低于环境"无法归因——是芯片族整族读到坏数，
+        // 还是环境代理本身偏高把正常空闲芯片判成失真，两种情形修法相反（R91 实测两者
+        // 在本机都出现过：cpuDie 8.4° 而 gpuDie 45°，env 26.5°）。
+        if !belowAmbientFaulted, belowAmbientSeconds >= 90 {
+            belowAmbientFaulted = true
+            hooks.log("温度读数低于环境 12°C 持续 90s，判定读数失真，交还系统调度"
+                + "（热点 \(String(format: "%.1f", rawTemp))° / 环境参照 \(gateEnv.map { String(format: "%.1f", $0) } ?? "无")°）")
+        }
+        if belowAmbientFaulted, belowAmbientSeconds <= 0 {
+            belowAmbientFaulted = false
+            hooks.log("温度读数恢复合理区间 90s，偏低失真解除，重新接管（热点 \(String(format: "%.1f", rawTemp))°）")
+        }
+        if stuckDetector.faulted || belowAmbientFaulted {
+            // 两类传感器故障各有各的判据，横幅按实际那一条说话（卡死优先：它更具体）
+            let sensorFaultReason: ControlFaultReason =
+                stuckDetector.faulted ? .sensorImplausible : .sensorBelowAmbient
+            if forcedModeActive {
+                fans.restoreAutoAll()
+                forcedModeActive = false
+                lastWrittenRPM.removeAll()
+            }
+            return .sensorFault(sensorFaultReason)
+        }
+
+        return .ok(Sample(readings: sensorReadings, rawTemp: rawTemp, temp: temp,
+                          onBattery: onBattery, powerWatts: powerWatts,
+                          valleyEnv: valleyEnv, envTemp: envTemp, nightActive: nightActive))
+    }
+
+    /// 调度相位（R97 自 beat() 抽出，R96 方案 A 第 1 轮）：下一拍间隔 + 功耗采样间隔 +
+    /// prevRawTemp 更新。仅正常完拍路径调用——三条降级早退仍直调 scheduleNext：
+    /// 早退不碰 setPowerInterval/prevRawTemp 是既有语义，搬家不改。
+    /// effectiveMode 参数化的原因：effectiveConfig 是 beat() 局部量（boost 过期/passive/
+    /// 校准门可把 mode 语义化为 auto），本函数读不到 config 之外的修正，必须传入。
+    private func scheduleNextBeat(kind: BeatKind, rawTemp: Double, appliedPercents: [Double],
+                                  fanStates: [FanState], onBattery: Bool, effectiveMode: FanMode) {
+        if !kind.isFastApply {
             let nextInterval = computeNextInterval(
                 rawTemp: rawTemp, targetPercents: appliedPercents.isEmpty ? nil : appliedPercents,
                 fanStates: fanStates, onBattery: onBattery)
@@ -1417,7 +1508,7 @@ public final class ControlEngine {
             // #6: 自适应功耗采样间隔（高温/AI 主动控温 → 10s，凉机 → 60s，默认 20s）。
             // AI 空闲交还后（aiIdleActive）风扇归系统调度，分项功耗只喂 AI 前馈，
             // 此期间高频采样纯属浪费电——按非 AI 对待；温度 <55°C 时不分模式一律 60s
-            if rawTemp >= 80 || (effectiveConfig.mode == .ai && !aiIdleActive) {
+            if rawTemp >= 80 || (effectiveMode == .ai && !aiIdleActive) {
                 hooks.setPowerInterval(10)
             } else if rawTemp < 55 {
                 hooks.setPowerInterval(60)
@@ -1436,8 +1527,6 @@ public final class ControlEngine {
         // 强制使用 LOOP_INTERVAL_MIN（1s）。更新后 tempChange 只反映两次循环间的真实变化。
         prevRawTemp = rawTemp
     }
-
-    // MARK: - 单拍阶段抽取（R77 起：把 beat() 里自包含的阶段搬出，见各方法注释）
 
     /// 应用"重置 AI 热经验"请求（App 写 reset-learn.flag → daemon 消费并删除）。
     ///
