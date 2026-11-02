@@ -3100,3 +3100,33 @@ SMCCore 剔 Driver 94.98%（基线 94.95，门槛 94.0）——抽取让被执�
 - **记账**：断言 6153 → **6158 / 155 组**（+5 断言 +2 组，仅此两条债，无夹带）；
   契约门槛双源 6147 → **6152**、组门 145 → **147**（沿用 −6/−8 漂移余量）；
   覆盖率门 95.49%/94.98% 不变；VERSION 不动。
+
+## R98（执行轮，不抬版本）：beat() 拆分第 2 轮——决策相位 computeDecision 抽出
+
+**边界盘点（动手前）**：决策相位产出 14 个量，其中 hysteresisHold/overshootNow 在
+执行/学习相位才赋值（留编排层 var）；envOff/nandTemp/battTemp/aiIdleNow 无下游消费
+（收进函数内部）；quietUntil 消毒必须留编排层——effectiveConfig 是 beat() 局部量且
+decide() 内部另有 quiet 判定，消毒后下传保两路径同源（这是本轮唯一的边界决策）。
+下游对全部决策产物无再赋值（awk 实证）→ 编排层全部降为 let。
+
+**落地形态**：`computeDecision(kind:sample:actualInterval:effectiveConfig:) -> BeatDecision`
+（188 行，14 字段值类型），ControlEngine 私有方法。近纯：输入全入参；写副作用仅限决策
+语义自带的引擎态（aiController 步进/lastAIOutput/lastAIIntent/lastFeedTrust/aiIdleActive/
+三个托底锁存/aiCyclingGuardActive），不碰 lastStatus/调度/落盘。fastApply 分叉
+（aiPercent=lastAIOutput）从 kind 推导，无双轨。
+
+**行数**：beat() 980 → **829**（−151）；computeDecision 188。编排层距 ≤200 仍远，
+剩执行+学习+落盘（第 3 轮）。
+
+**验收（逐项实跑）**：① 断言 **6158/155 逐比特不变**（债后新基线）；② 覆盖率门
+ControlEngine 95.59% / SMCCore 95.00%（再微升，不降）；③ R92 三门 + R93 夹具全绿；
+④ root 门禁 73/0；⑤ 测试零改动。
+
+**变异验证（两次，均有牙）**：
+- 变异 c（编排层接线 quietActive 恒真）→ 影子账本/引擎接线两组 10+ 断言红
+  （影子记录门的 !quietActive 排除被击穿）。还原绿。
+- 变异 d（删 quietUntil 消毒赋值，decide 拿未消毒 horizon）→ TestsOverlay 48h 臂 +
+  v3.6.1 对抗回归臂（400 天静音承诺）两条红。还原绿。git diff 无 MUTATION 残留。
+
+**记账**：行为保持重构——VERSION 不动（4.2.72(168)），断言门槛不动（6152/147）。
+刻意未做：第 3 轮（执行+学习+落盘相位 applyOutputs/recordLearning/persistStatus）。

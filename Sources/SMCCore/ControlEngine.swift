@@ -68,6 +68,27 @@ struct Sample {
     let nightActive: Bool
 }
 
+/// 决策相位产物（R97 方案 A 第 2 轮）：管线决策本体 + AI 管线产物 + 影子四候选 +
+/// 下游相位消费的衍生标量。hysteresisHold/overshootNow 在执行/学习相位才赋值，
+/// 不属于本结构（留编排层 var）；envOff/nandTemp/battTemp/aiIdleNow 无下游消费，
+/// 收在 computeDecision 内部。
+struct BeatDecision {
+    let decision: FanPipeline.Decision
+    let reason: ControlReason   // aiIdle 覆盖后的主因
+    let aiPercent: Double?
+    let aiIntent: AIIntent?
+    let curveTargetPercent: Double?
+    let learnedNow: Double?
+    let shadowModelNow: Double?
+    let shadowTableNow: Double?
+    let shadowModelTarget: Double?
+    let shadowTableTarget: Double?
+    let palmComp: Double
+    let aiTargetEff: Double
+    let quietActive: Bool
+    let guardArmedThisBeat: Bool
+}
+
 public final class ControlEngine {
 
     // MARK: - 环境注入（生产由 main.swift 接线，测试用 Mock/Fake）
@@ -580,182 +601,31 @@ public final class ControlEngine {
         let envTemp = sample.envTemp
         let nightActive = sample.nightActive
 
-        var aiPercent: Double? = nil
-        var aiIntent: AIIntent? = nil
-        var curveTargetPercent: Double? = nil  // 当前温度下用户曲线的期望值（AI 模式展示"曲线基准"）
-        var hysteresisHold = false             // v3.7 决策透镜：本拍写入被迟滞带保持
-        var learnedNow: Double? = nil          // v3.7 透镜：当前温度学习查表值
-        // Phase 1 影子候选：必须在学习块之前冻结（学习块会用本拍 baseTarget 更新
-        // 学习表/热模型；之后才查会让候选被待评样本拟合，MAE 系统性偏小）。
-        // 模型/查表 × 当前/目标四路；当前温度是主判据（与实际输出同一工作点）。
-        var shadowModelNow: Double? = nil
-        var shadowTableNow: Double? = nil
-        var shadowModelTarget: Double? = nil
-        var shadowTableTarget: Double? = nil
-        var guardArmedThisBeat = false         // v3.1 启停抑制本拍武装（战报计数用）
-        var overshootNow: Double? = nil        // v3.2 本拍温度超出 AI 有效目标的量（战报过冲峰值用）
-        // AI 实际控制的"目标温度"（电池+省电时控制器会放宽 +4°）。学习窗口与"压不住"检测
-        // 都必须以它为准，否则会与控制器真实目标错位（电池省电下误判"压不住"/误挡学习）。
-        // v8：环境补偿（夏天放宽/冬天收紧）+ 夜间安静档（+4° 更安静）叠加在用户目标之上
-        // v2.6.2：目标钳位 ≤ failsafeRelease−4（84°）——环境+夜间+电池全叠可把目标推到
-        // 89°C 以上(高于兜底释放线 88°),AI 在 88–92° 区间保持低转速会触发
-        // "低转↔92° 全速↔88° 释放↔低转"的周期性振荡,学习窗口与"压不住"检测也全部失真
-        let envOff = FanPipeline.envOffset(envTemp: envTemp, enabled: config.envCompensation)
-        // v3.3 体感补偿：掌托超阈值（>40°）→ 适度收紧（AI 目标降低、曲线查表右移）。
-        // 掌托数据用本拍已读的传感器读数；无效/低于阈值 → 0（零噪声代价）
-        let palmComp = FanPipeline.palmComp(palmRest: sensorReadings.palmRest,
-                                            enabled: effectiveConfig.palmCompensation)
-        let aiTargetEff = effectiveConfig.mode == .ai
-            ? max(60, min(FanPipeline.failsafeReleaseTemp - 4,
-                  AIController.effectiveTarget(config.aiTargetTemp ?? 76, onBattery: onBattery,
-                                               batterySaver: config.batteryPreset != nil)
-                    + envOff
-                    + (nightActive && config.quietHours ? 4 : 0)
-                    - palmComp))
-            : (config.aiTargetTemp ?? 76)
-        // 静音承诺生效判定（hoist：AI 空闲交还抑制与评测排除共用同一判定）。
+        // 决策相位（R97 第 2 轮抽取）：静音 horizon 消毒留在本层——effectiveConfig 是
+        // 编排层局部量，且 decide() 内部有独立的 quiet 判定：必须先消毒再传入，
+        // 否则引擎判无效而管线仍按原值封顶（两条判定路径必须同源）。
         // v3.6.2（F5）：异常久远的 quietUntil 视为未设置
         let saneQuietUntil = saneHorizon(config.quietUntil, label: "静音承诺")
-        let quietActive = OverlayWindow.quietActive(config: config, now: hooks.now())
-        // 管线 decide() 内部有独立的 quiet 判定——把消毒后的 horizon 下传，
-        // 否则引擎判无效而管线仍按原值封顶（两条判定路径必须同源）
         effectiveConfig.quietUntil = saneQuietUntil
-        if effectiveConfig.mode == .ai {
-            aiController.tuning.targetTemp = aiTargetEff
-            // 曲线插值：AI 的期望转速基准（v9 曲线锚定/种子/前馈共用）。fastConfigApply 也计算，
-            // 保证 UI 能持续展示"曲线基准 vs AI 实际"的协同关系。
-            // 查表温度减 envOff：与曲线模式的实际执行语义一致（曲线模式按 temp-envOff 查表），
-            // 否则夏天 AI 稳态锚定值会高于用户曲线真正会执行的输出，"曲线基准"UI 刻度也失真。
-            // 曲线源用 activeCurve（电池档 > 夜间档 > 基础曲线，与 decide() 的选择链一致）：
-            // 电池省电时目标放宽 +4°（工作点更热），基础曲线在更热温度上期望值反而更高，
-            // 用基础曲线锚定会把 AI 稳态拉向高转速——与省电意图正相反；夜间安静档同理。
-            let anchorCurve = FanPipeline.activeCurve(config: effectiveConfig,
-                                                      onBattery: onBattery, nightActive: nightActive)
-            let curvePct = FanConfig.percent(temp: temp - envOff, curve: anchorCurve)
-            curveTargetPercent = curvePct
-            if fastConfigApply {
-                aiPercent = lastAIOutput
-                aiIntent = lastAIIntent
-            } else {
-                // 学习查表与参数模型互补：模型成熟（≥30 样本）时用其外推预测，
-                // 与查表取较大者（模型能覆盖查表没见过的温度/负载组合）
-                let learnedPct = thermalLearn.percent(for: temp, onBattery: onBattery,
-                                                      powerWatts: powerWatts)
-                learnedNow = learnedPct
-                // R89 L5 元学习：前馈信任门——预测误差证据（errEma）超限时模型预测
-                // 不参与前馈，回退纯查表；证据恢复自动再信任。边沿日志防刷屏。
-                let feedTrustNow = thermalModel.feedforwardTrusted
-                if feedTrustNow != lastFeedTrust {
-                    hooks.log(feedTrustNow
-                        ? "AI: 热模型预测误差回落，前馈恢复参与（模型与查表互补）"
-                        : "AI: 热模型预测误差超限，前馈暂停（回退查表）；持续超限将触发辨识重置")
-                    lastFeedTrust = feedTrustNow
-                }
-                let modelPct = feedTrustNow
-                    ? thermalModel.predictedPercent(for: envTemp ?? 25,
-                                                     power: powerWatts ?? 0,
-                                                     targetTemp: aiTargetEff)
-                    : nil
-                // 影子候选冻结（学习块之前）：模型@当前/目标 + 查表@当前/目标。
-                // 查表用只读入口，不改功耗档滞回；模型用含 0 的反解（need≤0 也是预测）。
-                // 影子**不受上面那道信任门约束**：它是量具不是控制——模型被暂停前馈时
-                // 更要把它的预测误差记下来，那正是判断"该不该重新信任"的证据。
-                if let env = envTemp, let p = powerWatts {
-                    shadowModelNow = thermalModel.predictedPercentIncludingZero(
-                        for: env, power: p, targetTemp: temp)
-                    shadowModelTarget = thermalModel.predictedPercentIncludingZero(
-                        for: env, power: p, targetTemp: aiTargetEff)
-                }
-                shadowTableNow = thermalLearn.percentReadOnly(
-                    for: temp, onBattery: onBattery, powerWatts: powerWatts)
-                shadowTableTarget = thermalLearn.percentReadOnly(
-                    for: aiTargetEff, onBattery: onBattery, powerWatts: powerWatts)
-                let feedPct: Double? = {
-                    switch (learnedPct, modelPct) {
-                    case let (l?, m?): return max(l, m)
-                    case let (l?, nil): return l
-                    case let (nil, m?): return m
-                    case (nil, nil): return nil
-                    }
-                }()
-                let components = hooks.powerComponents()
-                aiPercent = aiController.step(temp: temp,
-                                              learned: feedPct,
-                                              curvePercent: curvePct,
-                                              powerWatts: powerWatts,
-                                              cpuPower: components.cpu,
-                                              gpuPower: components.gpu,
-                                              allowRelease: !quietActive,
-                                              dt: actualInterval)
-                lastAIOutput = aiPercent
-                lastAIIntent = aiController.intent(temp: temp)
-                aiIntent = lastAIIntent
-            }
-        }
-        // v2.9.2/v3.1 启停循环抑制边沿日志（释放后快速被夺回 = 被动平衡高于夺回线）
-        if aiController.cyclingGuardArmed != aiCyclingGuardActive {
-            guardArmedThisBeat = aiController.cyclingGuardArmed
-            aiCyclingGuardActive = aiController.cyclingGuardArmed
-            let gmin = Int(aiController.currentGuardSeconds / 60)
-            let gtext = gmin >= 120 ? "\(gmin / 60) 小时" : "\(gmin) 分钟"
-            hooks.log(aiCyclingGuardActive
-                ? "AI: 检测到停转-启转循环（被动热浸泡平衡高于夺回线），抑制期内保持最低转速稳定运行（\(gtext)后重试交还）"
-                : "AI: 启停循环抑制解除，恢复空闲交还评估")
-        }
-
-        let nandTemp = sensorReadings.ssd ?? 0
-        let battTemp = sensors.batteryTemperature
-        let decision = FanPipeline.decide(config: effectiveConfig, smoothedTemp: temp, rawTemp: rawTemp,
-                                          nandTemp: nandTemp, onBattery: onBattery,
-                                          aiPercent: aiPercent, now: hooks.now(),
-                                          nightActive: nightActive,
-                                          envTemp: envTemp,
-                                          palmComp: palmComp,
-                                          wasSSDGuardActive: ssdGuardActive,
-                                          wasSSDCriticalActive: ssdCriticalActive,
-                                          wasFailsafeActive: failsafeActive,
-                                          battTemp: battTemp,
-                                          wasBatteryGuardActive: batteryGuardActive,
-                                          wasBatteryCriticalActive: batteryCriticalActive)
-
-        var reason = decision.reason
-        // AI 空闲交还判定：AI 模式下 aiPercent 为 nil（AI 主动交还）且没有被托底/兜底覆盖
-        let aiIdleNow = effectiveConfig.mode == .ai && aiPercent == nil && reason == .ai
-        if aiIdleNow { reason = .aiIdle }
-
-        // 边沿日志（状态翻转才打）
-        if aiIdleNow != aiIdleActive {
-            if aiIdleNow {
-                hooks.log("AI: 持续低负载，交还系统调度（风扇有机会降转/停转）")
-            } else {
-                if effectiveConfig.mode == .ai {
-                    hooks.log("AI: 负载回升，重新接管风扇")
-                }
-            }
-            aiIdleActive = aiIdleNow
-        }
-
-        if decision.ssdGuard != ssdGuardActive {
-            ssdGuardActive = decision.ssdGuard
-            hooks.log(ssdGuardActive
-                ? "SSD 高温托底触发: NAND \(String(format: "%.1f", nandTemp))°C"
-                : "SSD 温度回落: NAND \(String(format: "%.1f", nandTemp))°C")
-        }
-        ssdCriticalActive = decision.ssdCriticalActive
-        if decision.batteryGuard != batteryGuardActive {
-            batteryGuardActive = decision.batteryGuard
-            hooks.log(batteryGuardActive
-                ? "电池高温托底触发: \(String(format: "%.1f", battTemp))°C"
-                : "电池温度回落: \(String(format: "%.1f", battTemp))°C")
-        }
-        batteryCriticalActive = decision.batteryCriticalActive
-        if decision.failsafeActive != failsafeActive {
-            failsafeActive = decision.failsafeActive
-            hooks.log(failsafeActive
-                ? "高温兜底触发: \(String(format: "%.1f", rawTemp))°C ≥ \(Int(FanPipeline.failsafeTemp))°C，全速运行"
-                : "高温兜底解除: \(String(format: "%.1f", rawTemp))°C")
-        }
-
+        let dec = computeDecision(kind: kind, sample: sample, actualInterval: actualInterval,
+                                  effectiveConfig: effectiveConfig)
+        // 决策快照展开为本拍沿用局部量（下游执行/学习/落盘相位零改动）
+        let decision = dec.decision
+        let reason = dec.reason
+        let aiPercent = dec.aiPercent
+        let aiIntent = dec.aiIntent
+        let curveTargetPercent = dec.curveTargetPercent  // 当前温度下用户曲线的期望值（AI 模式展示"曲线基准"）
+        let learnedNow = dec.learnedNow                  // v3.7 透镜：当前温度学习查表值
+        let shadowModelNow = dec.shadowModelNow
+        let shadowTableNow = dec.shadowTableNow
+        let shadowModelTarget = dec.shadowModelTarget
+        let shadowTableTarget = dec.shadowTableTarget
+        let palmComp = dec.palmComp
+        let aiTargetEff = dec.aiTargetEff
+        let quietActive = dec.quietActive
+        let guardArmedThisBeat = dec.guardArmedThisBeat  // v3.1 启停抑制本拍武装（战报计数用）
+        var hysteresisHold = false             // v3.7 决策透镜：本拍写入被迟滞带保持（执行相位赋值）
+        var overshootNow: Double? = nil        // v3.2 本拍温度超出 AI 有效目标的量（战报过冲峰值用，学习相位赋值）
         let targetPercent = decision.targetPercent
 
         // 一次性读取所有风扇状态
@@ -1491,6 +1361,203 @@ public final class ControlEngine {
         return .ok(Sample(readings: sensorReadings, rawTemp: rawTemp, temp: temp,
                           onBattery: onBattery, powerWatts: powerWatts,
                           valleyEnv: valleyEnv, envTemp: envTemp, nightActive: nightActive))
+    }
+
+    /// 决策相位（R97 自 beat() 抽出，R96 方案 A 第 2 轮）：目标叠加（环境/夜间/电池/体感）
+    /// → AI 管线（曲线锚定/学习查表 + 模型前馈信任门/影子候选冻结/step）→ FanPipeline.decide
+    /// → aiIdle 主因覆盖与托底边沿锁存。近纯：输入全在入参（kind/Sample/actualInterval/
+    /// effectiveConfig 值传递），引擎只读状态直读 self；写副作用仅限决策语义自带的引擎态
+    /// （aiController 步进与 tuning.targetTemp/lastAIOutput/lastAIIntent/lastFeedTrust/
+    /// aiIdleActive/ssd·battery·failsafe 锁存/aiCyclingGuardActive）——不碰 lastStatus/
+    /// 调度/落盘。调用前编排层必须已把消毒后的 quietUntil 写进 effectiveConfig
+    /// （decide 内部另有 quiet 判定，两条路径同源）。
+    private func computeDecision(kind: BeatKind, sample: Sample, actualInterval: TimeInterval,
+                                 effectiveConfig: FanConfig) -> BeatDecision {
+        let temp = sample.temp
+        let rawTemp = sample.rawTemp
+        let onBattery = sample.onBattery
+        let powerWatts = sample.powerWatts
+        let envTemp = sample.envTemp
+        let nightActive = sample.nightActive
+        let sensorReadings = sample.readings
+
+        var aiPercent: Double? = nil
+        var aiIntent: AIIntent? = nil
+        var curveTargetPercent: Double? = nil
+        var learnedNow: Double? = nil
+        // Phase 1 影子候选：必须在学习块之前冻结（学习块会用本拍 baseTarget 更新
+        // 学习表/热模型；之后才查会让候选被待评样本拟合，MAE 系统性偏小）。
+        // 模型/查表 × 当前/目标四路；当前温度是主判据（与实际输出同一工作点）。
+        var shadowModelNow: Double? = nil
+        var shadowTableNow: Double? = nil
+        var shadowModelTarget: Double? = nil
+        var shadowTableTarget: Double? = nil
+        var guardArmedThisBeat = false
+        // AI 实际控制的"目标温度"（电池+省电时控制器会放宽 +4°）。学习窗口与"压不住"检测
+        // 都必须以它为准，否则会与控制器真实目标错位（电池省电下误判"压不住"/误挡学习）。
+        // v8：环境补偿（夏天放宽/冬天收紧）+ 夜间安静档（+4° 更安静）叠加在用户目标之上
+        // v2.6.2：目标钳位 ≤ failsafeRelease−4（84°）——环境+夜间+电池全叠可把目标推到
+        // 89°C 以上(高于兜底释放线 88°),AI 在 88–92° 区间保持低转速会触发
+        // "低转↔92° 全速↔88° 释放↔低转"的周期性振荡,学习窗口与"压不住"检测也全部失真
+        let envOff = FanPipeline.envOffset(envTemp: envTemp, enabled: config.envCompensation)
+        // v3.3 体感补偿：掌托超阈值（>40°）→ 适度收紧（AI 目标降低、曲线查表右移）。
+        // 掌托数据用本拍已读的传感器读数；无效/低于阈值 → 0（零噪声代价）
+        let palmComp = FanPipeline.palmComp(palmRest: sensorReadings.palmRest,
+                                            enabled: effectiveConfig.palmCompensation)
+        let aiTargetEff = effectiveConfig.mode == .ai
+            ? max(60, min(FanPipeline.failsafeReleaseTemp - 4,
+                  AIController.effectiveTarget(config.aiTargetTemp ?? 76, onBattery: onBattery,
+                                               batterySaver: config.batteryPreset != nil)
+                    + envOff
+                    + (nightActive && config.quietHours ? 4 : 0)
+                    - palmComp))
+            : (config.aiTargetTemp ?? 76)
+        // 静音承诺生效判定（hoist：AI 空闲交还抑制与评测排除共用同一判定；
+        // quietUntil 的消毒由编排层在调用前完成，见 beat() 决策相位注释）
+        let quietActive = OverlayWindow.quietActive(config: config, now: hooks.now())
+        if effectiveConfig.mode == .ai {
+            aiController.tuning.targetTemp = aiTargetEff
+            // 曲线插值：AI 的期望转速基准（v9 曲线锚定/种子/前馈共用）。fastConfigApply 也计算，
+            // 保证 UI 能持续展示"曲线基准 vs AI 实际"的协同关系。
+            // 查表温度减 envOff：与曲线模式的实际执行语义一致（曲线模式按 temp-envOff 查表），
+            // 否则夏天 AI 稳态锚定值会高于用户曲线真正会执行的输出，"曲线基准"UI 刻度也失真。
+            // 曲线源用 activeCurve（电池档 > 夜间档 > 基础曲线，与 decide() 的选择链一致）：
+            // 电池省电时目标放宽 +4°（工作点更热），基础曲线在更热温度上期望值反而更高，
+            // 用基础曲线锚定会把 AI 稳态拉向高转速——与省电意图正相反；夜间安静档同理。
+            let anchorCurve = FanPipeline.activeCurve(config: effectiveConfig,
+                                                      onBattery: onBattery, nightActive: nightActive)
+            let curvePct = FanConfig.percent(temp: temp - envOff, curve: anchorCurve)
+            curveTargetPercent = curvePct
+            if kind.isFastApply {
+                aiPercent = lastAIOutput
+                aiIntent = lastAIIntent
+            } else {
+                // 学习查表与参数模型互补：模型成熟（≥30 样本）时用其外推预测，
+                // 与查表取较大者（模型能覆盖查表没见过的温度/负载组合）
+                let learnedPct = thermalLearn.percent(for: temp, onBattery: onBattery,
+                                                      powerWatts: powerWatts)
+                learnedNow = learnedPct
+                // R89 L5 元学习：前馈信任门——预测误差证据（errEma）超限时模型预测
+                // 不参与前馈，回退纯查表；证据恢复自动再信任。边沿日志防刷屏。
+                let feedTrustNow = thermalModel.feedforwardTrusted
+                if feedTrustNow != lastFeedTrust {
+                    hooks.log(feedTrustNow
+                        ? "AI: 热模型预测误差回落，前馈恢复参与（模型与查表互补）"
+                        : "AI: 热模型预测误差超限，前馈暂停（回退查表）；持续超限将触发辨识重置")
+                    lastFeedTrust = feedTrustNow
+                }
+                let modelPct = feedTrustNow
+                    ? thermalModel.predictedPercent(for: envTemp ?? 25,
+                                                     power: powerWatts ?? 0,
+                                                     targetTemp: aiTargetEff)
+                    : nil
+                // 影子候选冻结（学习块之前）：模型@当前/目标 + 查表@当前/目标。
+                // 查表用只读入口，不改功耗档滞回；模型用含 0 的反解（need≤0 也是预测）。
+                // 影子**不受上面那道信任门约束**：它是量具不是控制——模型被暂停前馈时
+                // 更要把它的预测误差记下来，那正是判断"该不该重新信任"的证据。
+                if let env = envTemp, let p = powerWatts {
+                    shadowModelNow = thermalModel.predictedPercentIncludingZero(
+                        for: env, power: p, targetTemp: temp)
+                    shadowModelTarget = thermalModel.predictedPercentIncludingZero(
+                        for: env, power: p, targetTemp: aiTargetEff)
+                }
+                shadowTableNow = thermalLearn.percentReadOnly(
+                    for: temp, onBattery: onBattery, powerWatts: powerWatts)
+                shadowTableTarget = thermalLearn.percentReadOnly(
+                    for: aiTargetEff, onBattery: onBattery, powerWatts: powerWatts)
+                let feedPct: Double? = {
+                    switch (learnedPct, modelPct) {
+                    case let (l?, m?): return max(l, m)
+                    case let (l?, nil): return l
+                    case let (nil, m?): return m
+                    case (nil, nil): return nil
+                    }
+                }()
+                let components = hooks.powerComponents()
+                aiPercent = aiController.step(temp: temp,
+                                              learned: feedPct,
+                                              curvePercent: curvePct,
+                                              powerWatts: powerWatts,
+                                              cpuPower: components.cpu,
+                                              gpuPower: components.gpu,
+                                              allowRelease: !quietActive,
+                                              dt: actualInterval)
+                lastAIOutput = aiPercent
+                lastAIIntent = aiController.intent(temp: temp)
+                aiIntent = lastAIIntent
+            }
+        }
+        // v2.9.2/v3.1 启停循环抑制边沿日志（释放后快速被夺回 = 被动平衡高于夺回线）
+        if aiController.cyclingGuardArmed != aiCyclingGuardActive {
+            guardArmedThisBeat = aiController.cyclingGuardArmed
+            aiCyclingGuardActive = aiController.cyclingGuardArmed
+            let gmin = Int(aiController.currentGuardSeconds / 60)
+            let gtext = gmin >= 120 ? "\(gmin / 60) 小时" : "\(gmin) 分钟"
+            hooks.log(aiCyclingGuardActive
+                ? "AI: 检测到停转-启转循环（被动热浸泡平衡高于夺回线），抑制期内保持最低转速稳定运行（\(gtext)后重试交还）"
+                : "AI: 启停循环抑制解除，恢复空闲交还评估")
+        }
+
+        let nandTemp = sensorReadings.ssd ?? 0
+        let battTemp = sensors.batteryTemperature
+        let decision = FanPipeline.decide(config: effectiveConfig, smoothedTemp: temp, rawTemp: rawTemp,
+                                          nandTemp: nandTemp, onBattery: onBattery,
+                                          aiPercent: aiPercent, now: hooks.now(),
+                                          nightActive: nightActive,
+                                          envTemp: envTemp,
+                                          palmComp: palmComp,
+                                          wasSSDGuardActive: ssdGuardActive,
+                                          wasSSDCriticalActive: ssdCriticalActive,
+                                          wasFailsafeActive: failsafeActive,
+                                          battTemp: battTemp,
+                                          wasBatteryGuardActive: batteryGuardActive,
+                                          wasBatteryCriticalActive: batteryCriticalActive)
+
+        var reason = decision.reason
+        // AI 空闲交还判定：AI 模式下 aiPercent 为 nil（AI 主动交还）且没有被托底/兜底覆盖
+        let aiIdleNow = effectiveConfig.mode == .ai && aiPercent == nil && reason == .ai
+        if aiIdleNow { reason = .aiIdle }
+
+        // 边沿日志（状态翻转才打）
+        if aiIdleNow != aiIdleActive {
+            if aiIdleNow {
+                hooks.log("AI: 持续低负载，交还系统调度（风扇有机会降转/停转）")
+            } else {
+                if effectiveConfig.mode == .ai {
+                    hooks.log("AI: 负载回升，重新接管风扇")
+                }
+            }
+            aiIdleActive = aiIdleNow
+        }
+
+        if decision.ssdGuard != ssdGuardActive {
+            ssdGuardActive = decision.ssdGuard
+            hooks.log(ssdGuardActive
+                ? "SSD 高温托底触发: NAND \(String(format: "%.1f", nandTemp))°C"
+                : "SSD 温度回落: NAND \(String(format: "%.1f", nandTemp))°C")
+        }
+        ssdCriticalActive = decision.ssdCriticalActive
+        if decision.batteryGuard != batteryGuardActive {
+            batteryGuardActive = decision.batteryGuard
+            hooks.log(batteryGuardActive
+                ? "电池高温托底触发: \(String(format: "%.1f", battTemp))°C"
+                : "电池温度回落: \(String(format: "%.1f", battTemp))°C")
+        }
+        batteryCriticalActive = decision.batteryCriticalActive
+        if decision.failsafeActive != failsafeActive {
+            failsafeActive = decision.failsafeActive
+            hooks.log(failsafeActive
+                ? "高温兜底触发: \(String(format: "%.1f", rawTemp))°C ≥ \(Int(FanPipeline.failsafeTemp))°C，全速运行"
+                : "高温兜底解除: \(String(format: "%.1f", rawTemp))°C")
+        }
+
+        return BeatDecision(decision: decision, reason: reason,
+                            aiPercent: aiPercent, aiIntent: aiIntent,
+                            curveTargetPercent: curveTargetPercent, learnedNow: learnedNow,
+                            shadowModelNow: shadowModelNow, shadowTableNow: shadowTableNow,
+                            shadowModelTarget: shadowModelTarget, shadowTableTarget: shadowTableTarget,
+                            palmComp: palmComp, aiTargetEff: aiTargetEff,
+                            quietActive: quietActive, guardArmedThisBeat: guardArmedThisBeat)
     }
 
     /// 调度相位（R97 自 beat() 抽出，R96 方案 A 第 1 轮）：下一拍间隔 + 功耗采样间隔 +
