@@ -89,6 +89,16 @@ struct BeatDecision {
     let guardArmedThisBeat: Bool
 }
 
+/// 执行相位·写产物（R99 方案 A 第 3a 轮）：写循环/故障试探/交还子分支的局部量回传。
+/// writtenRPM 仅供统计相位拼 FanStatusEntry；appliedPercent(s) 会被交还子分支清零，
+/// 故出入都必须过函数；appliedWriteSucceeded 是影子采样门（只认"真写下去"的拍）。
+struct FanWriteResult {
+    let writtenRPM: [Int: Double]
+    let appliedPercent: Double
+    let appliedPercents: [Double]
+    let appliedWriteSucceeded: Bool
+}
+
 public final class ControlEngine {
 
     // MARK: - 环境注入（生产由 main.swift 接线，测试用 Mock/Fake）
@@ -889,101 +899,14 @@ public final class ControlEngine {
                 aiHighEffortState = false
             }
 
-            // 闭环故障（SMC 写入连续失败 / 风扇实际转速持续不跟随）：
-            // 交还系统调度并保持——此前 faulted 后下一拍 mustReassert 立即重新写回，
-            // 形成"交还→夺回"每 ~6 拍一轮的振荡（restoreAutoAll 清空 lastWrittenRPM 后
-            // 反馈检查单拍即清零 fault），Md 翻转还会打断 EC 的升速斜坡自我延长。
-            // v2.6.2 试探协议（写-验证-交还，30s 时间基准）：
-            //   1. 试探拍：写入目标（SMC 保持强制模式）→ 验证期 3 拍让风扇物理爬升，
-            //      feedbackHealth.record 用 lastWrittenRPM 检查跟随；
-            //   2. 验证期结束仍 faulted → 交还系统；解除走 FanFeedbackHealth 自解
-            //      （交还/匹配计拍），阈值随 faultStreak 退避 3→48（R24，非锁存）；
-            //   3. 30s 后再试探。试探间隔本身不退避（控制律回退后保持 72 状态）。
-            // 此前 probe 后不交还，SMC 被钉在过期强制 RPM 上（status 却报"已交还"），
-            // 且周期按拍数（idle 20s/拍时 6 分钟才探一次）。
-            let controlBlocked = writeHealth.faulted || feedbackHealth.faulted
-            // 影子账本的"实际"必须是真写下去的值：全风扇读失败/本拍写失败/故障试探期
-            // 都不算。writeHealth 的 fault 要连续失败才置位（单拍失败不 fault），
-            // 故这里用本拍局部结果，而不是只看 faulted。
-            var appliedWriteSucceeded = false
-            if controlBlocked {
-                let probeDue = hooks.now().timeIntervalSince(lastProbeTime) >= 30
-                if probeDue, probeVerifyLoops <= 0 {
-                    lastProbeTime = hooks.now()
-                    var probeOK = !fanStates.isEmpty
-                    for (i, st) in fanStates.enumerated() {
-                        do {
-                            let pct = i < percents.count ? percents[i] : shapedBase
-                            let rpm = fans.rpm(forPercent: pct, state: st)
-                            try fans.setForcedRPM(state: st, rpm: rpm)
-                            lastWrittenRPM[st.id] = rpm
-                        } catch {
-                            probeOK = false
-                            hooks.log("故障试探写入失败: \(error)")
-                        }
-                    }
-                    writeHealth.record(loopSuccess: probeOK)
-                    if probeOK {
-                        // 设 4：本拍末尾 -=1 后剩 3，保证注释承诺的完整 3 拍严格验证窗
-                        probeVerifyLoops = 4
-                        // R27（L3-F6）：试探写入即进入强制模式语义——验证失败交还时
-                        // 才能无条件 restoreAutoAll，避免「仅启动期故障、此前无正常写」
-                        // 时 SMC 残留强制 RPM。
-                        forcedModeActive = true
-                        hooks.log("故障试探写入成功，进入跟随验证（3 拍）…")
-                    }
-                }
-                if probeVerifyLoops > 0 {
-                    // 验证期拍：不重写、不交还，feedbackHealth.record（拍首已调用）
-                    // 用 lastWrittenRPM 检查风扇是否跟随；3 拍后仍 faulted → 下拍交还
-                    probeVerifyLoops -= 1
-                } else {
-                    if forcedModeActive {
-                        fans.restoreAutoAll()
-                        forcedModeActive = false
-                        lastWrittenRPM.removeAll()
-                        hooks.log(feedbackHealth.faulted
-                            ? "风扇实际 RPM 持续未跟随目标，调速闭环失效，已交还系统调度"
-                            : "风扇写入连续失败，调速闭环失效，已交还系统调度")
-                    }
-                    appliedPercent = 0
-                    appliedPercents = []
-                }
-            } else {
-                let mustReassert = !forcedModeActive || loopCount % REASSERT_LOOPS == 0
-                var loopWriteFailed = false
-                // fanStates 为空但 targetPercent 非 nil 时，说明 SMC 读取全部失败（风扇状态严格读取
-                // 后失败风扇被跳过）或风扇键缺失，不能当作"写入成功"——
-                // 否则 writeHealth 永远不会 fault，形成静默故障。
-                if fanStates.isEmpty {
-                    loopWriteFailed = true
-                    hooks.log("风扇状态读取全部失败（\(fans.fanCount) 个风扇），记为写入失败")
-                }
-                for (i, st) in fanStates.enumerated() {
-                    do {
-                        let pct = i < percents.count ? percents[i] : shapedBase
-                        let rpm = fans.rpm(forPercent: pct, state: st)
-                        let lastRPM = lastWrittenRPM[st.id] ?? -1e9
-                        if mustReassert || abs(lastRPM - rpm) > RPM_DEADBAND {
-                            try fans.setForcedRPM(state: st, rpm: rpm)
-                            lastWrittenRPM[st.id] = rpm
-                        }
-                        writtenRPM[st.id] = lastWrittenRPM[st.id]
-                    } catch {
-                        loopWriteFailed = true
-                        hooks.log("风扇 \(st.id) 写入失败: \(error)")
-                    }
-                }
-                // 执行链可观测性：连续写失败超阈值 → 闭环已失效，交还系统并上报，
-                // 避免 daemon"以为在控制"而风扇实际无人管的静默故障
-                writeHealth.record(loopSuccess: !loopWriteFailed)
-                forcedModeActive = true
-                appliedWriteSucceeded = !loopWriteFailed && !fanStates.isEmpty
-                // v3.6.1：恢复正常写路径时清掉残留的验证计数——故障在验证期内自愈
-                //（controlBlocked 转 false）时计数器无人复位，会残留 1-2 拍，
-                // 下次故障期先空耗拍数做"伪验证"再走交还分支
-                probeVerifyLoops = 0
-            }
+            // 执行相位·写核心（R99 第 3a 轮抽出）：闭环故障试探协议 + 正常写循环。
+            // 交还子分支会把 appliedPercent(s) 清零，故出入都过 FanWriteResult。
+            let w = applyWrites(fanStates: fanStates, percents: percents, shapedBase: shapedBase,
+                                appliedPercent: appliedPercent, appliedPercents: appliedPercents)
+            writtenRPM = w.writtenRPM
+            appliedPercent = w.appliedPercent
+            appliedPercents = w.appliedPercents
+            let appliedWriteSucceeded = w.appliedWriteSucceeded
 
             // 第一性原理 Phase 1：影子前馈采样。只读——不参与决策、不写硬件。
             // 放在写扇之后：只有"真写下去了"的拍才算实际输出（全风扇读失败/写失败/
@@ -1055,26 +978,8 @@ public final class ControlEngine {
                 overshootNow = max(0, temp - aiTargetEff)
             }
         } else {
-            // auto / AI 空闲交还：只在状态切换时恢复一次
-            if forcedModeActive {
-                fans.restoreAutoAll()
-                forcedModeActive = false
-                lastWrittenRPM.removeAll()
-                controller.clearOutput()
-                if reason != .aiIdle {
-                    hooks.log("切换到系统自动调度")
-                }
-            }
-            // 不在 AI 主动调速时，清除"目标压不住"状态（避免切出 AI 后残留 stale 标志）
-            if targetUnreachableLogged {
-                targetUnreachable = false
-                targetUnreachableLogged = false
-            }
-            targetUnreachableSince = nil
-            // R77：全力散热同处清除——它是同一条路径上的弱信号，AI 交还期间不成立；
-            // 漏掉这里会让退出 AI 主动调速后黄提示一直挂在面板上
-            aiHighEffortState = false
-            aiHighEffortSince = nil
+            // auto / AI 空闲交还（R99 第 3a 轮抽出）：恢复系统调度 + 清压不住/全力散热残留
+            handbackToSystem(reason: reason)
         }
 
         // 4. 每日统计累计（用实际循环间隔，自适应后不再固定 3s）
@@ -1558,6 +1463,142 @@ public final class ControlEngine {
                             shadowModelTarget: shadowModelTarget, shadowTableTarget: shadowTableTarget,
                             palmComp: palmComp, aiTargetEff: aiTargetEff,
                             quietActive: quietActive, guardArmedThisBeat: guardArmedThisBeat)
+    }
+
+    /// 执行相位·写核心（R99 自 beat() 抽出，R96 方案 A 第 3a 轮）：闭环故障试探协议
+    ///（写-验证-交还，30s 时间基准）+ 正常写循环（死区/定期重写）。只搬"真正下发转速"
+    /// 的部分——shape/slew 成形与偏移计算留编排层（热经验学习块夹在成形与写入之间，
+    /// 顺序不可动）。本段无 fastConfigApply 引用，故不需要 kind。
+    /// 引擎态读写原样保留：writeHealth/feedbackHealth/lastProbeTime/probeVerifyLoops/
+    /// forcedModeActive/lastWrittenRPM/loopCount。不碰 lastStatus/调度/落盘。
+    private func applyWrites(fanStates: [FanState], percents: [Double], shapedBase: Double,
+                             appliedPercent: Double, appliedPercents: [Double]) -> FanWriteResult {
+        // 闭环故障（SMC 写入连续失败 / 风扇实际转速持续不跟随）：
+        // 交还系统调度并保持——此前 faulted 后下一拍 mustReassert 立即重新写回，
+        // 形成"交还→夺回"每 ~6 拍一轮的振荡（restoreAutoAll 清空 lastWrittenRPM 后
+        // 反馈检查单拍即清零 fault），Md 翻转还会打断 EC 的升速斜坡自我延长。
+        // v2.6.2 试探协议（写-验证-交还，30s 时间基准）：
+        //   1. 试探拍：写入目标（SMC 保持强制模式）→ 验证期 3 拍让风扇物理爬升，
+        //      feedbackHealth.record 用 lastWrittenRPM 检查跟随；
+        //   2. 验证期结束仍 faulted → 交还系统；解除走 FanFeedbackHealth 自解
+        //      （交还/匹配计拍），阈值随 faultStreak 退避 3→48（R24，非锁存）；
+        //   3. 30s 后再试探。试探间隔本身不退避（控制律回退后保持 72 状态）。
+        // 此前 probe 后不交还，SMC 被钉在过期强制 RPM 上（status 却报"已交还"），
+        // 且周期按拍数（idle 20s/拍时 6 分钟才探一次）。
+        let controlBlocked = writeHealth.faulted || feedbackHealth.faulted
+        // 影子账本的"实际"必须是真写下去的值：全风扇读失败/本拍写失败/故障试探期
+        // 都不算。writeHealth 的 fault 要连续失败才置位（单拍失败不 fault），
+        // 故这里用本拍局部结果，而不是只看 faulted。
+        var appliedWriteSucceeded = false
+        var writtenRPM: [Int: Double] = [:]
+        var outPercent = appliedPercent
+        var outPercents = appliedPercents
+        if controlBlocked {
+            let probeDue = hooks.now().timeIntervalSince(lastProbeTime) >= 30
+            if probeDue, probeVerifyLoops <= 0 {
+                lastProbeTime = hooks.now()
+                var probeOK = !fanStates.isEmpty
+                for (i, st) in fanStates.enumerated() {
+                    do {
+                        let pct = i < percents.count ? percents[i] : shapedBase
+                        let rpm = fans.rpm(forPercent: pct, state: st)
+                        try fans.setForcedRPM(state: st, rpm: rpm)
+                        lastWrittenRPM[st.id] = rpm
+                    } catch {
+                        probeOK = false
+                        hooks.log("故障试探写入失败: \(error)")
+                    }
+                }
+                writeHealth.record(loopSuccess: probeOK)
+                if probeOK {
+                    // 设 4：本拍末尾 -=1 后剩 3，保证注释承诺的完整 3 拍严格验证窗
+                    probeVerifyLoops = 4
+                    // R27（L3-F6）：试探写入即进入强制模式语义——验证失败交还时
+                    // 才能无条件 restoreAutoAll，避免「仅启动期故障、此前无正常写」
+                    // 时 SMC 残留强制 RPM。
+                    forcedModeActive = true
+                    hooks.log("故障试探写入成功，进入跟随验证（3 拍）…")
+                }
+            }
+            if probeVerifyLoops > 0 {
+                // 验证期拍：不重写、不交还，feedbackHealth.record（拍首已调用）
+                // 用 lastWrittenRPM 检查风扇是否跟随；3 拍后仍 faulted → 下拍交还
+                probeVerifyLoops -= 1
+            } else {
+                if forcedModeActive {
+                    fans.restoreAutoAll()
+                    forcedModeActive = false
+                    lastWrittenRPM.removeAll()
+                    hooks.log(feedbackHealth.faulted
+                        ? "风扇实际 RPM 持续未跟随目标，调速闭环失效，已交还系统调度"
+                        : "风扇写入连续失败，调速闭环失效，已交还系统调度")
+                }
+                outPercent = 0
+                outPercents = []
+            }
+        } else {
+            let mustReassert = !forcedModeActive || loopCount % REASSERT_LOOPS == 0
+            var loopWriteFailed = false
+            // fanStates 为空但 targetPercent 非 nil 时，说明 SMC 读取全部失败（风扇状态严格读取
+            // 后失败风扇被跳过）或风扇键缺失，不能当作"写入成功"——
+            // 否则 writeHealth 永远不会 fault，形成静默故障。
+            if fanStates.isEmpty {
+                loopWriteFailed = true
+                hooks.log("风扇状态读取全部失败（\(fans.fanCount) 个风扇），记为写入失败")
+            }
+            for (i, st) in fanStates.enumerated() {
+                do {
+                    let pct = i < percents.count ? percents[i] : shapedBase
+                    let rpm = fans.rpm(forPercent: pct, state: st)
+                    let lastRPM = lastWrittenRPM[st.id] ?? -1e9
+                    if mustReassert || abs(lastRPM - rpm) > RPM_DEADBAND {
+                        try fans.setForcedRPM(state: st, rpm: rpm)
+                        lastWrittenRPM[st.id] = rpm
+                    }
+                    writtenRPM[st.id] = lastWrittenRPM[st.id]
+                } catch {
+                    loopWriteFailed = true
+                    hooks.log("风扇 \(st.id) 写入失败: \(error)")
+                }
+            }
+            // 执行链可观测性：连续写失败超阈值 → 闭环已失效，交还系统并上报，
+            // 避免 daemon"以为在控制"而风扇实际无人管的静默故障
+            writeHealth.record(loopSuccess: !loopWriteFailed)
+            forcedModeActive = true
+            appliedWriteSucceeded = !loopWriteFailed && !fanStates.isEmpty
+            // v3.6.1：恢复正常写路径时清掉残留的验证计数——故障在验证期内自愈
+            //（controlBlocked 转 false）时计数器无人复位，会残留 1-2 拍，
+            // 下次故障期先空耗拍数做"伪验证"再走交还分支
+            probeVerifyLoops = 0
+        }
+        return FanWriteResult(writtenRPM: writtenRPM, appliedPercent: outPercent,
+                              appliedPercents: outPercents,
+                              appliedWriteSucceeded: appliedWriteSucceeded)
+    }
+
+    /// 执行相位·系统交还（R99 自 beat() 抽出）：targetPercent == nil（auto / AI 空闲
+    /// 交还）时的复位——只在状态切换时恢复一次；压不住/全力散热标志同处清除
+    ///（退出 AI 主动调速后黄提示不得挂留）。
+    private func handbackToSystem(reason: ControlReason) {
+        if forcedModeActive {
+            fans.restoreAutoAll()
+            forcedModeActive = false
+            lastWrittenRPM.removeAll()
+            controller.clearOutput()
+            if reason != .aiIdle {
+                hooks.log("切换到系统自动调度")
+            }
+        }
+        // 不在 AI 主动调速时，清除"目标压不住"状态（避免切出 AI 后残留 stale 标志）
+        if targetUnreachableLogged {
+            targetUnreachable = false
+            targetUnreachableLogged = false
+        }
+        targetUnreachableSince = nil
+        // R77：全力散热同处清除——它是同一条路径上的弱信号，AI 交还期间不成立；
+        // 漏掉这里会让退出 AI 主动调速后黄提示一直挂在面板上
+        aiHighEffortState = false
+        aiHighEffortSince = nil
     }
 
     /// 调度相位（R97 自 beat() 抽出，R96 方案 A 第 1 轮）：下一拍间隔 + 功耗采样间隔 +

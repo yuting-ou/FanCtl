@@ -3130,3 +3130,25 @@ ControlEngine 95.59% / SMCCore 95.00%（再微升，不降）；③ R92 三门 +
 
 **记账**：行为保持重构——VERSION 不动（4.2.72(168)），断言门槛不动（6152/147）。
 刻意未做：第 3 轮（执行+学习+落盘相位 applyOutputs/recordLearning/persistStatus）。
+
+## R99-3a（执行轮，不抬版本）：执行相位写核心 + 系统交还抽出
+
+**边界盘点（关键发现）**：执行与学习在 `if let baseTarget` 块内**交错**（输出成形 →
+影子 prev 冻结 → 热经验学习 → 压不住检测 → 写循环 → 影子采样 → 评测账本），不是
+两个连续相位。故第 3 轮改为「原调用点替换」：3a 只抽真正下发转速/交还的部分——
+`applyWrites`（试探协议 + 正常写循环，104 行）与 `handbackToSystem`（else 交还分支，
+21 行）。shape/slew 成形留编排层（学习块夹在它与写入之间），hysteresisHold 因此在
+编排层赋值、无跨函数回传问题。FanWriteResult 回传 writtenRPM/appliedPercent(s)/
+appliedWriteSucceeded（交还子分支清零后两个，出入必须过函数）。
+
+**行数**：beat() 829 → **724**（−105）。
+
+**验收**：断言 6158/155 逐比特不变；覆盖率 95.64%/95.04%（不降）；R92 三门 +
+R93 夹具绿；root 门禁 73/0；测试零改动。
+
+**变异验证（两次跑不红，判定 = 缺观测点而非边界错误，债③④另立 commit 补）**：
+- 3a-1（删 probeVerifyLoops=0 复位）：全绿。v3.6.1 修复（验证期自愈后计数器复位）
+  当年无回归测试；现有试探测试只覆盖「验证失败→交还」第一轮。
+- 3a-2（appliedPercent 接线改 shapedBase，交还清零丢失）：全绿。交还后
+  status.appliedPercent=0 的防矛盾语义有注释无断言。
+两条均为试探/交还路径的历史观测缺口，与本次抽取正确性无关（抽取逐字搬移）。
