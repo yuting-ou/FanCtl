@@ -3082,3 +3082,21 @@ SMCCore 剔 Driver 94.98%（基线 94.95，门槛 94.0）——抽取让被执�
 **记账**：行为保持重构——VERSION 不动（4.2.72(168)），断言门槛不动，RELEASE-NOTES
 无用户可见变化不新增。刻意未做：第 2 轮（决策相位 computeDecision）与第 3 轮
 （执行+学习+落盘），及上两条测试债的补充断言。
+
+### R97 续（测试债偿还，独立提交）：两条跑不红边界补断言并变异复验
+
+用户裁定不接受只挂账：趁决策相位未拆，补债成本最低（拆完后要反推断言落点）。
+- **债①** `testBadReadHoldKeepsCurrentInterval`：60° 恒温两拍进 COOL(10s) 稳态调度
+  → 骤降 35° 触发 smooth 坏读 hold → 断言 hold 拍调度沿用 currentLoopInterval(10s)
+  （另钉 hold 拍 status 仍为旧快照 = 路径证据）。期望值 10 来自 computeNextInterval
+  判据链独立推导（tempChange=0/非热/非 warm/17.92%≤25/非全最低 → COOL），非实现转述。
+- **债②** `testSmoothedTempFeedsDecision`：AI 模式（seedLearnTable 绕校准门）
+  70°→85° 变温，观测点 status.decisionTrace.temp；断言第 2 拍决策输入 = 75.25
+  （独立算式 70+0.35×15，alphaUp=0.35 为 FanControlLaw tuning 常量；首拍 70 直通
+  作观测点自检）。
+- **变异复验（这次必须红，红了）**：变异 a（hold 间隔→DEFAULT）红于债①断言③
+  （得 3.0）；变异 b（sample.temp→rawTemp）红于债②断言②（得 85.0 want 75.25）。
+  各精确红 1 条断言，还原后全绿，git diff 无 MUTATION 残留。
+- **记账**：断言 6153 → **6158 / 155 组**（+5 断言 +2 组，仅此两条债，无夹带）；
+  契约门槛双源 6147 → **6152**、组门 145 → **147**（沿用 −6/−8 漂移余量）；
+  覆盖率门 95.49%/94.98% 不变；VERSION 不动。

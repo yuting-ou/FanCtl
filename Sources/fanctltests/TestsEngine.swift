@@ -3423,3 +3423,73 @@ func testPersistenceFailureRetries() {
                 "③ 恢复可写后靠保留的脏旗重试落盘，磁盘追平内存")
     expect(!engine.learnDirty, "③ 重试成功后清旗")
 }
+
+// MARK: - R97 测试债：beat() 第 1 轮拆分（采集/调度相位）两次变异跑不红暴露的边界缺口
+
+// 债①：坏读 hold 拍的调度间隔必须沿用 currentLoopInterval（不得重置为 LOOP_INTERVAL_DEFAULT）。
+// 观测点：EngineCollector.schedules（hooks.schedule 的逐拍捕获）。
+// 变异复验口径：编排层 badReadHold 分支改 scheduleNext(interval: LOOP_INTERVAL_DEFAULT)
+// 后断言③必红（得 3 ≠ 10）；还原后绿。
+func testBadReadHoldKeepsCurrentInterval() {
+    group("坏读 hold 拍调度沿用当前间隔(R97)")
+    var envDirs: [URL] = []
+    envDirs.append(engineTestEnv())
+    ConfigStore.saveConfig(FanConfig(mode: .curve, preset: .balanced, envCompensation: false))
+    let smc = makeFanSMC(); smc.set("Tp01", 60); smc.set("TB0t", 30); smc.set("PSTR", 30)
+    let clock = FakeClock()
+    let col = EngineCollector()
+    let engine = makeEngine(smc: smc, clock: clock, collector: col)
+    // 恒温 60° 两拍进稳态调度。第 2 拍 computeNextInterval 的推导（独立判据，非实现转述）：
+    // tempChange=0（≤1）、60° 非热（<80）非 warm（<70）、非电池、输出 17.92%
+    //（balanced 曲线 60° 的 smoothstep 值，口径见 testCurveLookupSemantics）未全最低
+    // 且 ≤25（不触发回落短间隔）→ LOOP_INTERVAL_COOL = 10s。
+    engine.beat(); clock.advance(3)
+    engine.beat()
+    expect(col.schedules.last == 10.0,
+           "前置：60° 恒温稳态调度已进入 COOL(10s)（得 \(col.schedules.last ?? -1)）")
+    // 骤降 35° > glitchDrop(30°) → smooth() 判坏读 hold（返回 nil，最多沿用 3 拍）。
+    // 注意 hold 在采集相位内早退，先于卡死门/偏低门，故 25° 不会被误判失真。
+    smc.set("Tp01", 25)
+    clock.advance(10)
+    engine.beat()
+    // 路径钉住：hold 拍只刷新旧快照时间戳（传感器读数仍是上一拍 60°），
+    // 区别于故障路径（controlFault=true）与正常路径（快照更新为本拍读数 25°）。
+    expect(ConfigStore.loadStatus()?.sensors.cpuDie == 60,
+           "hold 拍 status 仍为旧快照（得 \(ConfigStore.loadStatus()?.sensors.cpuDie ?? -1)°，证明走 badReadHold 早退）")
+    expect(col.schedules.last == 10.0,
+           "hold 拍调度沿用 currentLoopInterval(10s)（得 \(col.schedules.last ?? -1)，重置为 DEFAULT(3s) 则本断言红）")
+    FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    for d in envDirs { try? FileManager.default.removeItem(at: d) }
+}
+
+// 债②：决策相位的温度输入必须是平滑温度 temp，不是 rawTemp。
+// 变温场景才有区分度（首拍 smooth 直通、恒温即收敛，temp≡rawTemp 抓不住偷换）。
+// 观测点：status.decisionTrace.temp（AI 模式每拍落盘的决策输入，ControlEngine persist 段
+// `temp: temp`）。期望值的独立推导：alphaUp=0.35（FanControlLaw tuning 默认值），
+// 第 2 拍平滑值 = 70 + 0.35×(85−70) = 75.25。
+// 变异复验口径：编排层 `let temp = sample.temp` 改为 `sample.rawTemp` 后断言②必红（得 85）。
+func testSmoothedTempFeedsDecision() {
+    group("变温决策输入为平滑温度(R97)")
+    var envDirs: [URL] = []
+    envDirs.append(engineTestEnv())
+    ConfigStore.saveConfig(FanConfig(mode: .ai, aiTargetTemp: 76, envCompensation: false))
+    let smc = makeFanSMC(); smc.set("Tp01", 70); smc.set("TB0t", 30); smc.set("PSTR", 45)
+    let clock = FakeClock()
+    let col = EngineCollector()
+    // 绕过冷启动观察期：校准期 effectiveMode 被语义化为 auto，decisionTrace 恒 nil
+    seedLearnTable()
+    let engine = makeEngine(smc: smc, clock: clock, collector: col,
+                            powerComponents: { (40, 15) })
+    engine.beat()
+    // 首拍直通（smooth 首调用 prev=nil → 返回 rawTemp 本身）：先证观测点可用——
+    // AI 生效（decisionTrace 非 nil）且决策输入即本拍温度 70（显式常量期望）。
+    expectClose(ConfigStore.loadStatus()?.decisionTrace?.temp ?? -1, 70, 1e-9,
+                "首拍决策输入 70（观测点自检；得 \(ConfigStore.loadStatus()?.decisionTrace?.temp ?? -1)）")
+    smc.set("Tp01", 85)
+    clock.advance(3)
+    engine.beat()
+    expectClose(ConfigStore.loadStatus()?.decisionTrace?.temp ?? -1, 75.25, 1e-9,
+                "第 2 拍决策输入 = 平滑 75.25（70+0.35×15；得 \(ConfigStore.loadStatus()?.decisionTrace?.temp ?? -1)，若用 rawTemp 则得 85）")
+    FanCtlPaths.setOverridesForTesting(supportDir: nil, logDir: nil)
+    for d in envDirs { try? FileManager.default.removeItem(at: d) }
+}
